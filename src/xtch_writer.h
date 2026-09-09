@@ -1,0 +1,264 @@
+// xtch_writer.h — XTC/XTCH container + XTG/XTH page encoder for the KO port.
+//
+// One EPUB → one device file. The container format is the same for both bit
+// depths; only the magic + page payload differ:
+//   - 2-bit "XTCH" (high quality): pages are XTH. Each XTH page is a 22B header
+//     ("XTH\0", w, h, 2 zero bytes, u32 dataSize=96000, 8B digest) followed by
+//     two 48000-byte planes. Device decode contract (XtcReaderActivity):
+//     value = (plane1bit<<1)|plane2bit, columns right→left, 8 vertical px/byte,
+//     MSB=topmost; 0=white 1=dark-grey 2=light-grey 3=black.
+//   - 1-bit "XTC\0" (fast): pages are XTG, a 22B header ("XTG\0", …,
+//     dataSize=48000) followed by one row-major plane, 8 px/byte MSB first,
+//     60 bytes/row × 800 rows. Device decode: bit 0 = BLACK, bit 1 = WHITE.
+//
+// Engine plane mapping (empirically verified, 97.6% AA-edge adjacency):
+//   lsb&msb marks = dark grey (v1), msb-only = light grey (v2),
+//   ink without grey = black (v3), no ink = white (v0).
+// For 1-bit XTG the engine BW plane's ink (0) maps directly to the device's
+// black=0 bit; text and dithered image black both land in the BW pass.
+#pragma once
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <string>
+#include <vector>
+
+namespace ko {
+
+// Output mode of the container (mirrors the device's two file magics).
+enum class XtcMode {
+  Mono1Bit = 0,   // "XTC\0", XTG pages (1-bit fast)
+  Gray2Bit = 1,   // "XTCH", XTH pages (2-bit high quality)
+};
+
+struct XtchChapter {
+  std::string name;
+  uint16_t startPage = 0;  // 0-based
+  uint16_t endPage = 0;    // 0-based inclusive
+};
+
+// A raw EPUB-TOC entry captured during export, before dedupe/ordering.
+struct ChapterCandidate {
+  std::string title;
+  uint32_t page = 0;       // global (container) page the entry starts at
+};
+
+class XtchWriter {
+ public:
+  explicit XtchWriter(XtcMode mode = XtcMode::Gray2Bit) : mode_(mode) {}
+
+  void setMode(XtcMode mode) { mode_ = mode; }
+  XtcMode mode() const { return mode_; }
+
+  void setMetadata(const std::string& title, const std::string& author,
+                   const std::string& publisher, const std::string& language) {
+    title_ = title;
+    author_ = author;
+    publisher_ = publisher;
+    language_ = language;
+  }
+
+  // Encode one logical (480x800 portrait) page from the three physical
+  // (800x480) plane captures. Appends an XTG (1-bit) or XTH (2-bit) page to
+  // pendingPages_ according to mode_.
+  bool addPageFromPlanes(const std::vector<uint8_t>& bw, const std::vector<uint8_t>& lsb,
+                         const std::vector<uint8_t>& msb) {
+    constexpr uint16_t LOGICAL_W = 480;
+    constexpr uint16_t LOGICAL_H = 800;
+    if (mode_ == XtcMode::Mono1Bit) {
+      return addMonoPage(bw, LOGICAL_W, LOGICAL_H);
+    }
+    return addGrayPage(bw, lsb, msb, LOGICAL_W, LOGICAL_H);
+  }
+
+ private:
+  // 1-bit XTG page: single row-major plane, 8 px/byte MSB first, bit 0 = black.
+  bool addMonoPage(const std::vector<uint8_t>& bw, uint16_t LOGICAL_W, uint16_t LOGICAL_H) {
+    std::vector<uint8_t> plane(48000, 0xFF);  // start white (1)
+
+    auto physBit = [](const std::vector<uint8_t>& buf, int phyX, int phyY) -> int {
+      return (buf[phyY * 100 + (phyX >> 3)] >> (7 - (phyX & 7))) & 1;
+    };
+
+    for (int y = 0; y < LOGICAL_H; y++) {
+      for (int x = 0; x < LOGICAL_W; x++) {
+        const int phyX = y;
+        const int phyY = 479 - x;
+        const int ink = physBit(bw, phyX, phyY) == 0;  // ink bit = 0 in engine BW
+        if (ink) {
+          // XTG bit 0 = black
+          plane[y * 60 + (x >> 3)] &= static_cast<uint8_t>(~(1 << (7 - (x & 7))));
+        }
+      }
+    }
+
+    const uint32_t dataSize = 48000;
+    std::vector<uint8_t> page;
+    page.reserve(22 + dataSize);
+    page.push_back('X'); page.push_back('T'); page.push_back('G'); page.push_back(0);
+    page.push_back(LOGICAL_W & 0xFF); page.push_back(LOGICAL_W >> 8);
+    page.push_back(LOGICAL_H & 0xFF); page.push_back(LOGICAL_H >> 8);
+    page.push_back(0); page.push_back(0);  // reserved
+    page.push_back(dataSize & 0xFF); page.push_back((dataSize >> 8) & 0xFF);
+    page.push_back((dataSize >> 16) & 0xFF); page.push_back((dataSize >> 24) & 0xFF);
+    page.insert(page.end(), 8, 0);  // digest = 0
+    page.insert(page.end(), plane.begin(), plane.end());
+    pendingPages_.push_back(std::move(page));
+    return true;
+  }
+
+  // 2-bit XTH page: two column-major planes (bit1/bit2), columns right→left.
+  bool addGrayPage(const std::vector<uint8_t>& bw, const std::vector<uint8_t>& lsb,
+                   const std::vector<uint8_t>& msb, uint16_t LOGICAL_W, uint16_t LOGICAL_H) {
+    std::vector<uint8_t> p1(48000, 0), p2(48000, 0);
+
+    auto physBit = [](const std::vector<uint8_t>& buf, int phyX, int phyY) -> int {
+      return (buf[phyY * 100 + (phyX >> 3)] >> (7 - (phyX & 7))) & 1;
+    };
+
+    // Logical portrait → physical: Portrait rotation is phyX=y, phyY=479-x.
+    for (int x = 0; x < LOGICAL_W; x++) {
+      const int targetCol = LOGICAL_W - 1 - x;  // XTH columns right→left
+      for (int y = 0; y < LOGICAL_H; y++) {
+        const int phyX = y;
+        const int phyY = 479 - x;
+        const int ink = physBit(bw, phyX, phyY) == 0;
+        const int l = physBit(lsb, phyX, phyY) == 1;
+        const int m = physBit(msb, phyX, phyY) == 1;
+        int v;
+        if (!ink)
+          v = 0;
+        else if (l)
+          v = 1;  // dark grey (engine LSB pass marks dark only)
+        else if (m)
+          v = 2;  // light grey (MSB only)
+        else
+          v = 3;  // pure black core
+        const int planeByte = targetCol * 100 + (y >> 3);
+        const int planeBit = 7 - (y & 7);
+        if (v & 2) p1[planeByte] |= static_cast<uint8_t>(1 << planeBit);
+        if (v & 1) p2[planeByte] |= static_cast<uint8_t>(1 << planeBit);
+      }
+    }
+
+    // XTH page: 22B header + plane1 + plane2
+    const uint32_t dataSize = 96000;
+    std::vector<uint8_t> page;
+    page.reserve(22 + dataSize);
+    page.push_back('X'); page.push_back('T'); page.push_back('H'); page.push_back(0);
+    page.push_back(LOGICAL_W & 0xFF); page.push_back(LOGICAL_W >> 8);
+    page.push_back(LOGICAL_H & 0xFF); page.push_back(LOGICAL_H >> 8);
+    page.push_back(0); page.push_back(0);  // reserved
+    page.push_back(dataSize & 0xFF); page.push_back((dataSize >> 8) & 0xFF);
+    page.push_back((dataSize >> 16) & 0xFF); page.push_back((dataSize >> 24) & 0xFF);
+    page.insert(page.end(), 8, 0);  // digest = 0 (vendor writes none)
+    page.insert(page.end(), p1.begin(), p1.end());
+    page.insert(page.end(), p2.begin(), p2.end());
+    pendingPages_.push_back(std::move(page));
+    return true;
+  }
+
+ public:
+  // Finalize container bytes: 56B header + 256B metadata + chapters + index + data
+  std::vector<uint8_t> finish(const std::vector<XtchChapter>& chapters) {
+    const size_t pageCount = pendingPages_.size();
+    const size_t chapterCount = chapters.size();
+    const uint64_t metadataOffset = 56;
+    const uint64_t chapterOffset = metadataOffset + 256;
+    const uint64_t indexOffset = chapterOffset + chapterCount * 96;
+    // data area: 16B/page index then pages
+    uint64_t totalData = 0;
+    for (const auto& p : pendingPages_) totalData += p.size();
+    const uint64_t dataOffset = indexOffset + pageCount * 16;
+
+    // Pre-reserve exact final size: avoids realloc doubling that can spike peak
+    // memory past the wasm heap on multi-hundred-MB books.
+    std::vector<uint8_t> out;
+    out.reserve(dataOffset + totalData);
+    out.resize(dataOffset, 0);
+    // --- header ---
+    if (mode_ == XtcMode::Mono1Bit) {
+      out[0] = 'X'; out[1] = 'T'; out[2] = 'C'; out[3] = 0;   // "XTC\0" 1-bit
+    } else {
+      out[0] = 'X'; out[1] = 'T'; out[2] = 'C'; out[3] = 'H'; // "XTCH" 2-bit
+    }
+    out[4] = 0x01; out[5] = 0x00;                            // version 1.0
+    out[6] = pageCount & 0xFF; out[7] = (pageCount >> 8) & 0xFF;
+    out[8] = 0;                      // readDirection L→R (Korean prose)
+    out[9] = 1;                      // hasMetadata
+    out[10] = 0;                     // hasThumbnails
+    out[11] = chapterCount > 0 ? 1 : 0;  // hasChapters
+    // currentPage (0xC..0xF): vendor files store 1
+    putU32(out, 0x0C, 1);
+    putU64(out, 0x10, metadataOffset);
+    putU64(out, 0x18, indexOffset);
+    putU64(out, 0x20, dataOffset);
+    putU64(out, 0x28, 0);            // thumbOffset
+    // chapterOffset: official writer always points at 312 (56 header + 256
+    // metadata) even with zero chapters; device parser reads it as u64 @0x30
+    // and only consults it when hasChapters=1.
+    putU64(out, 0x30, chapterOffset);
+    // --- metadata (256B @56) ---
+    putStr(out, metadataOffset + 0x00, title_, 128);
+    putStr(out, metadataOffset + 0x80, author_, 64);
+    putStr(out, metadataOffset + 0xC0, publisher_, 32);
+    putStr(out, metadataOffset + 0xE0, language_, 16);
+    putU32(out, metadataOffset + 0xF0, static_cast<uint32_t>(time(nullptr)));  // createTime
+    putU16(out, metadataOffset + 0xF4, 0);              // coverPage: official leaves 0 (page 0)
+    putU16(out, metadataOffset + 0xF6, static_cast<uint16_t>(chapterCount));
+    // reserved 0xF8..0xFF stays 0
+    // --- chapters (96B each) ---
+    // Chapter page fields are 1-BASED on disk: the device parser decrements
+    // (startPage-- / endPage--) when reading. Official writer stores +1.
+    for (size_t i = 0; i < chapterCount; i++) {
+      const uint64_t base = chapterOffset + i * 96;
+      putStr(out, base + 0x00, chapters[i].name, 80);
+      putU16(out, base + 0x50, static_cast<uint16_t>(chapters[i].startPage + 1));
+      putU16(out, base + 0x52, static_cast<uint16_t>(chapters[i].endPage + 1));
+      // reserved 0x54..0x5F stays 0
+    }
+    // --- index + data ---
+    // Memory-slim streaming: append each page then free its pending buffer, so
+    // peak usage stays ~= final file size instead of 2x (pendingPages + copy).
+    uint64_t cursor = dataOffset;
+    for (size_t i = 0; i < pageCount; i++) {
+      auto& page = pendingPages_[i];
+      const uint64_t e = indexOffset + i * 16;
+      putU64(out, e + 0x00, cursor);
+      putU32(out, e + 0x08, static_cast<uint32_t>(page.size()));
+      putU16(out, e + 0x0C, 480);
+      putU16(out, e + 0x0E, 800);
+      out.insert(out.end(), page.begin(), page.end());
+      cursor += page.size();
+      std::vector<uint8_t>().swap(page);  // release this page's heap now
+    }
+    return out;
+  }
+
+  void reset() { pendingPages_.clear(); }
+  size_t pageCount() const { return pendingPages_.size(); }
+
+ private:
+  static void putU16(std::vector<uint8_t>& v, size_t off, uint16_t val) {
+    v[off] = val & 0xFF; v[off + 1] = (val >> 8) & 0xFF;
+  }
+  static void putU32(std::vector<uint8_t>& v, size_t off, uint32_t val) {
+    v[off] = val & 0xFF; v[off + 1] = (val >> 8) & 0xFF;
+    v[off + 2] = (val >> 16) & 0xFF; v[off + 3] = (val >> 24) & 0xFF;
+  }
+  static void putU64(std::vector<uint8_t>& v, size_t off, uint64_t val) {
+    for (int i = 0; i < 8; i++) v[off + i] = (val >> (8 * i)) & 0xFF;
+  }
+  static void putStr(std::vector<uint8_t>& v, size_t off, const std::string& s, size_t maxLen) {
+    size_t n = s.size() < maxLen ? s.size() : maxLen - 1;
+    memcpy(v.data() + off, s.data(), n);
+  }
+
+  std::string title_, author_, publisher_, language_;
+  XtcMode mode_ = XtcMode::Gray2Bit;
+  std::vector<std::vector<uint8_t>> pendingPages_;
+};
+
+}  // namespace ko

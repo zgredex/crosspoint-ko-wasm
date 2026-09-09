@@ -1,0 +1,538 @@
+// wasm_api.cpp — CrossPoint-KO engine as a WASM module.
+//
+// Exposes the full Korean-typography knob surface so callers can experiment:
+//   - ReaderRenderSpec knobs: lineCompression, paragraph indent, character
+//     wrap, alignment, extra paragraph spacing, hyphenation, embedded style,
+//     image rendering policy, focus reading
+//   - margins + viewport
+//   - page-by-page plane capture (BW + LSB/MSB gray = the three passes the
+//     device display pipeline uses; XTH value semantics documented)
+//   - one-shot "convert whole book" → in-memory XTCH container bytes
+//
+// Memory model: module-lifetime HalDisplay + GfxRenderer + EngineDriver. EPUB
+// injected via ko_load_epub(bytes,len). Planes are 48000 bytes (physical
+// 800x480); JS reads them from HEAPU8. The encoder in JS (or ko_render_xtch)
+// transposes to logical 480x800 + XTH packing.
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <vector>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#define KO_EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define KO_EXPORT
+#endif
+#include <SdFontFamily.h>
+#include "ko_engine_driver.h"
+#include "xtch_writer.h"
+
+// Global instances (module-lifetime)
+static HalDisplay* g_display = nullptr;
+static GfxRenderer* g_renderer = nullptr;
+static ko::EngineDriver* g_driver = nullptr;
+static EpdFont* g_pretendard = nullptr;
+static EpdFontFamily* g_uiFamily = nullptr;
+static EpdFont* g_kopub = nullptr;
+static EpdFontFamily* g_kopubFamily = nullptr;
+static EpdFont* g_ridibatang = nullptr;
+static EpdFontFamily* g_ridibatangFamily = nullptr;
+static ko::Spec g_spec;
+static ko::RenderedPage g_page;
+static std::vector<uint8_t> g_error;
+
+// XTCH accumulation (used by ko_render_xtch one-shot)
+static ko::XtchWriter* g_xtch = nullptr;
+static std::vector<ko::XtchChapter> g_chapters;
+static std::vector<ko::XtchChapter> g_spineFallback;   // per-spine names when no TOC
+static std::vector<ko::ChapterCandidate> g_chapterCandidates;  // TOC entries during export
+static int g_currentSpine = -1;
+static int g_spinePageStart = 0;
+static int g_totalPages = 0;
+static int g_xtchFullReady = 0;
+static std::vector<uint8_t> g_xtchOut;      // finished container bytes (ko_xtch_ptr)
+static std::vector<uint8_t> g_coverData;   // cover BMP bytes (ko_generate_cover)
+static std::string g_coverPath;
+static size_t g_coverSize = 0;
+
+static void setError(const std::string& msg) {
+  g_error.assign(msg.begin(), msg.end());
+  g_error.push_back('\0');
+}
+
+extern "C" {
+
+// forward decl (ko_init calls it before its definition)
+KO_EXPORT void ko_set_margins(int top, int right, int bottom, int left);
+
+// ---- lifecycle -------------------------------------------------------------
+
+KO_EXPORT const char* ko_version() { return "crosspoint-ko 1.5.0-ko.3 wasm 0.1"; }
+
+KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
+  if (!g_display) {
+    g_display = new HalDisplay();
+    g_renderer = new GfxRenderer(*g_display);
+    g_renderer->begin();
+    g_driver = new ko::EngineDriver(*g_renderer, *g_display);
+
+    g_pretendard = new EpdFont(&pretendard_10_regular);
+    g_uiFamily = new EpdFontFamily(g_pretendard);
+    g_kopub = new EpdFont(&kopub_14_regular);
+    g_kopubFamily = new EpdFontFamily(g_kopub);
+    g_ridibatang = new EpdFont(&ridibatang_14_regular);
+    g_ridibatangFamily = new EpdFontFamily(g_ridibatang);
+    g_renderer->insertFont(UI_FONT_ID, g_uiFamily);
+    g_renderer->insertFont(UI_10_FONT_ID, g_uiFamily);
+    g_renderer->insertFont(UI_12_FONT_ID, g_uiFamily);
+    g_renderer->insertFont(SMALL_FONT_ID, g_uiFamily);
+    g_renderer->insertFont(KOPUB_14_FONT_ID, g_kopubFamily);
+    g_renderer->insertFont(RIDIBATANG_14_FONT_ID, g_ridibatangFamily);
+    g_renderer->setFallbackFont(UI_FONT_ID);
+    g_xtch = new ko::XtchWriter();
+  }
+  g_spec = ko::Spec();
+  g_spec.viewportWidth = static_cast<uint16_t>(viewportWidth);
+  g_spec.viewportHeight = static_cast<uint16_t>(viewportHeight);
+  // recompute margins so viewport+margin == full logical screen
+  ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  return 0;
+}
+
+KO_EXPORT void ko_close() {
+  delete g_driver; g_driver = nullptr;
+  delete g_renderer; g_renderer = nullptr;
+  delete g_display; g_display = nullptr;
+  delete g_uiFamily; g_uiFamily = nullptr;
+  delete g_pretendard; g_pretendard = nullptr;
+  delete g_kopubFamily; g_kopubFamily = nullptr;
+  delete g_kopub; g_kopub = nullptr;
+  delete g_ridibatangFamily; g_ridibatangFamily = nullptr;
+  delete g_ridibatang; g_ridibatang = nullptr;
+  delete g_xtch; g_xtch = nullptr;
+}
+
+KO_EXPORT const char* ko_error() {
+  return g_error.empty() ? "" : reinterpret_cast<const char*>(g_error.data());
+}
+
+// ---- Korean typography knobs ------------------------------------------------
+
+KO_EXPORT void ko_set_line_compression(float v) { g_spec.lineCompression = v; }
+KO_EXPORT void ko_set_extra_paragraph_spacing(int v) { g_spec.extraParagraphSpacing = v; }
+KO_EXPORT void ko_set_paragraph_indent(int v) { g_spec.paragraphIndent = v; }
+KO_EXPORT void ko_set_character_wrap(int v) { g_spec.characterWrap = v; }
+// alignment: 0 JUSTIFIED 1 LEFT 2 CENTER 3 RIGHT 4 BOOK_STYLE
+KO_EXPORT void ko_set_paragraph_alignment(int v) { g_spec.paragraphAlignment = v; }
+KO_EXPORT void ko_set_hyphenation(int v) { g_spec.hyphenationEnabled = v; }
+KO_EXPORT void ko_set_embedded_style(int v) { g_spec.embeddedStyle = v; }
+KO_EXPORT void ko_set_image_rendering(int v) { g_spec.imageRendering = v; }
+// Text anti-aliasing (device Text AA toggle). Off = text renders 1-bit in the
+// BW pass only; images still get their grayscale passes.
+KO_EXPORT void ko_set_text_aa(int v) { g_spec.textAntiAliasing = v ? 1 : 0; }
+KO_EXPORT void ko_set_focus_reading(int v) { (void)v; g_spec.focusReadingEnabled = 0; }  // EN-only; hardcoded off in KO
+
+// Reader font: RIDIBATANG_14_FONT_ID (default) / KOPUB_14_FONT_ID / CUSTOM_FONT_ID
+KO_EXPORT int ko_set_font(int fontId) {
+  switch (fontId) {
+    case RIDIBATANG_14_FONT_ID:
+    case KOPUB_14_FONT_ID:
+    case CUSTOM_FONT_ID:
+      g_spec.fontId = fontId;
+      return 0;
+    default:
+      setError("unknown font id");
+      return -1;
+  }
+}
+
+KO_EXPORT int ko_font() { return g_spec.fontId; }
+
+// Runtime custom reader font (.epdfont), mirroring the device's SD-font path:
+// bytes are mounted into the in-memory FS, loaded through SdFontFamily and
+// registered under CUSTOM_FONT_ID. After a book load (which clears the FS),
+// the caller must re-send the font (the web worker caches and re-applies it).
+KO_EXPORT int ko_load_epdfont(const uint8_t* data, size_t size, const char* name) {
+  if (!g_renderer || !data || size < 64) {
+    setError("bad epdfont payload");
+    return -1;
+  }
+  // remove any previous custom font first (mirrors reloadCustomReaderFont)
+  if (g_renderer->hasFont(CUSTOM_FONT_ID)) {
+    g_renderer->removeFont(CUSTOM_FONT_ID);
+  }
+  const std::string path = std::string("/.fonts/") + (name && name[0] ? name : "custom") + ".epdfont";
+  Storage.mountBlob(path, data, size);
+  auto family = new SdFontFamily(path.c_str());
+  if (!family || !family->load()) {
+    delete family;
+    Storage.remove(path.c_str());
+    setError("epdfont load failed (bad format?)");
+    return -1;
+  }
+  g_renderer->insertSdFont(CUSTOM_FONT_ID, family);  // takes ownership
+  g_spec.fontId = CUSTOM_FONT_ID;
+  return 0;
+}
+
+KO_EXPORT int ko_clear_custom_font() {
+  if (g_renderer && g_renderer->hasFont(CUSTOM_FONT_ID)) {
+    g_renderer->removeFont(CUSTOM_FONT_ID);
+  }
+  if (g_spec.fontId == CUSTOM_FONT_ID) {
+    g_spec.fontId = RIDIBATANG_14_FONT_ID;
+  }
+  return 0;
+}
+
+// Active reader font metrics: returns baseline advance (lineHeight) for the
+// current font at the default (uncompressed) multiplier — the KO doc's
+// advanceY (RIDIBatang 14 → 38 px).
+KO_EXPORT int ko_font_advance_y() {
+  if (!g_renderer) return 0;
+  return g_renderer->getLineHeight(g_spec.fontId);
+}
+
+KO_EXPORT void ko_set_margins(int top, int right, int bottom, int left) {
+  g_spec.marginTop = top;
+  g_spec.marginRight = right;
+  g_spec.marginBottom = bottom;
+  g_spec.marginLeft = left;
+  if (g_renderer) {
+    g_spec.viewportWidth = static_cast<uint16_t>(
+        g_renderer->getScreenWidth() - g_spec.marginLeft - g_spec.marginRight);
+    g_spec.viewportHeight = static_cast<uint16_t>(
+        g_renderer->getScreenHeight() - g_spec.marginTop - g_spec.marginBottom);
+  }
+}
+
+KO_EXPORT int ko_viewport_width() { return g_spec.viewportWidth; }
+KO_EXPORT int ko_viewport_height() { return g_spec.viewportHeight; }
+KO_EXPORT int ko_logical_width() {
+  return g_renderer ? g_renderer->getScreenWidth() : 0;
+}
+KO_EXPORT int ko_logical_height() {
+  return g_renderer ? g_renderer->getScreenHeight() : 0;
+}
+
+// ---- EPUB loading -----------------------------------------------------------
+
+KO_EXPORT int ko_load_epub(const uint8_t* data, size_t size, const char* virtualPath) {
+  if (!g_driver) return -1;
+  // Fresh in-memory FS per book: section caches from a previous load otherwise
+  // accumulate in the wasm heap and eventually fail section builds.
+  Storage.clearAll();
+  const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
+  if (!g_driver->loadEpubFromBlob(data, size, vp)) {
+    setError("Epub::load failed");
+    return -1;
+  }
+  g_xtch->reset();
+  g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
+  g_chapters.clear();
+  g_currentSpine = -1;
+  g_spinePageStart = 0;
+  g_totalPages = 0;
+  g_xtchFullReady = 0;
+  return g_driver->spineCount();
+}
+
+KO_EXPORT int ko_spine_count() { return g_driver ? g_driver->spineCount() : 0; }
+
+KO_EXPORT void ko_get_title(char* buf, int bufLen) {
+  if (!buf || bufLen <= 0) return;
+  const std::string& t = g_driver->title();
+  int n = static_cast<int>(t.size()) < bufLen - 1 ? static_cast<int>(t.size()) : bufLen - 1;
+  memcpy(buf, t.data(), n);
+  buf[n] = '\0';
+}
+
+// Spine href (basename) for the chapter picker; pointer valid until next call.
+KO_EXPORT const char* ko_get_spine_href(int spineIndex) {
+  if (!g_driver || spineIndex < 0 || spineIndex >= g_driver->spineCount()) return "";
+  const auto& item = g_driver->spineHref(spineIndex);
+  static std::string last;
+  last = item;
+  // basename only
+  size_t slash = last.find_last_of('/');
+  if (slash != std::string::npos) last = last.substr(slash + 1);
+  return last.c_str();
+}
+
+// Cover/thumbnail generation — mirrors the device library path. Generates the
+// prescaled cover BMP via JpegToBmpConverter (handles oversized covers that the
+// in-page decoder's RAM cap refuses). Returns bytes via ko_cover_ptr/size.
+// kind: 0 = cropped cover (540x800), 1 = thumb (device-height)
+KO_EXPORT int ko_generate_cover(int kind) {
+  if (!g_driver) return -1;
+  auto epub = g_driver->epubShared();
+  bool ok;
+  if (kind == 0) {
+    ok = epub->generateCoverBmp(true);          // cropped
+    g_coverPath = epub->getCoverBmpPath(true);
+  } else {
+    ok = epub->generateThumbBmp(220);           // device thumb height
+    g_coverPath = epub->getThumbBmpPath(220);
+  }
+  if (!ok) {
+    setError("cover generation failed");
+    return -1;
+  }
+  HalFile f;
+  if (!Storage.openFileForRead("CVR", g_coverPath, f)) {
+    setError("cover bmp missing");
+    return -1;
+  }
+  g_coverSize = f.size();
+  g_coverData.resize(g_coverSize);
+  if (f.read(g_coverData.data(), g_coverSize) != static_cast<int>(g_coverSize)) {
+    f.close();
+    setError("cover read failed");
+    return -1;
+  }
+  f.close();
+  return 0;
+}
+
+KO_EXPORT const uint8_t* ko_cover_ptr() { return g_coverData.empty() ? nullptr : g_coverData.data(); }
+KO_EXPORT size_t ko_cover_size() { return g_coverSize; }
+
+// ---- pagination + page capture ----------------------------------------------
+
+// Build spine (0-based). Returns page count, or -1 on failure.
+KO_EXPORT int ko_build_spine(int spineIndex) {
+  if (!g_driver) return -1;
+  const int n = g_driver->buildSection(spineIndex, g_spec);
+  if (n < 0) {
+    setError("section build failed");
+    return -1;
+  }
+  g_currentSpine = spineIndex;
+  return n;
+}
+
+// Render page p of current spine (all 3 passes). 0 ok / -1 error.
+// Then ko_plane_ptr(kind): 0=BW 1=LSB(dark grey) 2=MSB(light+dark).
+KO_EXPORT int ko_render_page(int pageIndex) {
+  if (!g_driver || g_currentSpine < 0) return -1;
+  if (!g_driver->renderPage(pageIndex, g_spec, g_page)) {
+    setError("page render failed");
+    return -1;
+  }
+  return 0;
+}
+
+KO_EXPORT const uint8_t* ko_plane_ptr(int kind) {
+  switch (kind) {
+    case 0: return g_page.bw.data();
+    case 1: return g_page.lsb.data();
+    case 2: return g_page.msb.data();
+    default: return nullptr;
+  }
+}
+KO_EXPORT size_t ko_plane_size(int kind) {
+  (void)kind;
+  return 48000;
+}
+
+// ---- XTCH container (whole-book convert) -----------------------------------
+//
+// One book = one XTCH file (the site's core promise: the exported .xtc/.xtch
+// plays back on the device exactly like the preview). Export is incremental:
+// the JS worker calls ko_export_spine() per spine (reports progress, stays well
+// under the call timeout), then ko_export_finish() finalizes the container.
+// Bytes are read via ko_xtch_ptr()/ko_xtch_size().
+
+// Select container mode before export: 0 = 1-bit XTC ("XTC\0", XTG pages),
+// 1 = 2-bit XTCH ("XTCH", XTH pages). Mirrors the device file magics.
+KO_EXPORT void ko_export_set_mode(int mode) {
+  if (g_xtch) g_xtch->setMode(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit);
+}
+
+KO_EXPORT int ko_export_begin() {
+  if (!g_driver || !g_xtch) return -1;
+  g_xtch->reset();
+  g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
+  g_chapters.clear();
+  g_spineFallback.clear();
+  g_chapterCandidates.clear();
+  g_totalPages = 0;
+  g_spinePageStart = 0;
+  g_xtchFullReady = 0;
+  g_xtchOut.clear();
+  return g_driver->spineCount();
+}
+
+// Render one spine's pages into the container. Returns the number of pages
+// ACTUALLY added (>=0), or -1 on build failure — the JS side maps spine→page
+// ranges from this return, so it must reflect real page count.
+KO_EXPORT int ko_export_spine(int spine) {
+  if (!g_driver || !g_xtch) return -1;
+  const int n = g_driver->buildSection(spine, g_spec);
+  if (n < 0) return -1;
+  const int before = g_totalPages;
+  for (int p = 0; p < n; p++) {
+    ko::RenderedPage rp;
+    if (!g_driver->renderPage(p, g_spec, rp)) continue;
+    g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
+    g_totalPages++;
+  }
+  const int added = g_totalPages - before;
+  if (added > 0) {
+    const int spineStart = g_spinePageStart;
+    // fallback chapter name (used only when the book has no usable TOC)
+    {
+      std::string href = g_driver->spineHref(spine);
+      size_t slash = href.find_last_of('/');
+      if (slash != std::string::npos) href = href.substr(slash + 1);
+      size_t dot = href.find_last_of('.');
+      if (dot != std::string::npos) href = href.substr(0, dot);
+      ko::XtchChapter ch;
+      ch.name = href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href;
+      ch.startPage = static_cast<uint16_t>(spineStart);
+      ch.endPage = static_cast<uint16_t>(spineStart + added - 1);
+      g_spineFallback.push_back(ch);
+    }
+    // TOC candidates for this spine: each nav entry resolving into this spine
+    // becomes a chapter whose start page = spine start + anchor local page
+    // (anchors are recorded during the layout we just ran).
+    const int tocN = g_driver->tocCount();
+    for (int t = 0; t < tocN; t++) {
+      if (g_driver->tocSpine(t) != spine) continue;
+      const std::string title = g_driver->tocTitle(t);
+      const std::string anchor = g_driver->tocAnchor(t);
+      int local = anchor.empty() ? -1 : g_driver->anchorLocalPage(anchor);
+      int page = (local >= 0 && local < added) ? spineStart + local : spineStart;
+      g_chapterCandidates.push_back({title, static_cast<uint32_t>(page)});
+    }
+    g_spinePageStart += added;
+  }
+  return added;
+}
+
+// Finalize the container into g_xtchOut. Returns total pages or -1.
+// Chapters are assembled from the EPUB TOC (device-true chapter list, official
+// converter caps at 100 entries, end page = next chapter start − 1). Books
+// without a usable TOC fall back to per-spine chapters.
+KO_EXPORT int ko_export_finish() {
+  if (!g_xtch) return -1;
+  g_chapters.clear();
+  const uint32_t lastPage = g_totalPages > 0 ? static_cast<uint32_t>(g_totalPages) - 1 : 0;
+
+  // Keep the first 100 TOC entries in TOC order (official MAX_TOC_EXPORT),
+  // then sort by page so chapter ranges are monotone, dropping same-page
+  // duplicates (a sub-entry that aliases its parent's heading).
+  std::vector<ko::ChapterCandidate> cand = g_chapterCandidates;
+  if (cand.size() > 100) cand.resize(100);
+  std::stable_sort(cand.begin(), cand.end(),
+                   [](const ko::ChapterCandidate& a, const ko::ChapterCandidate& b) {
+                     return a.page < b.page;
+                   });
+  std::vector<ko::ChapterCandidate> uniq;
+  for (const auto& c : cand) {
+    if (uniq.empty() || uniq.back().page != c.page) uniq.push_back(c);
+  }
+
+  if (!uniq.empty()) {
+    for (size_t i = 0; i < uniq.size(); i++) {
+      ko::XtchChapter ch;
+      ch.name = uniq[i].title.empty() ? ("Chapter " + std::to_string(i + 1)) : uniq[i].title;
+      ch.startPage = uniq[i].page;
+      ch.endPage = (i + 1 < uniq.size()) ? uniq[i + 1].page - 1 : lastPage;
+      if (ch.endPage < ch.startPage) ch.endPage = ch.startPage;
+      if (ch.startPage <= lastPage) g_chapters.push_back(ch);
+    }
+  } else if (!g_spineFallback.empty()) {
+    g_chapters = g_spineFallback;
+  }
+  g_xtchOut = g_xtch->finish(g_chapters);
+  g_xtchFullReady = 1;
+  return g_totalPages;
+}
+
+// One-shot convenience: whole book in a single call (used by host/tests).
+KO_EXPORT int ko_render_xtch() {
+  const int spines = ko_export_begin();
+  if (spines < 0) return -1;
+  for (int s = 0; s < spines; s++) {
+    if (ko_export_spine(s) < 0) continue;
+  }
+  return ko_export_finish();
+}
+
+// Module-lifetime output cache (declared above with the other globals)
+
+KO_EXPORT const uint8_t* ko_xtch_ptr() {
+  if (!g_xtchFullReady) return nullptr;
+  if (g_xtchOut.empty()) g_xtchOut = g_xtch->finish(g_chapters);
+  return g_xtchOut.data();
+}
+
+KO_EXPORT size_t ko_xtch_size() { return g_xtchOut.size(); }
+
+// ---- XTCZ (LZ4) compressed container ----------------------------------------
+// Official layout (epub2xtc.xteink.cn compressXtczLz4, verified from minified
+// bundle): "XTZ4" magic + u32LE uncompressed size + u32LE block size (4096),
+// then per block: u32LE length, bit31 set => raw stored, else LZ4-compressed
+// block bytes; terminator u32LE 0. Requires device firmware >= 5.1.6.
+#include <lz4.h>
+KO_EXPORT void ko_xtcz_wrap() {
+  if (!g_xtchFullReady || g_xtchOut.empty()) return;
+  const size_t rawLen = g_xtchOut.size();
+  constexpr uint32_t kBlock = 4096;
+  const uint32_t numBlocks = static_cast<uint32_t>((rawLen + kBlock - 1) / kBlock);
+
+  // worst case: header (12B) + per block 4B len + LZ4_compressBound(4096) (~4200)
+  const size_t cap = 12 + numBlocks * (4 + LZ4_compressBound(kBlock)) + 4;
+  std::vector<uint8_t> out;
+  out.reserve(cap);
+  const auto putU32 = [](std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(x & 0xFF); v.push_back((x >> 8) & 0xFF);
+    v.push_back((x >> 16) & 0xFF); v.push_back((x >> 24) & 0xFF);
+  };
+  out.push_back('X'); out.push_back('T'); out.push_back('Z'); out.push_back('4');
+  putU32(out, static_cast<uint32_t>(rawLen));
+  putU32(out, kBlock);
+
+  // LZ4_compress_default is stateless (creates its own table per call); block
+  // size 4096 keeps the per-call cost trivial even for ~46k blocks on a
+  // 190 MB book. White-dominant e-ink pages compress well.
+  std::vector<uint8_t> comp(LZ4_compressBound(kBlock));
+  for (size_t off = 0; off < rawLen; off += kBlock) {
+    const uint32_t chunk = static_cast<uint32_t>(std::min<size_t>(kBlock, rawLen - off));
+    if (chunk < 13) {  // too small to compress: always store raw
+      putU32(out, 0x80000000u | chunk);
+      out.insert(out.end(), g_xtchOut.data() + off, g_xtchOut.data() + off + chunk);
+      continue;
+    }
+    const int c = LZ4_compress_default(
+        reinterpret_cast<const char*>(g_xtchOut.data() + off),
+        reinterpret_cast<char*>(comp.data()),
+        static_cast<int>(chunk), static_cast<int>(comp.size()));
+    if (c > 0 && static_cast<size_t>(c) < chunk) {
+      putU32(out, static_cast<uint32_t>(c));
+      out.insert(out.end(), comp.data(), comp.data() + c);
+    } else {
+      putU32(out, 0x80000000u | chunk);
+      out.insert(out.end(), g_xtchOut.data() + off, g_xtchOut.data() + off + chunk);
+    }
+  }
+  putU32(out, 0);  // terminator
+  g_xtchOut.swap(out);
+}
+
+// Release the module-lifetime container buffer (frees wasm heap; the JS side
+// keeps its own copy once exported). Safe to call anytime.
+KO_EXPORT void ko_xtch_release() {
+  g_xtchOut.clear();
+  g_xtchOut.shrink_to_fit();
+  g_xtchFullReady = 0;
+}
+
+KO_EXPORT void ko_free(void*) {}
+
+}  // extern "C"

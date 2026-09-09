@@ -1,0 +1,13 @@
+# CMake build outputs
+build/
+build-wasm/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Commercial test book — not redistributable
+web/demo.epub
+
+# macOS
+.DS_Store

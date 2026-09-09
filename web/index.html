@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CrossPoint-KO EPUB Preview (WASM)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>CrossPoint-KO <span class="dim">한국어 EPUB 프리뷰 / Korean EPUB Preview</span></h1>
+  <div id="fileRow">
+    <input type="file" id="epubFile" class="fileInput" accept=".epub,application/epub+zip"
+           title="Choose an EPUB file">
+    <label for="epubFile" class="btn secondary fileBtn" title="Choose an EPUB file (EPUB 선택)">EPUB 선택 / Choose…</label>
+    <button id="openBtn" class="btn primary" disabled title="Open the chosen EPUB (열기)">열기 / Open</button>
+    <span id="status" class="status">load an EPUB to begin</span>
+  </div>
+</header>
+
+<main>
+  <!-- Preview: always visible, left; vertical book controls right of canvas -->
+  <section id="preview">
+    <!-- scrollable canvas viewport: fits at 100%, scrolls when zoomed in -->
+    <div id="canvasScroll">
+      <div id="canvasWrap">
+        <canvas id="page" width="480" height="800"></canvas>
+        <div id="loading" class="hidden">rendering…</div>
+      </div>
+    </div>
+
+    <!-- book controls + view scale, vertical rail right of the canvas -->
+    <nav id="pager">
+      <button id="prevBtn" title="Previous page (이전)" disabled>◀</button>
+      <span id="pageInfo">– / –</span>
+      <button id="nextBtn" title="Next page (다음)" disabled>▶</button>
+      <label class="chapter">
+        <span>Chapter <i>장</i></span>
+        <select id="spineSel" disabled></select>
+      </label>
+      <button id="coverBtn" title="Show book cover (표지)" disabled>표지 Cover</button>
+
+      <label class="scaleCtrl" title="View zoom only — never re-renders. 100% fits the window; above 100% magnifies (scroll to pan). The exported file is always 480×800 device pixels regardless.">
+        <span>Scale <i>확대</i></span>
+        <input type="range" id="zoom" min="50" max="400" value="100">
+        <output id="zoomOut">100%</output>
+      </label>
+    </nav>
+  </section>
+
+  <!-- Settings column -->
+  <aside id="controls">
+    <section class="card">
+      <h2>Typography / 타이포그래피</h2>
+
+      <label class="ctrl">
+        <span>Line spacing <i>줄간격</i></span>
+        <select id="lineCompression">
+          <option value="1.00">Tight (1.00)</option>
+          <option value="1.20" selected>Normal (1.20)</option>
+          <option value="1.40">Wide (1.40)</option>
+        </select>
+      </label>
+
+      <label class="ctrl">
+        <span>Paragraph alignment <i>정렬</i></span>
+        <select id="paragraphAlignment">
+          <option value="0" selected>Justified (양끝)</option>
+          <option value="1">Left (왼쪽)</option>
+          <option value="2">Center (가운데)</option>
+          <option value="3">Right (오른쪽)</option>
+          <option value="4">Book style (책 스타일)</option>
+        </select>
+      </label>
+
+      <label class="ctrl check">
+        <input type="checkbox" id="paragraphIndent">
+        <span>Paragraph indent <i>들여쓰기</i></span>
+      </label>
+
+      <label class="ctrl check" id="textAaLab" title="Smooth text edges via grey pixels. Only reachable in 2-bit XTCH files — a 1-bit XTC file carries the BW plane, which has no grey/AA">
+        <input type="checkbox" id="textAa" checked>
+        <span>Text anti-aliasing <i>텍스트 안티앨리어싱</i> <em class="aaHint"></em></span>
+      </label>
+
+      <label class="ctrl check">
+        <input type="checkbox" id="extraParagraphSpacing" checked>
+        <span>Extra paragraph spacing <i>문단 간격</i></span>
+      </label>
+
+      <label class="ctrl check">
+        <input type="checkbox" id="characterWrap" checked>
+        <span>Character wrap <i>음절 단위 줄바꿈</i> (KO)</span>
+      </label>
+
+      <label class="ctrl check">
+        <input type="checkbox" id="hyphenation">
+        <span>Hyphenation <i>하이픈</i> (needs word wrap)</span>
+      </label>
+
+      <label class="ctrl check">
+        <input type="checkbox" id="embeddedStyle" checked>
+        <span>Embedded book CSS <i>책 내장 CSS</i></span>
+      </label>
+    </section>
+
+    <section class="card" id="fontCard">
+      <h2>Reader font <i>본문 글꼴</i></h2>
+
+      <div class="ctrl segRow">
+        <span>Face preset <i>글꼴</i></span>
+        <select id="fontPreset" class="visHidden">
+          <option value="ridibatang" selected>RIDIBatang 14 (KO build default)</option>
+          <option value="kopub">KoPub Batang 14 (stock)</option>
+          <option value="custom">Custom .epdfont (runtime)</option>
+        </select>
+        <span class="seg" role="radiogroup" aria-label="Reader font preset / 본문 글꼴">
+          <button type="button" class="segBtn" data-value="ridibatang" role="radio"
+                  title="RIDIBatang 14 — KO build default" aria-checked="true">RIDIBatang 14</button>
+          <button type="button" class="segBtn" data-value="kopub" role="radio"
+                  title="KoPub Batang 14 (stock)" aria-checked="false">KoPub Batang 14</button>
+          <button type="button" class="segBtn" data-value="custom" role="radio"
+                  title="Custom .epdfont (runtime)" aria-checked="false">Custom .epdfont</button>
+        </span>
+      </div>
+
+      <div id="fontUpload" class="uploadBox hidden">
+        <p class="hint">Pick a TTF/OTF and tune — every change re-converts and
+          re-paginates live (visible page first, rest of the book pre-converts
+          silently once you stop). Same output the X4 loads from <code>/fonts/</code>.</p>
+
+        <div class="ctrl fileCtrl">
+          <span>Font file <i>OTF/TTF</i></span>
+          <input type="file" id="fontFile" class="fileInput" accept=".otf,.ttf,font/otf,font/ttf">
+          <label for="fontFile" class="btn secondary fileBtn small" title="Choose an OTF/TTF font file">Choose…</label>
+        </div>
+
+        <label class="ctrl">
+          <span>Name <i>이름</i></span>
+          <input type="text" id="fontName" value="custom" maxlength="24">
+        </label>
+
+        <label class="ctrl" title="Point size at the KO reader's 150 dpi — 14 matches the built-in RIDIBatang">
+          <span>Point size <i>크기</i></span>
+          <input type="range" id="fontSize" min="8" max="48" step="1" value="14">
+          <output id="fontSizeOut">14 pt</output>
+        </label>
+
+        <label class="ctrl" title="Target stroke weight. Variable fonts (wght axis) are instanced at
+this weight before rasterizing — fixes faces whose fvar default is Thin (e.g.
+NotoSansKR-VariableFont defaults to 100). Static fonts get synthetic bold
+relative to their native OS/2 weight: +100 ≈ +0.5 px strokes at 14 pt, which
+measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
+          <span>Weight <i>글자 굵기</i></span>
+          <input type="range" id="fontWeight" min="100" max="900" step="25" value="500">
+          <output id="fontWeightOut">500</output>
+        </label>
+
+        <label class="ctrl check">
+          <input type="checkbox" id="fontHangul" checked>
+          <span>Full modern Hangul U+AC00–D7AF <i>완성형 한글</i></span>
+        </label>
+
+        <label class="ctrl stacked">
+          <span>Extra intervals <i>추가 범위</i> (hex pairs)</span>
+          <input type="text" id="fontIntervals" placeholder="e.g. 0x3130,0x318F 0x3000,0x303F"
+                 title="Comma or space separated MIN,MAX hex ranges">
+        </label>
+
+        <label class="ctrl" title="Space advance in px — the KO build overrides space to 9 px">
+          <span>Space advance px <i>공백 폭</i></span>
+          <input type="range" id="fontSpacePx" min="0" max="30" step="1" value="9">
+          <output id="fontSpacePxOut">9 px</output>
+        </label>
+
+        <div id="fontConvStatus" class="fontStatus"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Page / 페이지</h2>
+      <label class="ctrl">
+        <span>Screen margin <i>여백</i></span>
+        <input type="range" id="screenMargin" min="5" max="40" step="5" value="5">
+        <output id="screenMarginOut">5</output>
+      </label>
+
+      <label class="ctrl">
+        <span>Image rendering <i>이미지</i></span>
+        <select id="imageRendering">
+          <option value="0" selected>Display (표시)</option>
+          <option value="1">Placeholder (자리표시)</option>
+          <option value="2">Suppress (숨김)</option>
+        </select>
+      </label>
+
+      <button id="resetBtn" class="btn secondary">Reset defaults / 기본값</button>
+    </section>
+
+    <p class="hint">
+      Engine: crosspoint-reader-ko 1.5.0-ko.3 (MIT) via WASM, KO typography build.<br>
+      Reader font: RIDIBatang 14 (default, advanceY 38 → lines 38/45/53 px), KoPub Batang 14 switchable,
+      custom .epdfont via OTF/TTF conversion.
+    </p>
+  </aside>
+
+  <!-- Export column -->
+  <aside id="exportPanel">
+    <section class="card" id="exportCard">
+      <h2>Export / 내보내기</h2>
+      <p class="hint" id="exportSub">1 EPUB → 1 device file — the preview always shows
+        exactly the chosen mode's output</p>
+
+      <div class="seg exportSeg" role="radiogroup" aria-label="Export mode / 출력 모드"
+           title="Output depth — the preview re-renders to show exactly this">
+        <button type="button" class="segBtn" data-value="0" role="radio" aria-checked="false"
+                title="Fast refresh — 1-bit XTC (XTC magic, XTG pages; BW plane, no AA greys)">XTC 1-bit <i>fast</i></button>
+        <button type="button" class="segBtn active" data-value="1" role="radio" aria-checked="true"
+                title="High quality — 2-bit XTCH (XTCH magic, XTH pages; full AA greys)">XTCH 2-bit <i>HD</i></button>
+      </div>
+
+      <label class="ctrl check" title="Wrap the container in XTZ4 (LZ4 blocks) → .xtcz file. Needs device firmware 5.1.6+; typically ~45% size">
+        <input type="checkbox" id="lz4Wrap">
+        <span>LZ4 compress <i>압축</i> (.xtcz)</span>
+      </label>
+
+      <label class="ctrl">
+        <span>File name <i>파일명</i></span>
+        <input type="text" id="exportName" value="[X4]" maxlength="40"
+               title="Prefix added before the book title">
+      </label>
+
+      <button id="downloadBtn" class="btn primary" disabled
+              title="Re-renders the whole book with the current settings and mode, then saves the device file">Export &amp; download ↓ / 내보내기 &amp; 다운로드</button>
+
+      <div id="exportStatus" class="exportStatus"></div>
+    </section>
+  </aside>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
