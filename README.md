@@ -1,5 +1,7 @@
 # KO-Fork EPUB → XTCH WASM Module — Build & API
 
+**Live:** https://crosspoint-ko-wasm.pages.dev
+
 Status: **DONE — verified end-to-end** (2026-09-09)
 
 The CrossPoint-KO Korean fork renderer (`crosspoint-reader-ko`, branch `release/korean`,
@@ -27,8 +29,11 @@ on-device XTC/XTH decode contract.
 ### Host build
 ```sh
 cmake -S . -B build && cmake --build build -j8
-./build/ko_xtch_host book.epub out.xtch
+./build/ko_xtch_host /abs/path/book.epub /abs/path/out.xtch
 ```
+> Pass **absolute** paths. The engine builds an internal virtual FS rooted at
+> `/.crosspoint/`, so a relative book path fails with
+> `Could not find or size META-INF/container.xml` even though the file is right there.
 
 ### WASM build
 ```sh

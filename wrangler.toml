@@ -1,0 +1,16 @@
+# Cloudflare Pages project config.
+#
+# Output dir is `dist`, NOT `web`, on purpose: web/ holds the commercial,
+# non-redistributable demo.epub used for local testing. scripts/build_dist.sh
+# copies web/ → dist/ with an explicit exclude (and fails hard if the book ever
+# leaks), so the deployed artifact can never contain it.
+#
+# Git-connected Pages project:
+#   build command : bash scripts/build_dist.sh
+#   output dir    : dist
+# Direct upload:
+#   bash scripts/build_dist.sh && npx wrangler pages deploy dist
+
+name = "crosspoint-ko-wasm"
+compatibility_date = "2026-09-01"
+pages_build_output_dir = "dist"
