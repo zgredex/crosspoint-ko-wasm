@@ -72,6 +72,32 @@ inline const MonoNoiseMasks& monoNoiseMasks() {
   static const MonoNoiseMasks inst;
   return inst;
 }
+
+// 8x8 bit-matrix transpose of the eight bytes packed into a uint64 (byte j at bits 8*(7-j)).
+// Definition, used as the reference for the fast version below:
+//     out[b] bit (7-j) = in[j] bit (7-b)
+// This is exactly the transpose the mono writer needs: the eight strided plane bytes are the rows,
+// and the eight logical rows sharing an input byte column are the columns.
+inline uint64_t transpose8x8Naive(uint64_t L) {
+  uint64_t T = 0;
+  for (int j = 0; j < 8; ++j) {
+    const uint8_t in = static_cast<uint8_t>((L >> (8 * (7 - j))) & 0xFF);
+    for (int b = 0; b < 8; ++b) {
+      if (((in >> (7 - b)) & 1) != 0) T |= static_cast<uint64_t>(1) << (8 * (7 - b) + (7 - j));
+    }
+  }
+  return T;
+}
+
+// Fast form: three delta-swap stages (Hacker's Delight). Swapping bit (r,c) with (c,r) needs the
+// deltas 7, 14, 28 for an 8x8 matrix held in 64 bits.
+inline uint64_t transpose8x8(uint64_t x) {
+  uint64_t t;
+  t = (x ^ (x >> 7)) & 0x00AA00AA00AA00AAULL;  x = x ^ t ^ (t << 7);
+  t = (x ^ (x >> 14)) & 0x0000CCCC0000CCCCULL; x = x ^ t ^ (t << 14);
+  t = (x ^ (x >> 28)) & 0x00000000F0F0F0F0ULL; x = x ^ t ^ (t << 28);
+  return x;
+}
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -149,35 +175,41 @@ class XtchWriter {
     // The dither uses precomputed mask layers instead of a per-pixel table lookup - that lookup
     // was measured at ~0.32 ns/pixel, about one cycle each.
     const MonoNoiseMasks& nm = monoNoiseMasks();
-    for (int y = 0; y < LOGICAL_H; y++) {
-      const int planeBit = 7 - (y & 7);
-      const uint8_t yc = static_cast<uint8_t>(y & 63);
-      const uint8_t* bwRow = bw.data() + (y >> 3);
-      const uint8_t* lsbRow = haveGray ? lsb.data() + (y >> 3) : nullptr;
-      const uint8_t* msbRow = haveGray ? msb.data() + (y >> 3) : nullptr;
-      uint8_t* outRow = plane.data() + static_cast<size_t>(y) * 60;
-      for (int k = 0; k < LOGICAL_W / 8; k++) {
-        uint8_t bwBits = 0, lBits = 0, mBits = 0;
+    // One 8x8 block per iteration: 8 strided loads per plane cover 64 pixels (previous version:
+    // 24 loads per 8 pixels). Gather, transpose, then decide eight output bytes.
+    for (int c = 0; c < LOGICAL_H / 8; ++c) {        // input byte column = phyX >> 3 = y >> 3
+      for (int k = 0; k < LOGICAL_W / 8; ++k) {      // output byte column = x >> 3
+        uint64_t Lbw = 0, Llsb = 0, Lmsb = 0;
         for (int j = 0; j < 8; ++j) {
-          const size_t off = static_cast<size_t>(479 - 8 * k - j) * 100;
-          const uint8_t sh = static_cast<uint8_t>(1u << (7 - j));
-          if (((bwRow[off] >> planeBit) & 1) == 0) bwBits |= sh;   // ink bit = 0 in engine BW
+          const size_t off = static_cast<size_t>(479 - 8 * k - j) * 100 + c;
+          const int sh = 8 * (7 - j);
+          Lbw |= static_cast<uint64_t>(bw[off]) << sh;
           if (haveGray) {
-            if (((lsbRow[off] >> planeBit) & 1) != 0) lBits |= sh;
-            if (((msbRow[off] >> planeBit) & 1) != 0) mBits |= sh;
+            Llsb |= static_cast<uint64_t>(lsb[off]) << sh;
+            Lmsb |= static_cast<uint64_t>(msb[off]) << sh;
           }
         }
-        uint8_t inkBits = bwBits;
-        if (dither && inkBits) {
-          // v: 1 = lsb; 2 = !lsb && msb; 3 = !lsb && !msb (same encoding as the scalar path).
-          const uint8_t m3 = static_cast<uint8_t>(~lBits & ~mBits);
-          const uint8_t m2 = static_cast<uint8_t>(~lBits &  mBits);
-          inkBits = static_cast<uint8_t>(
-              inkBits & static_cast<uint8_t>((m3 & nm.m[2][yc][k]) |
-                                             (lBits & nm.m[0][yc][k]) |
-                                             (m2 & nm.m[1][yc][k])));
+        const uint64_t Tbw = transpose8x8(Lbw);
+        const uint64_t Tlsb = haveGray ? transpose8x8(Llsb) : 0;
+        const uint64_t Tmsb = haveGray ? transpose8x8(Lmsb) : 0;
+        for (int b = 0; b < 8; ++b) {
+          const int y = c * 8 + b;
+          const int sh = 8 * (7 - b);
+          // Transposed byte: bit (7-j) holds the pixel at x = 8k + j of this logical row.
+          uint8_t inkBits = static_cast<uint8_t>(~((Tbw >> sh) & 0xFF));  // ink bit = 0
+          if (dither && inkBits) {
+            const uint8_t lBits = static_cast<uint8_t>((Tlsb >> sh) & 0xFF);
+            const uint8_t mBits = static_cast<uint8_t>((Tmsb >> sh) & 0xFF);
+            const uint8_t m3 = static_cast<uint8_t>(~lBits & ~mBits);
+            const uint8_t m2 = static_cast<uint8_t>(~lBits & mBits);
+            const uint8_t yc = static_cast<uint8_t>(y & 63);
+            inkBits = static_cast<uint8_t>(
+                inkBits & static_cast<uint8_t>((m3 & nm.m[2][yc][k]) |
+                                               (lBits & nm.m[0][yc][k]) |
+                                               (m2 & nm.m[1][yc][k])));
+          }
+          plane[static_cast<size_t>(y) * 60 + k] &= static_cast<uint8_t>(~inkBits);
         }
-        outRow[k] &= static_cast<uint8_t>(~inkBits);   // XTG bit 0 = black
       }
     }
 
