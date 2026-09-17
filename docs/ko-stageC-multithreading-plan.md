@@ -280,3 +280,142 @@ COOP/COEP와 함께 재검토. 그 전에는 하지 않습니다: 자체 위험�
 C5(워커 추가)보다 가치 있습니다. Max-minus-one은 올바른 풀 크기이지만, 남은 속도가 있는
 곳은 아닙니다. C4의 기본값도 max-minus-one이며, 스파인 수가 워커보다 적거나 아주 작은 책에서
 인스턴시에이션 비용이 지배적임이 측정될 때만 줄이며, 그 축소도 측정으로 정합니다.
+
+
+---
+
+## Two-phase scheduling: parallel pagination, then one global page queue
+
+**Decision: do not dispatch at spine granularity alone. Split the export into two parallel phases.**
+
+### Phase 1 - paginate every spine (spine granularity)
+
+Each worker takes a whole spine, parses it and lays out its pages.
+
+    120.9 ms / 10 = 12.1 ms
+
+This phase is deliberately spine-granular because pagination is sequential *within* a spine - each
+page break depends on how everything before it flowed - so it cannot be split further without
+changing the layout. Splitting it is not a scheduling question, it is a correctness one.
+
+### Phase 2 - render from ONE global page queue (page granularity)
+
+Every laid-out page from every spine goes into a single queue; any worker takes the next page.
+
+    1,353.5 ms / 10 = 135.4 ms
+
+A worker asked for page P of spine S builds S itself if it has not already. Parse + paginate is
+~0.06 ms/page, so a shared spine costs ~2 ms to re-parse - cheap against the imbalance it removes.
+
+### Why the split matters
+
+Spine-granular dispatch ends the export when the **largest remaining spine** ends, so the tail is
+"the biggest chapter" (measured tail spine distribution pending C0). With a page queue the tail is
+**one page**: ~0.7 ms for text, ~2.3 ms for an image page. That is the difference between the
+~300-320 ms projection and ~150 ms.
+
+### What this requires
+
+- **The coordinator owns** the spine list, the global page queue, the output ordering and the
+  container assembly. Workers own only their own engine instance and its state.
+- **Ordering must be by index, not arrival.** Each queue item carries (spineIndex, pageIndex) and
+  results land in a preallocated per-page slot, so worker completion order cannot reach the output.
+  This is what keeps the N=1 vs N=max-minus-one gate meaningful - without it, a page queue would
+  make the output order depend on scheduling.
+- **Phase 1 output must be shared with phase 2**: the page list per spine. One entry per page, so
+  it is small, but it is now needed by every worker rather than just the coordinator.
+- **Building a spine is idempotent and per-worker**, so any worker may build any spine it is asked
+  to render. No cross-worker state, no locking.
+- **Reserve one worker for preview navigation** (the core held back by max-minus-one), so an export
+  does not freeze the UI.
+
+### Gates for this change
+
+- page-level identical output at N=1, at N=max-minus-one, and phase 1/2 merged vs split
+- per-phase wall clock, proving phase 1 has not grown (it should stay ~12 ms)
+- tail measurement: time from "last queue item handed out" to "last result in" - should be about
+  one page. This is the direct test of whether the split achieved what it was for.
+
+### Resulting projection
+
+    load                      1.8 ms
+    phase 1  paginate        12.1 ms   parallel, spine granularity
+    phase 2  render         135.4 ms   parallel, page queue, near-perfect balance
+    tables + patch            0.3 ms   (streaming writer, see tail section)
+    write                    68.3 ms   overlapped with phase 2
+    ------------------------------------
+    critical path           ~150 ms    ->  10.0x
+
+**~150 ms is the Amdahl ceiling at 10 workers**, not a waypoint: renderPage is 90% of the work, so
+after this the binding constraint is the render phase itself. Further gains must come from making
+renderPage cheaper (SIMD on glyph/quantise paths, dither wiring, decode decisions) - not from more
+threads, and not from further scheduling.
+
+---
+
+## 2단계 스케줄링: 병렬 페이지네이션 후 하나의 전역 페이지 큐
+
+**결정: 스파인 단위 디스패치만으로는 부족합니다. 내보내기를 두 개의 병렬 단계로 나눕니다.**
+
+### 1단계 — 모든 스파인 페이지네이션 (스파인 단위)
+
+워커가 스파인 하나를 통째로 맡아 파싱하고 페이지를 레이아웃합니다.
+
+    120.9 ms / 10 = 12.1 ms
+
+이 단계를 의도적으로 스파인 단위로 두는 이유는 페이지네이션이 스파인 *내부에서* 순차적이기
+때문입니다 — 각 페이지 나눔이 앞선 모든 내용의 흐름에 의존합니다 — 따라서 레이아웃을 바꾸지 않고는
+더 나눌 수 없습니다. 이는 스케줄링 문제가 아니라 정확성 문제입니다.
+
+### 2단계 — 하나의 전역 페이지 큐에서 렌더 (페이지 단위)
+
+모든 스파인의 레이아웃된 모든 페이지가 하나의 큐에 들어가고, 아무 워커나 다음 페이지를 가져갑니다.
+
+    1,353.5 ms / 10 = 135.4 ms
+
+스파인 S의 페이지 P를 요청받은 워커는 아직 없다면 S를 직접 빌드합니다. 파싱+페이지네이션은
+페이지당 약 0.06 ms이므로 공유 스파인 재파싱 비용은 약 2 ms이며, 제거되는 불균형에 비하면
+저렴합니다.
+
+### 이 분할이 중요한 이유
+
+스파인 단위 디스패치는 **남은 가장 큰 스파인**이 끝날 때 내보내기가 끝나므로 꼬리가 '가장 큰
+챕터'입니다. 페이지 큐에서는 꼬리가 **페이지 하나**입니다: 텍스트 약 0.7 ms, 이미지 페이지 약
+2.3 ms. 이것이 ~300-320 ms 예상과 ~150 ms의 차이입니다.
+
+### 필요한 것
+
+- **코디네이터가 소유**: 스파인 목록, 전역 페이지 큐, 출력 순서, 컨테이너 조립. 워커는 자기 엔진
+  인스턴스와 그 상태만 소유합니다.
+- **순서는 도착이 아니라 인덱스로.** 각 큐 항목이 (spineIndex, pageIndex)를 지니고 결과가 미리
+  할당된 페이지 슬롯에 들어가므로, 워커 완료 순서가 출력에 도달할 수 없습니다. 이것이
+  N=1 대 N=max-minus-one 게이트를 유효하게 유지합니다 — 이것이 없으면 페이지 큐는 출력 순서를
+  스케줄링에 의존하게 만듭니다.
+- **1단계 결과를 2단계와 공유**: 스파인별 페이지 목록. 페이지당 한 항목이라 작지만, 이제
+  코디네이터만이 아니라 모든 워커가 필요로 합니다.
+- **스파인 빌드는 멱등이며 워커별**: 어떤 워커든 자기가 렌더하라는 스파인을 빌드할 수 있습니다.
+  워커 간 상태도, 잠금도 없습니다.
+- **미리보기 탐색용으로 워커 하나를 남겨 둡니다**(max-minus-one이 남긴 코어). 내보내기가 UI를
+  멈추지 않게 하기 위함입니다.
+
+### 게이트
+
+- N=1, N=max-minus-one, 그리고 1/2단계 병합 대 분할에서 페이지 단위 출력 동일
+- 단계별 벽시계 시간: 1단계가 커지지 않았음을 증명(약 12 ms 유지)
+- 꼬리 측정: '마지막 큐 항목 배포'부터 '마지막 결과 도착'까지 — 페이지 하나 정도여야 하며,
+  이것이 분할의 목적 달성 여부를 직접 검증합니다.
+
+### 결과 예상
+
+    load                      1.8 ms
+    1단계  페이지네이션       12.1 ms   병렬, 스파인 단위
+    2단계  렌더             135.4 ms   병렬, 페이지 큐, 거의 완벽한 균형
+    테이블 + 패치             0.3 ms   (스트리밍 라이터)
+    write                    68.3 ms   2단계와 중첩
+    ------------------------------------
+    임계 경로               ~150 ms    ->  10.0배
+
+**~150 ms는 10워커에서의 Amdahl 상한**이며 경유지가 아닙니다: renderPage가 전체의 90%이므로 이후의
+구속 조건은 렌더 단계 자체입니다. 추가 이득은 renderPage를 더 싸게 만드는 데서 나와야 하며
+(글리프/양자화 경로의 SIMD, 디더 연결, 디코딩 결정), 스레드를 늘리거나 스케줄링을 더 다듬는
+데서 나오지 않습니다.
