@@ -95,3 +95,60 @@ libpng zlib` ≈ 4 s).
 **No vendoring here, deliberately:** JPEG implementations diverge in IDCT rounding — hence
 vendored libjpeg-turbo with SIMD off — but PNG decoding is exact integer arithmetic and
 inflate is deterministic, so the toolchain-native libpng is bit-identical.
+
+---
+
+## Stage 2 mechanics settled (2026-09-17, second pass)
+
+**Must be atomic.** PNGdec's `iPixelType` is an enum type taken BY TYPE by
+`convertLineToGray`, so defining our own `PNG_PIXEL_*` constants while `PNGdec.h` is still
+included is an enumerator clash, and the call site stops type-checking:
+
+    BandBlock.h:35: error: redefinition of enumerator 'PNG_PIXEL_GRAYSCALE'
+    PngToFramebufferConverter.cpp:231: error: no matching function for call to 'convertLineToGray'
+
+So: shared constants + struct + `PNGdec.h` removal + decode swap happen in ONE step.
+
+Ready-made script: `scripts/png-port/stage2b_atomic.py`. It does not rewrite the ~100-line
+region; it deletes only specific constructs (brace-counted, with span-length assertions so
+a bad anchor aborts instead of eating code) and swaps the decode call:
+
+1. heap gates (`ESP.getMaxAllocHeap` + `MIN_FREE_HEAP_FOR_PNG`) - both occurrences
+2. `unique_ptr<PNG>` allocation
+3. `png->open(...)` + its `ScopedCleanup`
+4. `PNG_SUCCESS` -> 0
+5. PNGdec's two-scanline overflow guard
+6. the file callbacks `pngOpenWithHandle` .. `pngSeekWithHandle` (asserts span <= 60 lines
+   so `convertLineToGray` cannot be swallowed)
+7. `#include <PNGdec.h>` out, `BandBlock.h` in
+8. `PNGDRAW` -> `PngBlock` (keeps every field name, so the callback body is untouched)
+9. `validateImageDimensions(png->getWidth(), png->getHeight(), ...)` -> whole-file read +
+   libpng dimensions; `ctx.srcWidth/srcHeight` -> those; `rc = png->decode(&ctx, 0)` ->
+   row loop calling `pngDrawCallback` per row with a synthetic `PngBlock`
+
+### MISSING PIECE - write this first
+
+The script calls a helper that does not exist yet. Add it to `BandBlock.h` (or a new
+`PngDecodeSession.h`) and include it:
+
+    class PngDecodeSession {
+     public:
+      bool begin(const std::vector<uint8_t>& file, const std::string& path, int w, int h);
+      bool hasAlpha() const;     // post-update_info colour type has an alpha channel
+      int passes() const;        // png_set_interlace_handling result (1 if not interlaced)
+      void readRow(uint8_t* dst);  // png_read_row
+      ~PngDecodeSession();         // png_destroy_read_struct
+    };
+    // plus: int pngReadDimensions(const std::vector<uint8_t>& file, const std::string& path);
+    //       int pngReadHeight(...);
+
+Normalisation inside `begin()`: `png_read_info` -> `png_set_strip_16` if 16-bit ->
+`png_set_palette_to_rgb` if palette -> `png_set_expand_gray_1_2_4_to_8` if low-bit grey ->
+`png_set_rgb_to_gray_fixed` for RGB/palette -> `png_set_tRNS_to_alpha` if tRNS ->
+`png_set_interlace_handling` -> `png_read_update_info`. Do NOT strip alpha: the callback's
+`convertLineToGray` handles GRAY_ALPHA itself and the old path passed `iHasAlpha` too, so
+stripping would change compositing and break the gate. Errors via
+`setjmp(png_jmpbuf(png))` so a malformed file fails the image, not the process.
+
+Gate (baseline already captured): `/tmp/ab/png_before.xtch`, 1345804 B / 14 pages -
+page-level identical, 0 differing pixels. PNG is lossless, so identical is the target.
