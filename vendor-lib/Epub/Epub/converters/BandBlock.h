@@ -18,3 +18,31 @@ struct BandBlock {
   int iHeight = 0;     // number of rows in the band
   uint16_t* pPixels = nullptr;  // 8-bit greyscale, densely packed, cast for the ABI
 };
+
+// ---------------------------------------------------------------------------
+// PNGdec-compatible scanline block and pixel-type tags.
+//
+// PNGdec has been removed from the build. These definitions keep the PNG framebuffer
+// converter's callback signature and its comparisons byte-for-byte identical, so removing
+// the library is provably behaviour-neutral. Field names match PNGdec's, which is why the
+// callback body needs no change at all.
+// ---------------------------------------------------------------------------
+inline constexpr int PNG_SUCCESS = 0;  // PNGdec's success code, kept for the call sites
+
+enum PngPixelType {
+  PNG_PIXEL_GRAYSCALE = 0,
+  PNG_PIXEL_GRAY_ALPHA = 1,
+  PNG_PIXEL_TRUECOLOR = 2,
+  PNG_PIXEL_TRUECOLOR_ALPHA = 3,
+  PNG_PIXEL_INDEXED = 4,
+};
+
+struct PNGDRAW {
+  void* pUser = nullptr;
+  int y = 0;                 // source row index
+  int iBpp = 8;
+  int iHasAlpha = 0;
+  int iPixelType = PNG_PIXEL_GRAYSCALE;
+  void* pPalette = nullptr;  // always null: palette is expanded to RGB, then to grey
+  uint8_t* pPixels = nullptr;
+};

@@ -5,7 +5,7 @@
 #include <HalStorage.h>
 #include <Logging.h>
 #include <Memory.h>
-#include <PNGdec.h>  // remaining: the scanline decode path
+#include "BandBlock.h"  // PNGDRAW + PNG_PIXEL_* live here now
 
 #include <cstdlib>
 #include <cstring>
@@ -44,35 +44,6 @@ struct PngContext {
 
 // File I/O callbacks use pFile->fHandle to access the HalFile*,
 // avoiding the need for global file state.
-void* pngOpenWithHandle(const char* filename, int32_t* size) {
-  HalFile* f = new HalFile();
-  if (!Storage.openFileForRead("PNG", std::string(filename), *f)) {
-    delete f;
-    return nullptr;
-  }
-  *size = f->size();
-  return f;
-}
-
-void pngCloseWithHandle(void* handle) {
-  HalFile* f = reinterpret_cast<HalFile*>(handle);
-  if (f) {
-    f->close();
-    delete f;
-  }
-}
-
-int32_t pngReadWithHandle(PNGFILE* pFile, uint8_t* pBuf, int32_t len) {
-  HalFile* f = reinterpret_cast<HalFile*>(pFile->fHandle);
-  if (!f) return 0;
-  return f->read(pBuf, len);
-}
-
-int32_t pngSeekWithHandle(PNGFILE* pFile, int32_t pos) {
-  HalFile* f = reinterpret_cast<HalFile*>(pFile->fHandle);
-  if (!f) return -1;
-  return f->seek(pos);
-}
 
 // The PNG decoder (PNGdec) is ~42 KB due to internal zlib decompression buffers.
 // We heap-allocate it on demand rather than using a static instance, so this memory
@@ -227,7 +198,8 @@ int pngDrawCallback(PNGDRAW* pDraw) {
   if (endDstY > ctx->dstHeight) endDstY = ctx->dstHeight;
 
   // Convert entire source line to grayscale (improves cache locality)
-  convertLineToGray(pDraw->pPixels, ctx->grayLineBuffer, srcWidth, pDraw->iPixelType, pDraw->iBpp, pDraw->pPalette,
+  convertLineToGray(pDraw->pPixels, ctx->grayLineBuffer, srcWidth, pDraw->iPixelType, pDraw->iBpp,
+                    static_cast<uint8_t*>(pDraw->pPalette),  // always null in this port
                     pDraw->iHasAlpha);
 
   // Render scaled rows using Bresenham-style integer stepping (no floating-point division)

@@ -184,3 +184,38 @@ than the cap:
 
 Equivalence holds everywhere PNGdec could decode; where it could not, the port is strictly
 better. Host and wasm both build (wasm exit 0).
+
+---
+
+## Stage 3 - CLOSED (2026-09-17): PNGdec is gone
+
+**The handoff was wrong about this one.** The cover converter
+(vendor-lib/PngToBmpConverter/PngToBmpConverter.cpp) never used PNGdec: it is a
+self-contained decoder with its own chunk walker (findNextIdatChunk), scanline decoder
+(decodeScanline), grey conversion (convertScanlineToGray) and inflate. So stage 3 was a
+DELETION, not a port - no cover-code changes were needed at all.
+
+PNGdec was referenced by exactly two files: CMakeLists.txt and the framebuffer converter.
+
+### What was done
+
+1. BandBlock.h gains PNGdec-compatible definitions: PNG_PIXEL_* enumerators, a PNGDRAW
+   struct with the same field names, and PNG_SUCCESS = 0. The framebuffer callback body is
+   therefore untouched by the removal.
+2. The framebuffer converter drops <PNGdec.h> for BandBlock.h.
+3. 29 lines of dead PNGdec file callbacks deleted (pngOpenWithHandle..pngSeekWithHandle,
+   the PNGFILE users).
+4. One call-site cast: the synthetic block's pPalette is void* while convertLineToGray
+   declares uint8_t* - void* does not implicitly convert to uint8_t* in C++.
+5. CMakeLists.txt: 8 PNGdec lines removed (include dir + 7 sources, including its bundled
+   zlib). third_party/PNGdec deleted.
+
+### Gate
+
+The PNGdec-free build is **byte-identical** to the design-C build: demo-png.epub, 14 pages,
+**0 differing pages, 0 differing pixels**. Host builds; wasm builds (exit 0).
+
+### Result
+
+No device-era decoder remains in the tree: JPEG on libjpeg-turbo, PNG on libpng, PXC cache
+gone, MCU band machinery gone.
