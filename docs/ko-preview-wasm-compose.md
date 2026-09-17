@@ -221,3 +221,41 @@ Add `ko_rgba_ptr()` + `ko_compose_rgba()` to `src/wasm_api.cpp` (inside `extern 
 `KO_EXPORT`), point the worker at them with the zero-copy `ImageData` view, delete both JS
 compose functions and their LUTs, rebuild wasm, and re-run the gate against the same oracle.
 Browser timing via `performance.now()` around compose + `putImageData` still outstanding.
+
+---
+
+## Stage 2 gate CLOSED on real engine page data (2026-09-17)
+
+The gate did not need a browser. The engine's own planes are recoverable from a page the
+engine produced: invert the writer's packing (v = 0 if !ink, 1 if lsb, 2 if msb, else 3)
+out of the XTCH page bytes and rebuild the three 48,000-byte planes. Page 7 of png_3.xtch
+was used, whose four-level histogram proves real content across all shades:
+
+    v=0 white 302,274 | v=1 dark grey 6,503 | v=2 light grey 49,597 | v=3 black 25,626
+
+Results:
+
+    cmp rgba_cpp_real.bin rgba_js_real.bin    -> IDENTICAL (1,536,000 bytes)
+    cmp rgba_cpp_real.bin rgba_jsold_real.bin -> IDENTICAL (1,536,000 bytes)
+
+* C++ engine compose == frozen JS oracle, on real page content.
+* C++ engine compose == ORIGINAL JS as well, which independently re-verifies the JS
+  optimisation (b3b2184) on real content rather than only on synthetic planes.
+
+The only link left to inspection rather than bytes is the wiring itself: ko_compose_rgba
+reads ko_plane_ptr(0/1/2), the same accessors the export path already uses, each returning
+48,000 bytes per the layout above.
+
+## Browser timing - snippet, not yet run
+
+The compose is measured (1.419 ms/page 2-bit, 0.088 ms/page 1-bit, native, 300 iters). The
+canvas upload cannot be timed outside a browser, so it is NOT estimated here. Drop this into
+the worker around the compose + blit and report the numbers:
+
+    const t0 = performance.now();
+    api._ko_compose_rgba(mono ? 1 : 0);
+    const t1 = performance.now();
+    const img = new ImageData(new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4), 480, 800);
+    ctx.putImageData(img, 0, 0);
+    const t2 = performance.now();
+    console.log('compose', (t1 - t0).toFixed(2), 'ms  putImageData', (t2 - t1).toFixed(2), 'ms');
