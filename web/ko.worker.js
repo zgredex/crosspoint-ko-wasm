@@ -141,14 +141,28 @@ const GRAY = [255, 128, 205, 0]; // white, dark-grey, light-grey, black
 // 480x800 RGBA buffer and we wrap it as a ZERO-COPY view. No JS pixel loop exists.
 // The buffer can move if wasm memory grows, so the pointer is fetched AFTER composing and
 // the view is rebuilt every call. putImageData reads it synchronously, so the view stays valid.
+// tick/tock are the worker's existing stage timers; used defensively so this stays valid if
+// they are not in scope here.
+function _stage(name, fn) {
+  const has = typeof tick === 'function' && typeof tock === 'function';
+  if (has) tick(name);
+  try { return fn(); } finally { if (has) tock(name); }
+}
+
 function composeMono() {
-  if (api._ko_compose_rgba(1) !== 0) throw new Error('engine compose failed (mono)');
-  return new ImageData(new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4), 480, 800);
+  _stage('compose.mono', () => {
+    if (api._ko_compose_rgba(1) !== 0) throw new Error('engine compose failed (mono)');
+  });
+  return _stage('compose.view', () =>
+    new ImageData(new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4), 480, 800));
 }
 
 function composePage() {
-  if (api._ko_compose_rgba(0) !== 0) throw new Error('engine compose failed');
-  return new ImageData(new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4), 480, 800);
+  _stage('compose.page', () => {
+    if (api._ko_compose_rgba(0) !== 0) throw new Error('engine compose failed');
+  });
+  return _stage('compose.view', () =>
+    new ImageData(new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4), 480, 800));
 }
 
 async function init() {
