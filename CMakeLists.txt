@@ -119,7 +119,59 @@ set(STUB_SOURCES
   ${STUB_DIR}/uzlib_checksums.c
 )
 
+# ---------------------------------------------------------------------------
+# libjpeg-turbo, vendored so host and wasm share ONE decoder implementation.
+#
+# Upstream refuses add_subdirectory() outright ("cannot be integrated into another
+# build system using add_subdirectory()"), so it is built as an ExternalProject and
+# imported. Its own generated jconfig.h comes from its build system either way,
+# which is the other reason not to hand-roll it.
+#
+# SIMD is disabled on purpose. The SIMD IDCT/colour paths are not guaranteed
+# bit-identical to the C ISLOW path, and the host build is the byte-exact
+# verification harness — divergence between toolchains would make every
+# verification ambiguous. With SIMD off, both toolchains compile the same C and
+# our decoder sets dct_method = JDCT_ISLOW, so decoded pixels match everywhere.
+#
+# TurboJPEG (the C++ wrapper), 12-bit samples and shared libraries are unused.
+# ---------------------------------------------------------------------------
+include(ExternalProject)
+
+set(JPEG_TURBO_INSTALL ${CMAKE_BINARY_DIR}/libjpeg-install)
+set(JPEG_TURBO_ARGS
+    -DCMAKE_BUILD_TYPE=Release
+    -DENABLE_SHARED=OFF
+    -DENABLE_STATIC=ON
+    -DWITH_SIMD=OFF
+    -DWITH_TURBOJPEG=OFF
+    -DWITH_12BIT=OFF
+    -DWITH_JAVA=OFF
+    -DCMAKE_INSTALL_PREFIX=${JPEG_TURBO_INSTALL})
+if(CMAKE_TOOLCHAIN_FILE)
+  list(APPEND JPEG_TURBO_ARGS -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE})
+endif()
+
+ExternalProject_Add(libjpeg_turbo_ext
+  SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libjpeg-turbo
+  BINARY_DIR ${CMAKE_BINARY_DIR}/libjpeg-turbo-build
+  INSTALL_DIR ${JPEG_TURBO_INSTALL}
+  CMAKE_ARGS ${JPEG_TURBO_ARGS}
+  BUILD_BYPRODUCTS ${JPEG_TURBO_INSTALL}/lib/libjpeg.a
+  UPDATE_COMMAND ""
+  TEST_COMMAND ""
+  LOG_BUILD ON)
+
+add_library(jpeg-static STATIC IMPORTED GLOBAL)
+set_target_properties(jpeg-static PROPERTIES
+  IMPORTED_LOCATION ${JPEG_TURBO_INSTALL}/lib/libjpeg.a
+  INTERFACE_INCLUDE_DIRECTORIES ${JPEG_TURBO_INSTALL}/include)
+add_dependencies(jpeg-static libjpeg_turbo_ext)
+# The imported archive does not exist until the ExternalProject has built, so make
+# the dependency explicit for the targets that link it.
+file(MAKE_DIRECTORY ${JPEG_TURBO_INSTALL}/include)
+
 add_library(koengine STATIC ${ENGINE_SOURCES} ${STUB_SOURCES})
+target_link_libraries(koengine PUBLIC jpeg-static)
 
 if(EMSCRIPTEN)
   add_executable(ko_xtch_wasm src/wasm_api.cpp)
