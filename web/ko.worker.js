@@ -67,6 +67,51 @@ function defaultSpec() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Text-viewport derivation for the EXPORTED FILE.
+//
+// GfxRenderer::getOrientedViewableTRBL() supplies the viewable margins (portrait
+// 9/3/3/3) and the reader adds screenMargin to every side:
+//
+//   t += screenMargin;  r += screenMargin;  b += screenMargin;  l += screenMargin;
+//   viewport = screen - (l+r, t+b)
+//
+// DELIBERATE DIVERGENCE — and it is a hard product constraint: the device's EPUB
+// reader ALSO reserves the status-bar lane (EpubReaderActivity::render() does
+// `b += max(screenMargin, statusBarHeight)`, statusBarHeight = 19 for shipped
+// defaults). We do NOT, because an XTC/XTCH page is a finished BITMAP and the UI
+// must never be encoded into it:
+//
+//   * nothing of the UI is drawn into the page — that is the point,
+//   * the device composites its own chrome at read time (XtcReaderActivity +
+//     xtcStatusBarMode, default XTC_STATUS_BAR_HIDE),
+//   * reserving the lane here would bake a UI-driven gap into page geometry, so
+//     one book would paginate differently based on a UI setting the file does
+//     not contain.
+//
+// Net: default margins 14/8/8/8 → viewport 464x778, matching the official
+// converter byte-for-byte. The reader's live-layout numbers (464x764) are a
+// *preview* concern only — chrome composited by the browser, never exported.
+// ---------------------------------------------------------------------------
+const VIEWABLE_MARGIN = { top: 9, right: 3, bottom: 3, left: 3 };  // GfxRenderer::VIEWABLE_MARGIN_*
+const SCREEN_W = 480;
+const SCREEN_H = 800;
+
+function marginsFor(spec) {
+  const m = spec.screenMargin;
+  return {
+    top: VIEWABLE_MARGIN.top + m,
+    right: VIEWABLE_MARGIN.right + m,
+    left: VIEWABLE_MARGIN.left + m,
+    bottom: VIEWABLE_MARGIN.bottom + m,
+  };
+}
+
+function viewportFor(spec) {
+  const mg = marginsFor(spec);
+  return { width: SCREEN_W - mg.left - mg.right, height: SCREEN_H - mg.top - mg.bottom, margins: mg };
+}
+
 function specKey(spec) {
   return JSON.stringify(spec);
 }
@@ -268,18 +313,25 @@ self.onmessage = async (ev) => {
         api._ko_set_character_wrap(currentSpec.characterWrap);
         api._ko_set_paragraph_alignment(currentSpec.paragraphAlignment);
         api._ko_set_extra_paragraph_spacing(currentSpec.extraParagraphSpacing);
-        api._ko_set_hyphenation(currentSpec.hyphenation);
+        // Firmware gates hyphenation on word-wrap mode (CrossPointSettings::
+        // readerRenderSpec): hyphenationEnabled = hyphenationEnabled && characterWrap == 0.
+        // Character wrap can already break anywhere, so hyphenation is inert there.
+        api._ko_set_hyphenation((currentSpec.hyphenation && currentSpec.characterWrap === 0) ? 1 : 0);
         api._ko_set_embedded_style(currentSpec.embeddedStyle);
         api._ko_set_image_rendering(currentSpec.imageRendering);
         api._ko_set_text_aa(currentSpec.textAa);
         tick('applyFont');
         applyFont(currentSpec.font);   // reader face (default ridibatang)
         tock('applyFont');
-        // margins: device = viewable (9/3/3/3) + screenMargin
-        const m = currentSpec.screenMargin;
-        api._ko_set_margins(9 + m, 3 + m, 3 + m, 3 + m);
+        // margins: viewable area + screenMargin on all four sides (no UI reserve)
+        const mg = marginsFor(currentSpec);
+        api._ko_set_margins(mg.top, mg.right, mg.bottom, mg.left);
         tock('spec');
-        post(id, true, { specKey: specKey(currentSpec) });
+        post(id, true, {
+          specKey: specKey(currentSpec),
+          margins: mg,
+          viewport: { width: SCREEN_W - mg.left - mg.right, height: SCREEN_H - mg.top - mg.bottom },
+        });
         break;
       }
 

@@ -1,0 +1,19 @@
+# Cloudflare Pages headers (copied into dist/ by scripts/build_dist.sh).
+#
+# The JS glue and the 6.5 MB .wasm must never mix versions, so nothing here is
+# cached without revalidation — Pages' ETag makes the revalidate cheap (304).
+#
+# NOTE: do NOT set Content-Type here. Pages derives MIME from the file extension
+# and already serves .wasm as application/wasm. An earlier revision added a
+# `*.wasm` Content-Type rule; without a leading "/" that pattern matched every
+# path and stamped application/wasm onto index.html, app.js and style.css, which
+# makes browsers refuse to render the site. Extension-derived MIME is correct —
+# leave it alone.
+/*
+  Cache-Control: public, max-age=0, must-revalidate
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+
+# the demo books are content, not code — safe to hold longer than a session
+/*.epub
+  Cache-Control: public, max-age=86400

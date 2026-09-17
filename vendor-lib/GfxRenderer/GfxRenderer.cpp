@@ -428,6 +428,87 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
       innerBase = cursorX + left;  // screenX = innerBase + glyphX
     }
 
+    // ---- portrait fast path ------------------------------------------------
+    // Portrait + non-rotated is the only configuration this build produces, and
+    // it has closed-form destination addressing: for one glyph row phyX is
+    // constant (so the bit mask never changes) and phyY = panelHeight-1-screenX
+    // decreases by exactly 1 per pixel — so the framebuffer byte address simply
+    // steps by -stride. Walking it directly removes, per glyph pixel, a
+    // rotateCoordinates() call, a bounds check and a LOG_ERR (which formats a
+    // string!) — that last one fires on every pixel of a glyph box that hangs
+    // off the panel edge. Falls back to the generic path for every other
+    // orientation/rotation or while a tiled-grayscale strip target is active.
+    if constexpr (rotation == TextRotation::None) {
+      if (renderer.getOrientation() == GfxRenderer::Portrait && !renderer.hasStripTarget()) {
+        uint8_t* const fb = renderer.getWriteTarget();
+        const int stride = renderer.getDisplayWidthBytes();
+        const int panelW = renderer.getDisplayWidth();
+        const int panelH = renderer.getDisplayHeight();
+
+        for (int glyphY = 0; glyphY < height; glyphY++) {
+          const int phyX = outerBase + glyphY;   // screenY, constant across the row
+          if (phyX < 0 || phyX >= panelW) continue;
+          const int colByte = phyX >> 3;
+          const uint8_t mask = static_cast<uint8_t>(1u << (7 - (phyX & 7)));
+          // phyY = panelH - 1 - (innerBase + glyphX); clip glyphX so 0 <= phyY < panelH.
+          const int phyY0 = panelH - 1 - innerBase;
+          int gx0 = 0;
+          int gx1 = width - 1;
+          if (phyY0 >= panelH) gx0 = phyY0 - (panelH - 1);
+          if (phyY0 < gx1) gx1 = phyY0;
+          if (gx0 > gx1) continue;
+
+          const int rowPixel0 = glyphY * width;
+          int idx = (phyY0 - gx0) * stride + colByte;
+          // The synthetic-bold twin sits one screenX further, i.e. one physical
+          // row lower; only valid while every pixel in the clipped run has room.
+          const bool boldOk = syntheticBold && (phyY0 - gx1) >= 1;
+
+          if (is2Bit) {
+            for (int gx = gx0; gx <= gx1; gx++, idx -= stride) {
+              const int pp = rowPixel0 + gx;
+              const uint8_t b = bitmap[pp >> 2];
+              // font 0=white 1=light 2=dark 3=black -> 0=black .. 3=white
+              // NOTE: tried skipping zero bytes (four white pixels) here; it measured
+              // SLOWER (1454 -> 1699 ms on a 2034-page book) — the extra branch costs
+              // more than the skip saves on dense Korean glyph boxes.
+              const uint8_t v = static_cast<uint8_t>(3 - ((b >> ((3 - (pp & 3)) * 2)) & 0x3));
+              if (renderMode == GfxRenderer::BW) {
+                if (v < 3) {
+                  fb[idx] &= static_cast<uint8_t>(~mask);
+                  if (boldOk) fb[idx - stride] &= static_cast<uint8_t>(~mask);
+                }
+              } else if (renderMode == GfxRenderer::GRAYSCALE_MSB) {
+                if (v == 1 || v == 2) {
+                  fb[idx] |= mask;
+                  if (boldOk) fb[idx - stride] |= mask;
+                }
+              } else if (renderMode == GfxRenderer::GRAYSCALE_LSB) {
+                if (v == 1) {
+                  fb[idx] |= mask;
+                  if (boldOk) fb[idx - stride] |= mask;
+                }
+              }
+            }
+          } else {
+            for (int gx = gx0; gx <= gx1; gx++, idx -= stride) {
+              const int pp = rowPixel0 + gx;
+              if ((bitmap[pp >> 3] >> (7 - (pp & 7))) & 1) {
+                if (pixelState) {
+                  fb[idx] &= static_cast<uint8_t>(~mask);
+                  if (boldOk) fb[idx - stride] &= static_cast<uint8_t>(~mask);
+                } else {
+                  fb[idx] |= mask;
+                  if (boldOk) fb[idx - stride] |= mask;
+                }
+              }
+            }
+          }
+        }
+        return;   // glyph fully drawn by the fast path
+      }
+    }
+
     if (is2Bit) {
       int pixelPosition = 0;
       for (int glyphY = 0; glyphY < height; glyphY++) {
@@ -1987,10 +2068,12 @@ int GfxRenderer::getLineHeight(const int fontId) const {
 }
 
 int GfxRenderer::getLineHeight(const int fontId, const float compression) const {
-  // The Korean fork truncates the scaled advance; keep pagination and tiers
-  // identical (CrossPoint-1.5.0-KO-Typography-Changes.md): RIDIBatang 14 →
-  // Tight 38 / Normal 45 / Wide 53 px.
-  return static_cast<int>(getLineHeight(fontId) * compression);
+  // Mirror of crosspoint-reader-ko (release/korean): the scaled advance is
+  // ROUNDED, not truncated. The half-pixel bump is not cosmetic — with
+  // RIDIBatang 14 (advanceY 38) at Normal spacing, 38 * 1.20 = 45.6, so this
+  // returns 46 px while a truncating build emits 45 and silently paginates
+  // differently (one line of drift per ~40 lines).
+  return static_cast<int>(getLineHeight(fontId) * compression + 0.5f);
 }
 
 int GfxRenderer::getTextHeight(const int fontId) const {
@@ -2105,6 +2188,59 @@ void GfxRenderer::preconditionGrayscale(int x, int y, int w, int h) const {
 void GfxRenderer::copyGrayscaleLsbBuffers() const { display.copyGrayscaleLsbBuffers(frameBuffer); }
 
 void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuffers(frameBuffer); }
+
+// ---- text-gray capture ----------------------------------------------------
+// See the contract in GfxRenderer.h. Capture only ever ADDS a side write while
+// recording a level that the draw path already computed, so pass 1's output is
+// unchanged by construction.
+void GfxRenderer::beginLevelCapture() {
+  const int rowBytes = getDisplayWidthBytes() * 4;  // 4 px/byte at 2 bits each
+  if (!_levelBuf) {
+    _levelRowBytes = rowBytes;
+    _levelBuf = static_cast<uint8_t*>(malloc(static_cast<size_t>(rowBytes) * panelHeight));
+    if (!_levelBuf) { _levelRowBytes = 0; return; }
+  }
+  // Pre-fill with white (level 3): a pixel no glyph touches stays white, and
+  // white sets no gray bit, so untouched pixels need no capture at all.
+  memset(_levelBuf, 0xFF, static_cast<size_t>(_levelRowBytes) * panelHeight);
+  _levelCapture = true;
+}
+
+void GfxRenderer::captureLevel(const int x, const int y, const uint8_t level) const {
+  if (!_levelCapture) return;
+  int phyX = 0;
+  int phyY = 0;
+  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
+  captureLevelPhysical(phyX, phyY, level);
+}
+
+void GfxRenderer::captureLevelPhysical(const int phyX, const int phyY, const uint8_t level) const {
+  if (!_levelBuf || phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) return;
+  uint8_t* p = _levelBuf + static_cast<size_t>(phyY) * _levelRowBytes + (phyX >> 2);
+  const uint8_t shift = static_cast<uint8_t>((3 - (phyX & 3)) * 2);
+  *p = static_cast<uint8_t>((*p & ~(0x3u << shift)) | ((level & 0x3u) << shift));
+}
+
+void GfxRenderer::orCapturedGrayInto(uint8_t* planeOut, const bool lsbPlane) const {
+  if (!_levelBuf || !planeOut) return;
+  const int planeRowBytes = getDisplayWidthBytes();
+  for (int row = 0; row < panelHeight; row++) {
+    const uint8_t* lrow = _levelBuf + static_cast<size_t>(row) * _levelRowBytes;
+    uint8_t* outRow = planeOut + static_cast<size_t>(row) * planeRowBytes;
+    for (int b = 0; b < planeRowBytes; b++) {
+      const uint8_t lo = lrow[b * 2];      // pixels 0..3 of this plane byte
+      const uint8_t hi = lrow[b * 2 + 1];  // pixels 4..7
+      uint8_t bits = 0;
+      for (int i = 0; i < 4; i++) {
+        const uint8_t lvLo = static_cast<uint8_t>((lo >> ((3 - i) * 2)) & 0x3u);
+        if (lvLo == 1 || (!lsbPlane && lvLo == 2)) bits |= static_cast<uint8_t>(0x80u >> i);
+        const uint8_t lvHi = static_cast<uint8_t>((hi >> ((3 - i) * 2)) & 0x3u);
+        if (lvHi == 1 || (!lsbPlane && lvHi == 2)) bits |= static_cast<uint8_t>(0x08u >> i);
+      }
+      outRow[b] |= bits;
+    }
+  }
+}
 
 void GfxRenderer::displayGrayBuffer() const { display.displayGrayBuffer(fadingFix); }
 

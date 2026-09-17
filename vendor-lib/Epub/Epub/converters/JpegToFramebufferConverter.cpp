@@ -7,9 +7,14 @@
 #include <Logging.h>
 #include <Memory.h>
 
+#include <csetjmp>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <new>
+#include <vector>
+
+#include <jpeglib.h>
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
@@ -48,68 +53,62 @@ struct JpegContext {
   bool caching{false};
 };
 
-// File I/O callbacks use pFile->fHandle to access the HalFile*,
-// avoiding the need for global file state.
-void* jpegOpen(const char* filename, int32_t* size) {
-  HalFile* f = new HalFile();
-  if (!Storage.openFileForRead("JPG", std::string(filename), *f)) {
-    delete f;
-    return nullptr;
-  }
-  *size = f->size();
-  return f;
+// ---------------------------------------------------------------------------
+// libjpeg-turbo, decoded from a whole-file buffer via jpeg_mem_src.
+//
+// The old decoder (JPEGDEC) streamed MCU bands through file callbacks because it
+// had fixed internal buffers, and that banding is why the sampling math below is
+// block-relative. We keep that math untouched and simply hand it the whole frame
+// as a single band via a synthetic JPEGDRAW (x=0, y=0), so `x - blockX` and
+// `y - blockY` become the identity and the destination box cannot drift.
+// ---------------------------------------------------------------------------
+
+// libjpeg calls error_exit() — which is exit() — on malformed data unless the error
+// manager is replaced. A corrupt image must fail the decode, never the process
+// (and in wasm, never the whole conversion).
+struct JpegErrorHandler {
+  jpeg_error_mgr pub;
+  jmp_buf escape;
+  char message[JMSG_LENGTH_MAX]{};
+};
+
+void jpegErrorExit(j_common_ptr cinfo) {
+  JpegErrorHandler* self = reinterpret_cast<JpegErrorHandler*>(cinfo->err);
+  (*cinfo->err->format_message)(cinfo, self->message);
+  longjmp(self->escape, 1);
 }
 
-void jpegClose(void* handle) {
-  HalFile* f = reinterpret_cast<HalFile*>(handle);
-  if (f) {
-    f->close();
-    delete f;
+// Read the whole file into memory: no streaming, no size cap (a 1200x1500 greyscale
+// frame is 1.8 MB against a 2 GB heap).
+bool readWholeFile(const std::string& path, std::vector<uint8_t>& out) {
+  HalFile f;
+  if (!Storage.openFileForRead("JPG", path, f)) {
+    LOG_ERR("JPG", "Failed to open %s", path.c_str());
+    return false;
   }
+  const int64_t size = f.size();
+  if (size <= 0) {
+    LOG_ERR("JPG", "Empty file: %s", path.c_str());
+    f.close();
+    return false;
+  }
+  out.resize(static_cast<size_t>(size));
+  const int32_t got = f.read(out.data(), static_cast<int32_t>(out.size()));
+  f.close();
+  if (got != static_cast<int32_t>(size)) {
+    LOG_ERR("JPG", "Short read on %s (%d of %lld)", path.c_str(), (int)got, (long long)size);
+    return false;
+  }
+  return true;
 }
 
-// JPEGDEC tracks file position via pFile->iPos internally (e.g. JPEGGetMoreData
-// checks iPos < iSize to decide whether more data is available). The callbacks
-// MUST maintain iPos to match the actual file position, otherwise progressive
-// JPEGs with large headers fail during parsing.
-int32_t jpegRead(JPEGFILE* pFile, uint8_t* pBuf, int32_t len) {
-  HalFile* f = reinterpret_cast<HalFile*>(pFile->fHandle);
-  if (!f) return 0;
-  int32_t bytesRead = f->read(pBuf, len);
-  if (bytesRead < 0) return 0;
-  pFile->iPos += bytesRead;
-  return bytesRead;
-}
-
-int32_t jpegSeek(JPEGFILE* pFile, int32_t pos) {
-  HalFile* f = reinterpret_cast<HalFile*>(pFile->fHandle);
-  if (!f) return -1;
-  if (!f->seek(pos)) return -1;
-  pFile->iPos = pos;
-  return pos;
-}
-
-// JPEGDEC object is ~17 KB due to internal decode buffers.
-// Heap-allocate on demand so memory is only used during active decode.
-constexpr size_t JPEG_DECODER_APPROX_SIZE = 20 * 1024;
-constexpr size_t MIN_FREE_HEAP_FOR_JPEG = JPEG_DECODER_APPROX_SIZE + 16 * 1024;
-
-// Choose JPEGDEC's built-in scale factor for coarse downscaling.
-// Returns the scale denominator (1, 2, 4, or 8) and sets jpegScaleOption.
-int chooseJpegScale(float targetScale, int& jpegScaleOption) {
-  if (targetScale <= 0.125f) {
-    jpegScaleOption = JPEG_SCALE_EIGHTH;
-    return 8;
-  }
-  if (targetScale <= 0.25f) {
-    jpegScaleOption = JPEG_SCALE_QUARTER;
-    return 4;
-  }
-  if (targetScale <= 0.5f) {
-    jpegScaleOption = JPEG_SCALE_HALF;
-    return 2;
-  }
-  jpegScaleOption = 0;
+// Coarse downscale factor for the DCT-domain decode. Deliberately the SAME thresholds
+// as the old chooser: this value determines scaledSrcWidth/Height and therefore the
+// sampling geometry, so it must not drift.
+int chooseScaleDenom(float targetScale) {
+  if (targetScale <= 0.125f) return 8;
+  if (targetScale <= 0.25f) return 4;
+  if (targetScale <= 0.5f) return 2;
   return 1;
 }
 
@@ -198,7 +197,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         uint8_t gray = row[dstX - blockX];
         uint8_t dithered;
         if (useDithering) {
-          dithered = applyBayerDither4Level(gray, outX, outY);
+          dithered = applyOrderedDither4Level(gray, outX, outY);
         } else {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
@@ -257,7 +256,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
         uint8_t dithered;
         if (useDithering) {
-          dithered = applyBayerDither4Level(gray, outX, outY);
+          dithered = applyOrderedDither4Level(gray, outX, outY);
         } else {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
@@ -280,7 +279,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
         uint8_t dithered;
         if (useDithering) {
-          dithered = applyBayerDither4Level(gray, outX, outY);
+          dithered = applyOrderedDither4Level(gray, outX, outY);
         } else {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
@@ -306,7 +305,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
         uint8_t dithered;
         if (useDithering) {
-          dithered = applyBayerDither4Level(gray, outX, outY);
+          dithered = applyOrderedDither4Level(gray, outX, outY);
         } else {
           dithered = gray / 85;
           if (dithered > 3) dithered = 3;
@@ -339,7 +338,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
       uint8_t dithered;
       if (useDithering) {
-        dithered = applyBayerDither4Level(gray, outX, outY);
+        dithered = applyOrderedDither4Level(gray, outX, outY);
       } else {
         dithered = gray / 85;
         if (dithered > 3) dithered = 3;
@@ -355,27 +354,33 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 }  // namespace
 
 bool JpegToFramebufferConverter::getDimensionsStatic(const std::string& imagePath, ImageDimensions& out) {
-  size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < MIN_FREE_HEAP_FOR_JPEG) {
-    LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_JPEG);
+  std::vector<uint8_t> file;
+  if (!readWholeFile(imagePath, file)) return false;
+
+  JpegErrorHandler err;
+  jpeg_decompress_struct cinfo;
+  std::memset(&cinfo, 0, sizeof(cinfo));
+  bool created = false;
+  cinfo.err = jpeg_std_error(&err.pub);
+  err.pub.error_exit = jpegErrorExit;
+  if (setjmp(err.escape)) {
+    if (created) jpeg_destroy_decompress(&cinfo);
+    LOG_ERR("JPG", "Bad JPEG header: %s (%s)", imagePath.c_str(), err.message);
     return false;
   }
 
-  std::unique_ptr<JPEGDEC> jpeg(new (std::nothrow) JPEGDEC());
-  if (!jpeg) {
-    LOG_ERR("JPG", "Failed to allocate JPEG decoder for dimensions");
+  jpeg_create_decompress(&cinfo);
+  created = true;
+  jpeg_mem_src(&cinfo, file.data(), static_cast<unsigned long>(file.size()));
+  if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+    jpeg_destroy_decompress(&cinfo);
+    LOG_ERR("JPG", "Not a JPEG: %s", imagePath.c_str());
     return false;
   }
 
-  int rc = jpeg->open(imagePath.c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, nullptr);
-  const ScopedCleanup cleanup{[&jpeg]() { jpeg->close(); }};
-  if (rc != 1) {
-    LOG_ERR("JPG", "Failed to open JPEG for dimensions (err=%d): %s", jpeg->getLastError(), imagePath.c_str());
-    return false;
-  }
-
-  out.width = jpeg->getWidth();
-  out.height = jpeg->getHeight();
+  out.width = static_cast<int>(cinfo.image_width);
+  out.height = static_cast<int>(cinfo.image_height);
+  jpeg_destroy_decompress(&cinfo);
   LOG_DBG("JPG", "Image dimensions: %dx%d", out.width, out.height);
 
   return true;
@@ -385,47 +390,53 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
                                                      const RenderConfig& config) {
   LOG_DBG("JPG", "Decoding JPEG: %s", imagePath.c_str());
 
-  size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < MIN_FREE_HEAP_FOR_JPEG) {
-    LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_JPEG);
-    return false;
-  }
-
-  std::unique_ptr<JPEGDEC> jpeg(new (std::nothrow) JPEGDEC());
-  if (!jpeg) {
-    LOG_ERR("JPG", "Failed to allocate JPEG decoder");
-    return false;
-  }
-
   JpegContext ctx;
   ctx.renderer = &renderer;
   ctx.config = &config;
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
 
-  int rc = jpeg->open(imagePath.c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, jpegDrawCallback);
-  const ScopedCleanup cleanup{[&jpeg]() { jpeg->close(); }};
-  if (rc != 1) {
-    LOG_ERR("JPG", "Failed to open JPEG (err=%d): %s", jpeg->getLastError(), imagePath.c_str());
+  std::vector<uint8_t> file;
+  if (!readWholeFile(imagePath, file)) return false;
+
+  JpegErrorHandler err;
+  jpeg_decompress_struct cinfo;
+  std::memset(&cinfo, 0, sizeof(cinfo));
+  bool created = false;
+  cinfo.err = jpeg_std_error(&err.pub);
+  err.pub.error_exit = jpegErrorExit;
+  if (setjmp(err.escape)) {
+    if (created) jpeg_destroy_decompress(&cinfo);
+    LOG_ERR("JPG", "Decode failed on %s: %s", imagePath.c_str(), err.message);
     return false;
   }
 
-  int srcWidth = jpeg->getWidth();
-  int srcHeight = jpeg->getHeight();
+  jpeg_create_decompress(&cinfo);
+  created = true;
+  jpeg_mem_src(&cinfo, file.data(), static_cast<unsigned long>(file.size()));
+  if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+    jpeg_destroy_decompress(&cinfo);
+    LOG_ERR("JPG", "Bad JPEG header: %s", imagePath.c_str());
+    return false;
+  }
+
+  const int srcWidth = static_cast<int>(cinfo.image_width);
+  const int srcHeight = static_cast<int>(cinfo.image_height);
 
   if (srcWidth <= 0 || srcHeight <= 0) {
+    jpeg_destroy_decompress(&cinfo);
     LOG_ERR("JPG", "Invalid JPEG dimensions: %dx%d", srcWidth, srcHeight);
     return false;
   }
 
   if (!validateImageDimensions(srcWidth, srcHeight, "JPEG")) {
+    jpeg_destroy_decompress(&cinfo);
     return false;
   }
 
-  bool isProgressive = jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE;
-  if (isProgressive) {
-    LOG_INF("JPG", "Progressive JPEG detected - decoding DC coefficients only (lower quality)");
-  }
+  // Progressive files now decode at FULL quality: the old "DC coefficients only"
+  // path was a decoder limitation (an 8x blur), not a requirement.
+  const bool isProgressive = cinfo.progressive_mode != 0;
 
   // Calculate overall target scale
   float targetScale;
@@ -445,18 +456,12 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     destHeight = (int)(srcHeight * targetScale);
   }
 
-  // Choose JPEGDEC built-in scaling for coarse downscaling.
-  // Progressive JPEGs: JPEGDEC forces JPEG_SCALE_EIGHTH internally (DC-only
-  // decode produces 1/8 resolution). We must match this to avoid the if/else
-  // priority chain in DecodeJPEG selecting a different scale.
-  int jpegScaleOption;
-  int jpegScaleDenom;
-  if (isProgressive) {
-    jpegScaleOption = JPEG_SCALE_EIGHTH;
-    jpegScaleDenom = 8;
-  } else {
-    jpegScaleDenom = chooseJpegScale(targetScale, jpegScaleOption);
-  }
+  // Coarse DCT-domain downscale. Progressive files are deliberately NOT forced to 1/8
+  // any more: that existed only because JPEGDEC decodes progressive DC-only, throwing
+  // away 7/8 of the detail. The coarse factor now comes from the target scale for both
+  // kinds of file, so the resampler is fed full-quality pixels. The destination box is
+  // identical either way.
+  const int jpegScaleDenom = chooseScaleDenom(targetScale);
 
   if (destWidth <= 0 || destHeight <= 0) {
     LOG_ERR("JPG", "Degenerate output dimensions %dx%d for %s, skipping render", destWidth, destHeight,
@@ -477,39 +482,52 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
           destHeight, targetScale, jpegScaleDenom, (float)destWidth / ctx.scaledSrcWidth,
           isProgressive ? " [progressive]" : "");
 
-  // Set pixel type to 8-bit grayscale (must be after open())
-  jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
-  jpeg->setUserPointer(&ctx);
+  // No pixel cache: it was an SD-card payload cache for a slow MCU re-rendering a
+  // page ~13 times. We render each page once, and the decoded frame is already in
+  // memory, so the cache has nothing to save and its band cap is device-shaped.
+  ctx.caching = false;
 
-  // Start streaming the pixel cache to disk. The band only needs to hold the
-  // tallest single decode block: a JPEGDEC MCU cell is at most 16 scaled-source
-  // rows tall, which our fine scale maps to this many output rows.
-  ctx.caching = !config.cachePath.empty();
-  if (ctx.caching) {
-    const int maxBlockDstRows = (int)(((int64_t)16 * ctx.fineScaleFPY) >> FP_SHIFT) + 2;
-    if (!ctx.cache.begin(config.cachePath, destWidth, destHeight, config.x, config.y, maxBlockDstRows)) {
-      LOG_ERR("JPG", "Failed to start cache stream, continuing without caching");
-      ctx.caching = false;
-    }
-  }
+  // Decode the whole frame once, greyscale, with the integer ISLOW IDCT so host and
+  // wasm produce identical pixels (SIMD is disabled in both builds).
+  cinfo.out_color_space = JCS_GRAYSCALE;
+  cinfo.dct_method = JDCT_ISLOW;
+  cinfo.scale_num = 1;
+  cinfo.scale_denom = static_cast<unsigned int>(jpegScaleDenom);
+  jpeg_start_decompress(&cinfo);
 
-  unsigned long decodeStart = millis();
-  rc = jpeg->decode(0, 0, jpegScaleOption);
-  unsigned long decodeTime = millis() - decodeStart;
-
-  if (rc != 1) {
-    LOG_ERR("JPG", "Decode failed (rc=%d, lastError=%d)", rc, jpeg->getLastError());
-    if (ctx.caching) ctx.cache.abort();
+  const int decodedW = static_cast<int>(cinfo.output_width);
+  const int decodedH = static_cast<int>(cinfo.output_height);
+  // The geometry math assumes ceil(srcW / denom). libjpeg rounds scaled output the same
+  // way, but verify rather than assume: a mismatch would silently shift every sample.
+  if (decodedW != ctx.scaledSrcWidth || decodedH != ctx.scaledSrcHeight) {
+    LOG_ERR("JPG", "Scaled dimension mismatch: decoder %dx%d, geometry %dx%d", decodedW, decodedH,
+            ctx.scaledSrcWidth, ctx.scaledSrcHeight);
+    jpeg_destroy_decompress(&cinfo);
     return false;
   }
 
-  LOG_DBG("JPG", "JPEG decoding complete - render time: %lu ms", decodeTime);
-
-  // Finalize the streamed cache file. Note: a flush failure mid-decode clears
-  // ctx.caching (the partial file is dropped), so re-read the flag here.
-  if (ctx.caching) {
-    ctx.cache.finalize();
+  std::vector<uint8_t> frame(static_cast<size_t>(decodedW) * static_cast<size_t>(decodedH));
+  while (cinfo.output_scanline < cinfo.output_height) {
+    JSAMPROW rows[1] = {frame.data() + static_cast<size_t>(cinfo.output_scanline) * decodedW};
+    jpeg_read_scanlines(&cinfo, rows, 1);
   }
+  jpeg_finish_decompress(&cinfo);
+  jpeg_destroy_decompress(&cinfo);
+  created = false;
+
+  // Hand the whole frame to the unchanged band callback as one band.
+  const unsigned long decodeStart = millis();
+  JPEGDRAW draw{};
+  draw.pUser = &ctx;
+  draw.x = 0;
+  draw.y = 0;
+  draw.iWidth = decodedW;
+  draw.iWidthUsed = decodedW;
+  draw.iHeight = decodedH;
+  draw.pPixels = reinterpret_cast<uint16_t*>(frame.data());
+  jpegDrawCallback(&draw);
+  const unsigned long decodeTime = millis() - decodeStart;
+  LOG_DBG("JPG", "JPEG decoding complete - render time: %lu ms", decodeTime);
 
   return true;
 }

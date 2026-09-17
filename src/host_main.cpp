@@ -5,12 +5,21 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "ko_engine_driver.h"
 #include "xtch_writer.h"
+
+// Phase profiling: where does whole-book conversion actually spend its time?
+// Layout (parse + paginate) and rasterize (glyphs + quantize) have completely
+// different optimization strategies, so measure before touching either.
+using Clock = std::chrono::steady_clock;
+static double msSince(const Clock::time_point& t0) {
+  return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
 
 // Global display instance the renderer references
 HalDisplay display;
@@ -53,11 +62,14 @@ int main(int argc, char** argv) {
   renderer.setFallbackFont(UI_FONT_ID);
 
   ko::EngineDriver driver(renderer, display);
+  auto tLoad0 = Clock::now();
   if (!driver.loadEpubFromBlob(epubBytes.data(), epubBytes.size(), epubPath)) {
     fprintf(stderr, "Epub::load failed\n");
     return 1;
   }
-  fprintf(stderr, "loaded: title='%s' spines=%d\n", driver.title().c_str(), driver.spineCount());
+  const double tLoad = msSince(tLoad0);
+  fprintf(stderr, "loaded: title='%s' spines=%d  [load %.1f ms]\n", driver.title().c_str(),
+          driver.spineCount(), tLoad);
 
   ko::Spec spec;
   const int mTop = spec.marginTop, mRight = spec.marginRight;
@@ -73,14 +85,21 @@ int main(int argc, char** argv) {
   std::vector<ko::XtchChapter> chapters;
   int chapterStart = 0;
   int spineCount = driver.spineCount();
+  double tBuild = 0, tRender = 0, tWrite = 0;
   for (int spine = 0; spine < spineCount; spine++) {
+    auto t0 = Clock::now();
     const int n = driver.buildSection(spine, spec);
+    tBuild += msSince(t0);
     if (n < 0) { fprintf(stderr, "spine %d: build failed\n", spine); continue; }
     fprintf(stderr, "spine %d/%d: %d pages\n", spine, spineCount, n);
     for (int p = 0; p < n; p++) {
       ko::RenderedPage rp;
+      t0 = Clock::now();
       if (!driver.renderPage(p, spec, rp)) { fprintf(stderr, "  page %d failed\n", p); continue; }
+      tRender += msSince(t0);
+      t0 = Clock::now();
       writer.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
+      tWrite += msSince(t0);
       totalPages++;
       if (totalPages % 25 == 0) fprintf(stderr, "  ...%d\n", totalPages);
     }
@@ -94,13 +113,24 @@ int main(int argc, char** argv) {
     }
   }
   fprintf(stderr, "rendered %d pages; finalizing container\n", totalPages);
+  fprintf(stderr,
+          "PROFILE  buildSection(parse+paginate) %.1f ms | renderPage(glyphs+quantize) %.1f ms"
+          " | writer %.1f ms | total %.1f ms | %.2f ms/page\n",
+          tBuild, tRender, tWrite, tBuild + tRender + tWrite,
+          totalPages ? (tBuild + tRender + tWrite) / totalPages : 0.0);
 
+  auto tFin0 = Clock::now();
   std::vector<uint8_t> out = writer.finish(chapters);
+  const double tFinish = msSince(tFin0);
   FILE* o = fopen(outPath.c_str(), "wb");
   if (!o) { fprintf(stderr, "cannot write %s\n", outPath.c_str()); return 1; }
+  tFin0 = Clock::now();
   fwrite(out.data(), 1, out.size(), o);
   fclose(o);
+  const double tDisk = msSince(tFin0);
   fprintf(stderr, "DONE %s (%zu bytes, %d pages, %zu chapters)\n", outPath.c_str(), out.size(),
           totalPages, chapters.size());
+  fprintf(stderr, "PROFILE2 load %.1f ms | finish(container build) %.1f ms | disk write %.1f ms\n",
+          tLoad, tFinish, tDisk);
   return 0;
 }

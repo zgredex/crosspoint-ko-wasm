@@ -133,18 +133,48 @@ class EngineDriver {
 
     renderer_.clearScreen(0xFF);
     renderer_.setRenderMode(GfxRenderer::BW);
-    renderPass(false);   // text + image blacks always
-    out.bw.assign(display_.getFrameBuffer(), display_.getFrameBuffer() + 48000);
 
     const bool aaOn = spec.textAntiAliasing != 0;
+    // ---------------------------------------------------------------------
+    // TEXT-ONCE PATH — IMPLEMENTED, MEASURED, NOT ENABLED.
+    //
+    // Idea: with AA on, the gray passes only contribute the text classification,
+    // so text could be blitted once (BW pass) and its gray bits OR'd in from
+    // `orCapturedGrayInto` instead of re-blitting the whole page twice more.
+    // Measured: renderPage 1,491 -> 1,144 ms (-23%) on a 2,034-page book.
+    //
+    // It is NOT byte-exact, so it stays off. Evidence:
+    //   * control (capture enabled, gray passes = reference) -> byte-exact, which
+    //     proves the capture itself is side-effect free;
+    //   * with the path on: 293/2,034 pages of a text book and 4/14 of an image
+    //     book diverge, on pages where Page::hasImages() == false, i.e. pages
+    //     whose gray passes draw nothing but text;
+    //   * the BW (ink) plane ALSO diverges there, and pass 1 is untouched code —
+    //     that is the contradiction. Either the page -> packed-page mapping or
+    //     the assumption that gray-mode text drawing is a pure function of the
+    //     coverage level is incomplete.
+    // Do not flip this on without resolving that first. Diagnostics that localise
+    // it live in the skill: references/ko-engine-performance-work.md (blob-shape
+    // map + per-plane split, which show thin 1px dither-like differences in a
+    // regular grid pattern).
+    // ---------------------------------------------------------------------
+    const bool textOnce = false;
+
+    if (textOnce) renderer_.beginLevelCapture();
+    renderPass(false);
+    if (textOnce) renderer_.endLevelCapture();
+    out.bw.assign(display_.getFrameBuffer(), display_.getFrameBuffer() + 48000);
+
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-    renderPass(!aaOn);   // AA off: text stays 1-bit, only images get gray
+    renderPass(textOnce ? true : !aaOn);
+    if (textOnce) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), true);
     renderer_.copyGrayscaleLsbBuffers();
 
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-    renderPass(!aaOn);
+    renderPass(textOnce ? true : !aaOn);
+    if (textOnce) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), false);
     renderer_.copyGrayscaleMsbBuffers();
 
     renderer_.setRenderMode(GfxRenderer::BW);

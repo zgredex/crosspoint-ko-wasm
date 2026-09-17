@@ -54,7 +54,13 @@ inline constexpr QuantProfile kProfileMaster = {{45, 70, 140}, {30, 50, 140}, {1
 // fork's thresholds" — kept selectable so it can be measured against `master`.
 inline constexpr QuantProfile kProfileKoFork = {{45, 70, 140}, {45, 70, 140}, {0, 85, 170, 255}, "kofork"};
 
-inline constexpr QuantProfile kDefaultProfile = kProfileMaster;
+// Default: the ko fork's own triple (45/70/140) on BOTH paths, with nominal level
+// luminances. This is the strictest reading of "keep the ko fork's thresholds", and
+// it also measured better than `master` in every comparison run (ramp tone error
+// 0.031 vs 0.185; real-photo local tone error 1.36 vs 11.63) — `master`'s
+// perceived-luminance levels (15/30/80/210) are carried here but were never
+// explained, so they are not the default. One line to switch.
+inline constexpr QuantProfile kDefaultProfile = kProfileKoFork;
 
 // ---------------------------------------------------------------------------
 // Enumeration

@@ -110,36 +110,37 @@ class XtchWriter {
   }
 
   // 2-bit XTH page: two column-major planes (bit1/bit2), columns right→left.
+  //
+  // Optimized from the per-pixel form: it is a byte-aligned permutation, so it
+  // runs 8 pixels at a time. For a logical column x every pixel reads physical
+  // row phyY = 479 - x, and a pixel's source bit position (7 - (y & 7)) is the
+  // SAME as its destination bit position — so no shifting or bit reversal is
+  // needed and the inner 800-pixel loop becomes 100 byte operations:
+  //     ink = ~bw   (BW bit 0 = ink)
+  //     v = 0 white | 1 dark grey | 2 light grey | 3 black   (from ink/l/m)
+  //     p1 = v & 2  =  ink & ~l              (light grey or black)
+  //     p2 = v & 1  =  ink & (l | ~m)        (dark grey or black)
   bool addGrayPage(const std::vector<uint8_t>& bw, const std::vector<uint8_t>& lsb,
                    const std::vector<uint8_t>& msb, uint16_t LOGICAL_W, uint16_t LOGICAL_H) {
     std::vector<uint8_t> p1(48000, 0), p2(48000, 0);
+    if (bw.size() < 48000 || lsb.size() < 48000 || msb.size() < 48000) return false;
 
-    auto physBit = [](const std::vector<uint8_t>& buf, int phyX, int phyY) -> int {
-      return (buf[phyY * 100 + (phyX >> 3)] >> (7 - (phyX & 7))) & 1;
-    };
-
-    // Logical portrait → physical: Portrait rotation is phyX=y, phyY=479-x.
+    const int rowBytes = 100;         // physical row stride: 800 px / 8
+    const int rowsPerCol = LOGICAL_H / 8;   // 800 logical y -> 100 bytes
     for (int x = 0; x < LOGICAL_W; x++) {
-      const int targetCol = LOGICAL_W - 1 - x;  // XTH columns right→left
-      for (int y = 0; y < LOGICAL_H; y++) {
-        const int phyX = y;
-        const int phyY = 479 - x;
-        const int ink = physBit(bw, phyX, phyY) == 0;
-        const int l = physBit(lsb, phyX, phyY) == 1;
-        const int m = physBit(msb, phyX, phyY) == 1;
-        int v;
-        if (!ink)
-          v = 0;
-        else if (l)
-          v = 1;  // dark grey (engine LSB pass marks dark only)
-        else if (m)
-          v = 2;  // light grey (MSB only)
-        else
-          v = 3;  // pure black core
-        const int planeByte = targetCol * 100 + (y >> 3);
-        const int planeBit = 7 - (y & 7);
-        if (v & 2) p1[planeByte] |= static_cast<uint8_t>(1 << planeBit);
-        if (v & 1) p2[planeByte] |= static_cast<uint8_t>(1 << planeBit);
+      const int targetCol = LOGICAL_W - 1 - x;   // XTH columns right→left
+      const int phyY = 479 - x;                  // portrait: phyX = y, phyY = 479 - x
+      const uint8_t* rowB = bw.data() + static_cast<size_t>(phyY) * rowBytes;
+      const uint8_t* rowL = lsb.data() + static_cast<size_t>(phyY) * rowBytes;
+      const uint8_t* rowM = msb.data() + static_cast<size_t>(phyY) * rowBytes;
+      uint8_t* out1 = p1.data() + static_cast<size_t>(targetCol) * rowBytes;
+      uint8_t* out2 = p2.data() + static_cast<size_t>(targetCol) * rowBytes;
+      for (int by = 0; by < rowsPerCol; by++) {
+        const uint8_t ink = static_cast<uint8_t>(~rowB[by]);
+        const uint8_t l = rowL[by];
+        const uint8_t m = rowM[by];
+        out1[by] = static_cast<uint8_t>(ink & static_cast<uint8_t>(~l));
+        out2[by] = static_cast<uint8_t>(ink & static_cast<uint8_t>(l | static_cast<uint8_t>(~m)));
       }
     }
 

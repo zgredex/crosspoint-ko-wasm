@@ -80,6 +80,13 @@ class GfxRenderer {
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
 
+  // Text coverage-level scratch for the single-text-blit path: 2 bits per
+  // physical pixel, panel-wide (96 KB at 800x480). Allocated on first use and
+  // kept for the renderer's lifetime, so a captured page costs no allocation.
+  mutable uint8_t* _levelBuf = nullptr;
+  mutable int _levelRowBytes = 0;
+  mutable bool _levelCapture = false;
+
   // Shared implementation behind both drawText overloads (with/without Korean letter-spacing).
   void drawTextImpl(int fontId, int x, int y, const char* text, int8_t letterSpacing, bool black,
                     EpdFontFamily::Style style, BidiUtils::BidiBaseDir baseDir) const;
@@ -200,6 +207,10 @@ class GfxRenderer {
   uint8_t* getWriteTarget() const { return _stripActive ? _stripBuf : frameBuffer; }
   int getWriteOriginY() const { return _stripActive ? _stripY0 : 0; }
   int getWriteRows() const { return _stripActive ? _stripRows : panelHeight; }
+  // True when drawPixel()/clearScreen() are redirected to a tiled-grayscale band
+  // scratch instead of the shared framebuffer. Hot-path writers that bypass
+  // drawPixel() must fall back to it while a strip target is active.
+  bool hasStripTarget() const { return _stripActive; }
 
   // Drawing
   void drawPixel(int x, int y, bool state = true) const;
@@ -283,6 +294,35 @@ class GfxRenderer {
   // `fallback`).
   void displayGrayscaleBase(HalDisplay::RefreshMode fallback = HalDisplay::HALF_REFRESH) const;
   void copyGrayscaleLsbBuffers() const;
+
+  // ---- text-gray capture (render text ONCE instead of three times) --------
+  // STATUS: prepared but DISABLED — the driver's `textOnce` flag is false, and
+  // the glyph-loop call sites were deliberately removed from renderCharImpl
+  // because the extra (never-taken) branch per glyph pixel cost ~240 ms on a
+  // 2,034-page book. To re-enable: flip the driver flag AND re-add the capture
+  // calls in renderCharImpl (portrait fast path + generic path, 2-bit and 1-bit
+  // forms — noted in references/ko-engine-performance-work.md), then resolve the
+  // correctness blocker documented in src/ko_engine_driver.h.
+  //
+  // Idea: with AA on, the reference draws the whole page three times (BW, LSB,
+  // MSB) because each mode targets a different buffer. TEXT only ever
+  // contributes a pure per-pixel classification of its coverage level:
+  //     2-bit glyphs:  LSB bit = level==1        MSB bit = level==1 || level==2
+  //     1-bit glyphs:  BW ink clears (no-op on a zeroed gray buffer); a WHITE
+  //                    glyph sets both planes, which is captured as level 1.
+  // so the gray passes could render images only (page->renderImages) and have the
+  // text bits OR'd in from a buffer captured during the BW pass.
+  void beginLevelCapture();   // allocates the scratch once, pre-fills with white (3)
+  void endLevelCapture() { _levelCapture = false; }
+  bool levelCaptureActive() const { return _levelCapture; }
+  // Logical-coordinate capture (rotates exactly like drawPixel()).
+  void captureLevel(int x, int y, uint8_t level) const;
+  // Physical-coordinate capture for callers that already have panel coordinates.
+  void captureLevelPhysical(int phyX, int phyY, uint8_t level) const;
+  // OR the captured text level mask into a gray plane buffer (48000 bytes):
+  // lsbPlane=true  -> bit set where level == 1
+  // lsbPlane=false -> bit set where level == 1 || level == 2
+  void orCapturedGrayInto(uint8_t* planeOut, bool lsbPlane) const;
   void copyGrayscaleMsbBuffers() const;
   void displayGrayBuffer() const;
 

@@ -13,6 +13,7 @@
     paragraphIndent: $('paragraphIndent'), extraParagraphSpacing: $('extraParagraphSpacing'),
     characterWrap: $('characterWrap'), hyphenation: $('hyphenation'),
     embeddedStyle: $('embeddedStyle'), textAa: $('textAa'),
+    viewportOut: $('viewportOut'),
     screenMargin: $('screenMargin'), screenMarginOut: $('screenMarginOut'),
     imageRendering: $('imageRendering'), zoom: $('zoom'), zoomOut: $('zoomOut'),
     resetBtn: $('resetBtn'),
@@ -172,6 +173,12 @@
     els.textAa.checked = true;                // device default: on
     els.screenMargin.value = '5';
     els.screenMarginOut.textContent = '5';
+    // NOTE: the device's status-bar settings deliberately do NOT feed layout.
+    // The reader reserves a 19 px status-bar lane on-device, but an XTC/XTCH
+    // page is a finished bitmap and the UI must not be encoded into it — the
+    // device composites its own chrome at read time (xtcStatusBarMode, default
+    // hidden). Keeping the file UI-free is why there is no status-bar control
+    // in this panel.
     els.imageRendering.value = '0';
     els.fontPreset.value = 'ridibatang';
     els.fontSize.value = '14';
@@ -286,7 +293,17 @@
   }
 
   async function pushSpec() {
-    await call('spec', { spec: readSpec() });
+    const r = await call('spec', { spec: readSpec() });
+    // Surface the derived text viewport. It is the firmware's own arithmetic
+    // (viewable margins + screenMargin + status-bar lane), so showing it makes
+    // pagination behaviour auditable instead of mysterious.
+    if (els.viewportOut && r && r.viewport) {
+      const m = r.margins || {};
+      els.viewportOut.textContent =
+        'Text viewport 본문 영역: ' + r.viewport.width + '×' + r.viewport.height +
+        ' px  ·  margins T/R/B/L ' + m.top + '/' + m.right + '/' + m.bottom + '/' + m.left +
+        '  ·  no UI baked into the file (파일에는 UI 미포함)';
+    }
   }
 
   async function refresh(keepPage = true, quiet = false) {
@@ -385,6 +402,37 @@
     els.fontConvStatus.className = 'fontStatus' + (isErr ? ' err' : ' ok');
   }
 
+  // ---- backend capability ------------------------------------------------
+  // Custom-font conversion (TTF/OTF → .epdfont) is done by the local Python
+  // server (server.py → tools/ttf_to_epdfont_fast.py, freetype). A static
+  // deploy has no such endpoint, so probe once and say so plainly rather than
+  // surfacing a bare "HTTP 404" in the middle of a knob scrub.
+  let fontBackend = null;        // null = unknown, true = present, false = static deploy
+  let fontBackendProbe = null;
+  function hasFontBackend() {
+    if (fontBackend !== null) return Promise.resolve(fontBackend);
+    if (!fontBackendProbe) {
+      fontBackendProbe = (async () => {
+        try {
+          const r = await fetch('/api/convert-font', { method: 'POST', body: new FormData() });
+          // server.py answers this endpoint with JSON (even for a bad request);
+          // a static host answers with its own 404 page
+          fontBackend = (r.headers.get('content-type') || '').includes('application/json');
+        } catch (_) {
+          fontBackend = false;
+        }
+        if (!fontBackend) {
+          fontBackendProbe = Promise.resolve(false);
+          const note = document.getElementById('fontBackendNote');
+          if (note) note.classList.remove('hidden');
+          els.fontUpload.classList.add('noBackend');
+        }
+        return fontBackend;
+      })();
+    }
+    return fontBackendProbe;
+  }
+
   // POST the chosen font + tuning knobs to the local converter; returns the
   // .epdfont ArrayBuffer (or throws with the server's message).
   // Hot-path protocol: the FIRST convert of a picked file uploads the bytes and
@@ -393,6 +441,11 @@
   let fontIdByFile = {};    // file fingerprint → registered fontId
   const fontFp = (f) => (f ? f.name + '|' + f.size + '|' + (f.lastModified || 0) : '');
   async function convertFont(fontFile) {
+    if (!(await hasFontBackend())) {
+      throw new Error('custom font conversion needs the local server (server.py) — '
+        + '커스텀 폰트 변환은 로컬 서버에서만 동작합니다. '
+        + 'This hosted build ships the WASM engine only.');
+    }
     const fp = fontFp(fontFile);
     const fd = new FormData();
     const known = fontIdByFile[fp];
@@ -932,6 +985,7 @@
   });
 
   // ---- boot ----
+  hasFontBackend();   // one probe: is the server-side converter deployed here?
   worker = spawnWorker();
   bootEngine().catch((e) => {
     setStatus('engine failed to start: ' + e.message, true);
