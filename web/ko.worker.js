@@ -149,20 +149,30 @@ function _stage(name, fn) {
   try { return fn(); } finally { if (has) tock(name); }
 }
 
+// A view over wasm memory CANNOT be transferred through postMessage - the browser throws
+// 'cannot transfer WebAssembly ArrayBuffer', because wasm memory is non-detachable by spec.
+// So the frame is copied out into a normal ArrayBuffer here: one native typed-array copy
+// (~1.5 MB), not per-pixel work. The engine-side compose and its single 32-bit store per
+// pixel are unaffected.
+function _frameFromEngine() {
+  const src = new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4);
+  const img = new ImageData(480, 800);
+  img.data.set(src);
+  return img;
+}
+
 function composeMono() {
   _stage('compose.mono', () => {
     if (api._ko_compose_rgba(1) !== 0) throw new Error('engine compose failed (mono)');
   });
-  return _stage('compose.view', () =>
-    new ImageData(new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4), 480, 800));
+  return _stage('compose.view', _frameFromEngine);
 }
 
 function composePage() {
   _stage('compose.page', () => {
     if (api._ko_compose_rgba(0) !== 0) throw new Error('engine compose failed');
   });
-  return _stage('compose.view', () =>
-    new ImageData(new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4), 480, 800));
+  return _stage('compose.view', _frameFromEngine);
 }
 
 async function init() {
