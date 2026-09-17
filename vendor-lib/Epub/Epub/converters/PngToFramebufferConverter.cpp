@@ -380,6 +380,8 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
                                                     const RenderConfig& config) {
   LOG_DBG("PNG", "Decoding PNG: %s", imagePath.c_str());
 
+  int rc = 0;
+
   // Use getMaxAllocHeap() (largest contiguous block) instead of getFreeHeap()
   // (total free): the PNG decoder is a single ~44 KB allocation, so total free
   // can be misleading on a fragmented heap — the 4× repeated PNG-decoder alloc
@@ -392,11 +394,6 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   }
 
   // Heap-allocate PNG decoder (~42 KB) - freed at end of function
-  std::unique_ptr<PNG> png(new (std::nothrow) PNG());
-  if (!png) {
-    LOG_ERR("PNG", "Failed to allocate PNG decoder");
-    return false;
-  }
 
   PngContext ctx;
   ctx.renderer = &renderer;
@@ -404,21 +401,46 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
 
-  int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
-                     pngDrawCallback);
-  const ScopedCleanup cleanup{[&png]() { png->close(); }};
   if (rc != PNG_SUCCESS) {
     LOG_ERR("PNG", "Failed to open PNG: %d", rc);
     return false;
   }
 
-  if (!validateImageDimensions(png->getWidth(), png->getHeight(), "PNG")) {
+    // Whole-file read, then a header-only libpng probe for the dimensions. Dimensions feed
+  // pagination, so this must agree with PNGdec exactly - verified against the stage 1 gate.
+  std::vector<uint8_t> file;
+  if (!readWholeFilePng(imagePath, file)) return false;
+
+  int pngW = 0;
+  int pngH = 0;
+  {
+    png_structp probe = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    png_infop probeInfo = probe ? png_create_info_struct(probe) : nullptr;
+    if (!probe || !probeInfo) {
+      if (probe) png_destroy_read_struct(&probe, nullptr, nullptr);
+      LOG_ERR("PNG", "Failed to create PNG read struct: %s", imagePath.c_str());
+      return false;
+    }
+    if (setjmp(png_jmpbuf(probe))) {
+      png_destroy_read_struct(&probe, &probeInfo, nullptr);
+      LOG_ERR("PNG", "Bad PNG header: %s", imagePath.c_str());
+      return false;
+    }
+    PngMemReader reader{&file, 0};
+    png_set_read_fn(probe, &reader, pngMemReadFn);
+    png_read_info(probe, probeInfo);
+    pngW = static_cast<int>(png_get_image_width(probe, probeInfo));
+    pngH = static_cast<int>(png_get_image_height(probe, probeInfo));
+    png_destroy_read_struct(&probe, &probeInfo, nullptr);
+  }
+
+  if (!validateImageDimensions(pngW, pngH, "PNG")) {
     return false;
   }
 
   // Calculate output dimensions
-  ctx.srcWidth = png->getWidth();
-  ctx.srcHeight = png->getHeight();
+  ctx.srcWidth = pngW;
+  ctx.srcHeight = pngH;
 
   if (config.useExactDimensions && config.maxWidth > 0 && config.maxHeight > 0) {
     // Use exact dimensions as specified (avoids rounding mismatches with pre-calculated sizes)
@@ -437,20 +459,12 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   }
   ctx.lastDstY = -1;  // Reset row tracking
 
-  const int pixelType = png->getPixelType();
-  const int bitsPerSample = png->getBpp();
+  const int pixelType = PNG_PIXEL_GRAYSCALE;
+  const int bitsPerSample = 8;
   LOG_DBG("PNG", "PNG %dx%d -> %dx%d (scale %.2f), type: %d, bpp: %d", ctx.srcWidth, ctx.srcHeight, ctx.dstWidth,
           ctx.dstHeight, ctx.scale, pixelType, bitsPerSample);
 
   const int requiredInternal = requiredPngInternalBufferBytes(ctx.srcWidth, pixelType, bitsPerSample);
-  if (requiredInternal > PNG_MAX_BUFFERED_PIXELS) {
-    LOG_ERR(
-        "PNG",
-        "PNG row buffer too small: need %d bytes for width=%d type=%d bpp=%d, configured PNG_MAX_BUFFERED_PIXELS=%d",
-        requiredInternal, ctx.srcWidth, pixelType, bitsPerSample, PNG_MAX_BUFFERED_PIXELS);
-    LOG_ERR("PNG", "Aborting decode to avoid PNGdec internal buffer overflow");
-    return false;
-  }
 
   if (!isSupportedBitDepth(pixelType, bitsPerSample)) {
     warnUnsupportedFeature(
@@ -461,13 +475,11 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   // The converter expands each source row to 8-bit grayscale before dithering,
   // so this scratch buffer is sized by source pixels even when PNGdec reads a
   // packed 1/2/4-bit row internally.
-  constexpr size_t MAX_GRAY_LINE_BUFFER_BYTES = PNG_MAX_BUFFERED_PIXELS / 2;
+  // No device-era cap here. The old limit was PNGdec's fixed internal buffer
+  // (PNG_MAX_BUFFERED_PIXELS), which rejected any image wider than ~1281 px outright.
+  // Nothing in this port has a fixed row buffer, so the scratch row is simply sized by
+  // the source width.
   const size_t grayBufSize = static_cast<size_t>(ctx.srcWidth);
-  if (grayBufSize > MAX_GRAY_LINE_BUFFER_BYTES) {
-    LOG_ERR("PNG", "Expanded gray row too wide: need %u bytes for width=%d, max=%u", static_cast<unsigned>(grayBufSize),
-            ctx.srcWidth, static_cast<unsigned>(MAX_GRAY_LINE_BUFFER_BYTES));
-    return false;
-  }
 
   auto grayLineBuffer = makeUniqueNoThrow<uint8_t[]>(grayBufSize);
   if (!grayLineBuffer) {
@@ -484,7 +496,63 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   // re-decode on every one of an image page's ~14 render passes.
 
   unsigned long decodeStart = millis();
-  rc = png->decode(&ctx, 0);
+    // libpng, one row at a time, into the UNCHANGED callback: it is already per-scanline
+  // (pDraw->y) and does all of its own up/downscale row mapping, so only the producer of
+  // the pixels changes. The synthetic block carries exactly the fields that callback
+  // reads: y, pPixels, iBpp, iPixelType, iHasAlpha, pPalette, pUser.
+  rc = 1;
+  {
+    png_structp pngRead = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    png_infop pngInfo = pngRead ? png_create_info_struct(pngRead) : nullptr;
+    if (!pngRead || !pngInfo) {
+      if (pngRead) png_destroy_read_struct(&pngRead, nullptr, nullptr);
+      LOG_ERR("PNG", "Failed to create PNG read struct");
+    } else if (setjmp(png_jmpbuf(pngRead))) {
+      png_destroy_read_struct(&pngRead, &pngInfo, nullptr);
+      LOG_ERR("PNG", "PNG decode failed: %s", imagePath.c_str());
+    } else {
+      PngMemReader rowReader{&file, 0};
+      png_set_read_fn(pngRead, &rowReader, pngMemReadFn);
+      png_read_info(pngRead, pngInfo);
+
+      // Normalise to 8-bit greyscale. Alpha is KEPT as a channel, never stripped: the
+      // callback composites it (it took iHasAlpha from PNGdec too), so stripping would
+      // change compositing.
+      const int bitDepth = png_get_bit_depth(pngRead, pngInfo);
+      const int colorType = png_get_color_type(pngRead, pngInfo);
+      const bool indexed = (colorType == PNG_COLOR_TYPE_PALETTE);
+      if (bitDepth == 16) png_set_strip_16(pngRead);
+      if (indexed) png_set_palette_to_rgb(pngRead);
+      if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8) png_set_expand_gray_1_2_4_to_8(pngRead);
+      if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_RGB_ALPHA || indexed) {
+        png_set_rgb_to_gray_fixed(pngRead, 1, -1, -1);  // default weights
+      }
+      if (png_get_valid(pngRead, pngInfo, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(pngRead);
+      const int passes = png_set_interlace_handling(pngRead);
+      png_read_update_info(pngRead, pngInfo);
+      const bool hasAlpha = (png_get_color_type(pngRead, pngInfo) & PNG_COLOR_MASK_ALPHA) != 0;
+
+      std::vector<uint8_t> rowBuf(static_cast<size_t>(pngW) * (hasAlpha ? 2u : 1u));
+      for (int pass = 0; pass < passes; pass++) {
+        for (int y = 0; y < pngH; y++) {
+          png_read_row(pngRead, rowBuf.data(), nullptr);
+          if (pass != passes - 1) continue;  // only the final pass leaves dst complete
+          PNGDRAW draw{};
+          draw.pUser = &ctx;
+          draw.y = y;
+          draw.pPixels = rowBuf.data();
+          draw.iBpp = 8;
+          draw.iHasAlpha = hasAlpha ? 1 : 0;
+          draw.iPixelType = hasAlpha ? PNG_PIXEL_GRAY_ALPHA : PNG_PIXEL_GRAYSCALE;
+          draw.pPalette = nullptr;
+          pngDrawCallback(&draw);
+        }
+      }
+      png_read_end(pngRead, nullptr);
+      png_destroy_read_struct(&pngRead, &pngInfo, nullptr);
+      rc = 0;
+    }
+  }
   unsigned long decodeTime = millis() - decodeStart;
 
   ctx.grayLineBuffer = nullptr;

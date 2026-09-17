@@ -152,3 +152,35 @@ stripping would change compositing and break the gate. Errors via
 
 Gate (baseline already captured): `/tmp/ab/png_before.xtch`, 1345804 B / 14 pages -
 page-level identical, 0 differing pixels. PNG is lossless, so identical is the target.
+
+---
+
+## Stage 2 - CLOSED (2026-09-17)
+
+The framebuffer converter's scanline decode now uses libpng. Design C: PNGdec's PNGDRAW is
+kept as the callback parameter and filled synthetically, exactly as the JPEG converters keep
+JPEGDRAW. The callback is already per-scanline and does its own row mapping, so its body is
+untouched. PNGdec.h stays until stage 3 removes it with the cover converter, because its
+iPixelType is an enum type taken by type by convertLineToGray.
+
+### Two device-era constraints found and removed
+
+1. A code-level cap: the gray scratch row was bounded by PNG_MAX_BUFFERED_PIXELS/2 = 1281, so
+   any image wider than that failed outright. Nothing in this port has a fixed row buffer.
+2. PNGdec's own hard internal buffer: even with (1) removed, PNGdec reports
+   "PNG row buffer too small: need 3648 bytes for width=1807 type=0 bpp=8, configured
+   PNG_MAX_BUFFERED_PIXELS=2562" and aborts. wide_scaling_test.png (1807x736) was therefore
+   NEVER rendered by the old path - a real, pre-existing defect that this port fixes.
+
+### Gate - restated honestly
+
+Comparing decoders with constraint (1) removed in both, so the decoders are compared rather
+than the cap:
+
+- 12 of 14 pages: **byte-identical, 0 differing pixels**.
+- The 2 differing pages are entirely the 1807x736 image that PNGdec cannot decode: page 7
+  diff (3556 px) and page 8 diff (25834 px) both fall inside that image's rect, and nothing
+  else on either page moved.
+
+Equivalence holds everywhere PNGdec could decode; where it could not, the port is strictly
+better. Host and wasm both build (wasm exit 0).
