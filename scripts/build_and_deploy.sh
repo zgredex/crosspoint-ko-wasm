@@ -42,7 +42,7 @@ echo "== deploy =="
 npx -y wrangler@latest pages deploy dist --project-name=crosspoint-ko-wasm --branch=main
 
 echo "== verify live artifact =="
-LIVE_SHA=$(curl -s https://crosspoint-ko-wasm.pages.dev/ko_xtch_wasm.wasm | shasum -a 256 | awk '{print $1}')
+LIVE_SHA=$(curl -s "https://crosspoint-ko-wasm.pages.dev/ko_xtch_wasm.wasm?cb=$(date +%s)" | shasum -a 256 | awk '{print $1}')
 if [ "$LIVE_SHA" != "$BUILD_SHA" ]; then
   echo "FAIL: live wasm does not match the build"
   echo "      build-wasm : ${BUILD_SHA:0:16}"

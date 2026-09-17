@@ -169,6 +169,15 @@ target_link_libraries(koengine PUBLIC jpeg-static)
 # pixels and vendoring buys nothing here.
 if(EMSCRIPTEN)
   target_link_options(koengine PUBLIC "-sUSE_LIBPNG=1" "-sUSE_ZLIB=1")
+
+  # WASM-only multipliers (no device-era reason to withhold them). -msimd128 enables
+  # auto-vectorisation and SIMD intrinsics for the hot loops (plane/bit expansion, dither,
+  # writer packing); -flto lets the whole engine optimise across translation units. Both
+  # preserve integer semantics - no -ffast-math - so output stays byte-identical.
+  if(EMSCRIPTEN)
+    target_compile_options(koengine PUBLIC "-msimd128" "-flto")
+    target_link_options(koengine PUBLIC "-msimd128" "-flto")
+  endif()
 else()
   list(APPEND CMAKE_PREFIX_PATH /opt/homebrew)
   find_package(PNG REQUIRED)
