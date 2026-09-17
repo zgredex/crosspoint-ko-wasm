@@ -171,6 +171,18 @@ file(MAKE_DIRECTORY ${JPEG_TURBO_INSTALL}/include)
 add_library(koengine STATIC ${ENGINE_SOURCES} ${STUB_SOURCES})
 target_link_libraries(koengine PUBLIC jpeg-static)
 
+# libpng for the PNG paths (framebuffer + covers). Unlike JPEG, where implementations
+# legitimately differ in IDCT rounding, PNG decoding is exact integer arithmetic and
+# inflate is deterministic - so the toolchain-native libpng produces bit-identical
+# pixels and vendoring buys nothing here.
+if(EMSCRIPTEN)
+  target_link_options(koengine PUBLIC "-sUSE_LIBPNG=1" "-sUSE_ZLIB=1")
+else()
+  list(APPEND CMAKE_PREFIX_PATH /opt/homebrew)
+  find_package(PNG REQUIRED)
+  target_link_libraries(koengine PUBLIC PNG::PNG)
+endif()
+
 if(EMSCRIPTEN)
   add_executable(ko_xtch_wasm src/wasm_api.cpp)
   target_link_libraries(ko_xtch_wasm PRIVATE koengine)
