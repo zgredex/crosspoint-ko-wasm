@@ -197,6 +197,13 @@
   // ---- rendering ----
   // Parse the fork's 2bpp top-down BMP (palette: 0 black 1 dark 2 light 3 white).
   // Returns ImageData (cover 540x800, cropped-cover aspect).
+  // BMP palette 0=black..3=white, packed as little-endian RGBA words so each pixel is one
+  // 32-bit store. Previously the loop allocated a fresh [0,85,170,255] array per pixel and
+  // did four byte stores.
+  const BMP_GRAY32 = new Uint32Array([0xFF000000, 0xFF555555, 0xFFAAAAAA, 0xFFFFFFFF]);
+
+  // Parse the fork's 2bpp top-down BMP (palette: 0 black 1 dark 2 light 3 white).
+  // Returns ImageData (cover 540x800, cropped-cover aspect).
   function bmpToImageData(buf) {
     const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
     const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
@@ -208,17 +215,14 @@
     const bytesPerRow = Math.ceil((w * 2) / 8);
     const rowPad = (bytesPerRow % 4) ? (4 - (bytesPerRow % 4)) : 0;
     const img = new ImageData(w, absH);
-    const d = img.data;
+    const rgba = new Uint32Array(img.data.buffer);
     for (let y = 0; y < absH; y++) {
       const srcY = topDown ? y : (absH - 1 - y);
       const rowStart = dataOff + srcY * (bytesPerRow + rowPad);
-      for (let x = 0; x < w; x++) {
+      let out = y * w;
+      for (let x = 0; x < w; x++, out++) {
         const b = u8[rowStart + (x >> 2)];
-        const shift = 6 - ((x & 3) << 1);
-        const idx = (b >> shift) & 3;
-        const g = [0, 85, 170, 255][idx];   // BMP palette 0=black..3=white
-        const o = (y * w + x) * 4;
-        d[o] = g; d[o + 1] = g; d[o + 2] = g; d[o + 3] = 255;
+        rgba[out] = BMP_GRAY32[(b >> (6 - ((x & 3) << 1))) & 3];
       }
     }
     return img;
