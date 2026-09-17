@@ -26,7 +26,7 @@ HalDisplay display;
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: %s <book.epub> [out.xtch]\n", argv[0]);
+    fprintf(stderr, "usage: %s <book.epub> [out.xtch] [--1bit] [--no-mono-dither]\n", argv[0]);
     return 2;
   }
   const std::string epubPath = argv[1];
@@ -80,6 +80,14 @@ int main(int argc, char** argv) {
           spec.viewportHeight, mTop, mRight, mBottom, mLeft);
 
   ko::XtchWriter writer;
+  // Output-mode flags, for verifying the 1-bit path (the web app sets the same mode
+  // through ko_set_output_mode).
+  for (int i = 1; i < argc; i++) {
+    const std::string flag = argv[i];
+    if (flag == "--1bit") writer.setMode(ko::XtcMode::Mono1Bit);
+    else if (flag == "--no-mono-dither") writer.setMonoGrayDither(false);
+  }
+
   writer.setMetadata(driver.title(), "unknown", "", "ko");
   int totalPages = 0;
   std::vector<ko::XtchChapter> chapters;
