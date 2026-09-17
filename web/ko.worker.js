@@ -135,41 +135,52 @@ function copyPlane(kind) {
 const colBytes = 100; // physical row width in bytes
 const GRAY = [255, 128, 205, 0]; // white, dark-grey, light-grey, black
 
-const bitAt = (buf, phyX, phyY) => (buf[phyY * colBytes + (phyX >> 3)] >> (7 - (phyX & 7))) & 1;
 
 // 1-bit (XTC / XTG) preview: the file stores ONLY the BW plane — no AA greys.
 // Bit 0 = black on the device; this is byte-exactly what addMonoPage() packs.
+// Bit 0 = black on the device; this is byte-exactly what addMonoPage() packs.
+const MONO32 = new Uint32Array([0xFF000000, 0xFFFFFFFF]); // indexed by the plane bit: 0=black, 1=white
+
+// Same contract as before, without the per-pixel helper calls. The inner loop runs over x
+// for a fixed y, so phyX = y is constant: the bit position inside a physical byte is a loop
+// invariant and the byte index steps by exactly -colBytes per column. Output is one 32-bit
+// store of a precomputed RGBA word per pixel rather than four byte stores.
 function composeMono(bw) {
   const img = new ImageData(480, 800);
-  const d = img.data;
-  for (let y = 0; y < 800; y++) {        // logical row
-    for (let x = 0; x < 480; x++) {      // logical col
-      const ink = bitAt(bw, y, 479 - x) === 0;
-      const g = ink ? 0 : 255;           // black : white
-      const o = (y * 480 + x) * 4;
-      d[o] = g; d[o + 1] = g; d[o + 2] = g; d[o + 3] = 255;
+  const rgba = new Uint32Array(img.data.buffer);
+  for (let y = 0; y < 800; y++) {        // logical row -> phyX
+    const bit = 7 - (y & 7);
+    const byteCol = y >> 3;
+    let idx = 479 * colBytes + byteCol;  // x = 0 -> phyY = 479
+    let out = y * 480;
+    for (let x = 0; x < 480; x++, idx -= colBytes, out++) {
+      rgba[out] = MONO32[(bw[idx] >> bit) & 1];
     }
   }
   return img;
 }
 
+// Packed RGBA words for the four panel shades, indexed by v. Byte-identical to the
+// per-component writes this replaces (each is [g, g, g, 255]).
+const GRAY32 = new Uint32Array([0xFFFFFFFF, 0xFF808080, 0xFFCDCDCD, 0xFF000000]);
+
 function composePage(bw, lsb, msb) {
   const img = new ImageData(480, 800);
-  const d = img.data;
+  const rgba = new Uint32Array(img.data.buffer);
 
-  for (let y = 0; y < 800; y++) {        // logical row
-    for (let x = 0; x < 480; x++) {      // logical col
-      const phyX = y;
-      const phyY = 479 - x;
-      const ink = bitAt(bw, phyX, phyY) === 0;
+  for (let y = 0; y < 800; y++) {        // logical row -> phyX
+    const bit = 7 - (y & 7);
+    const byteCol = y >> 3;
+    let idx = 479 * colBytes + byteCol;  // x = 0 -> phyY = 479
+    let out = y * 480;
+    for (let x = 0; x < 480; x++, idx -= colBytes, out++) {
+      const ink = ((bw[idx] >> bit) & 1) === 0;
       let v;
       if (!ink) v = 0;
-      else if (bitAt(lsb, phyX, phyY) === 1) v = 1;   // dark grey
-      else if (bitAt(msb, phyX, phyY) === 1) v = 2;   // light grey
+      else if (((lsb[idx] >> bit) & 1) === 1) v = 1;   // dark grey
+      else if (((msb[idx] >> bit) & 1) === 1) v = 2;   // light grey
       else v = 3;                                      // black
-      const o = (y * 480 + x) * 4;
-      const g = GRAY[v];
-      d[o] = g; d[o + 1] = g; d[o + 2] = g; d[o + 3] = 255;
+      rgba[out] = GRAY32[v];
     }
   }
   return img;
