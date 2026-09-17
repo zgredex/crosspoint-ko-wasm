@@ -62,6 +62,26 @@ Serial tail as it stands: finish 45.2 + disk 68.3 = **113.5 ms**, plus load ~2 m
     optimistic total = 188 + 115 = ~300 ms   ->  5.0x
     with imperfect balance (tail spine)      ->  ~350-400 ms  ->  3.8-4.3x
 
+**Pool size: MAX MINUS ONE, by decision.** Use `navigator.hardwareConcurrency - 1` workers - every
+core but one, reserved for the UI thread so preview navigation stays responsive during an export.
+Do not be conservative: on the M2 Pro (10-12 cores) that is 9-11 workers, and an idle core is
+throughput given away for nothing.
+
+Recomputed at 10 workers rather than 8:
+
+    renderPage 1,353.5 / 10 = 135 ms
+    buildSection 120.9 / 10 =  12 ms
+    writer        28.1 / 10 =   3 ms
+    --------------------------------
+    parallel part           ~ 150 ms
+    total = 150 + 115       ~ 265 ms   ->  5.7x
+    with tail imbalance     ~ 300-320 ms ->  4.7-5.0x
+
+Note the diminishing return and its cause: 8 -> 10 workers moves the total only ~10-15%, because the
+115 ms serial tail is already ~40% of the result. **The tail, not the core count, is the binding
+constraint** - which is why C3 (streaming container) is worth more than C5 (more workers).
+Max-minus-one is the right pool size; it is not where the remaining speed is.
+
 So the honest expectation is **4-5x wall clock, not 6-8x** - and it is the *serial tail*, not the
 worker count, that caps it. That is why the plan spends a stage on shrinking the tail rather than
 just adding workers.
@@ -90,7 +110,11 @@ pages in spine order and records chapter offsets as it goes, instead of bufferin
 finishing at the end. This also drops peak memory (today the finished container is held whole -
 195 MB for the text book). Gate: identical output; tail re-measured.
 
-**C4 - right-size the pool.** Workers = `min(cores-1, spines)` with a floor: for small books the
+**C4 - pool sizing.** Default is **max-minus-one** (`hardwareConcurrency - 1`), always. Reduce it
+only when either (a) there are fewer spines than workers, so the extra workers would sit idle, or
+(b) measurement shows instantiation cost dominating for a tiny book - at ~7 MB module plus fonts per
+worker, the pool can cost more to start than it saves. Both reductions must be measured, never
+assumed. (Superseded text follows.) For small books the
 8 x wasm instantiation (~7 MB module + fonts each) costs more than it saves. Measure the
 startup-vs-pages crossover and encode it. Gate: identical output at N = 1/2/4/8; crossover number.
 
@@ -232,3 +256,27 @@ COOP/COEP와 함께 재검토. 그 전에는 하지 않습니다: 자체 위험�
 마지막의 `disk write` / Blob 다운로드는 I/O이며 직렬로 남습니다; 195 MB 책에서 68 ms이고
 브라우저에서는 다운로드입니다. 밴드 제거, 메모리 내 책 파싱, 항상 전체 해상도 디코딩(E-G)은
 여기서 다루지 않습니다.
+
+---
+
+## 갱신: 풀 크기는 MAX MINUS ONE (2026-09-17 결정)
+
+코어를 하나만 남기고 `navigator.hardwareConcurrency - 1` 워커를 사용합니다. 남긴 한 코어는 UI 스레드용이며,
+내보내기 중에도 미리보기 탐색이 반응성을 유지하도록 하는 덱입니다. 보수적일 필요는 없습니다: M2 Pro(10-12코어)에서
+9-11 워커이며, 놀리는 코어는 아무것도 얻지 못한 채 처리량을 버리는 것입니다.
+
+8이 아니라 10 워커로 재계산:
+
+    renderPage 1,353.5 / 10 = 135 ms
+    buildSection 120.9 / 10 =  12 ms
+    writer        28.1 / 10 =   3 ms
+    --------------------------------
+    병렬 부분               ~ 150 ms
+    합계 = 150 + 115        ~ 265 ms   ->  5.7배
+    꼬리 불균형 포함        ~ 300-320 ms ->  4.7-5.0배
+
+수익 체감과 원인: 8 -> 10 워커는 총합을 10-15%만 움직입니다. 115 ms 직렬 꼬리가 이미 결과의 약
+40%이기 때문입니다. **구속 조건은 코어 수가 아니라 꼬리입니다** — 그래서 C3(컨테이너 스트리밍)이
+C5(워커 추가)보다 가치 있습니다. Max-minus-one은 올바른 풀 크기이지만, 남은 속도가 있는
+곳은 아닙니다. C4의 기본값도 max-minus-one이며, 스파인 수가 워커보다 적거나 아주 작은 책에서
+인스턴시에이션 비용이 지배적임이 측정될 때만 줄이며, 그 축소도 측정으로 정합니다.
