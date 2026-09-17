@@ -54,7 +54,6 @@ constexpr size_t MIN_MAX_ALLOC_FOR_INSERT = 48 * 1024;
 
 // Minimum free heap required to apply CSS during rendering
 // If below this threshold, we skip CSS to avoid display artifacts.
-constexpr size_t MIN_FREE_HEAP_FOR_CSS = 48 * 1024;
 
 // Maximum length for a single selector string
 // Prevents parsing of extremely long or malformed selectors
@@ -459,11 +458,6 @@ void CssParser::processRuleBlockWithStyle(std::string_view selectorGroup, const 
   // the heap during the initial live parse and a later allocation aborts on
   // bad_alloc (exceptions disabled), so the book never opens. Mirrors the same
   // guard in loadFromCache(). Check every 8 rules. Partial CSS beats no book.
-  if ((rulesBySelector_.size() & 0x7) == 0 && ESP.getMaxAllocHeap() < MIN_MAX_ALLOC_FOR_INSERT) {
-    LOG_ERR("CSS", "MaxAlloc %u below safe threshold after %zu rules, stopping", ESP.getMaxAllocHeap(),
-            rulesBySelector_.size());
-    return;
-  }
 
   // Walk comma-separated selectors in place — no vector allocation. Selectors
   // with unsupported syntax (combinators, attributes, pseudo, etc.) are skipped
@@ -662,14 +656,6 @@ bool CssParser::loadFromStream(HalFile& source) {
 
 CssStyle CssParser::resolveStyle(std::string_view tagName, std::string_view classAttr) const {
   static bool lowHeapWarningLogged = false;
-  if (ESP.getFreeHeap() < MIN_FREE_HEAP_FOR_CSS) {
-    if (!lowHeapWarningLogged) {
-      lowHeapWarningLogged = true;
-      LOG_DBG("CSS", "Warning: low heap (%u bytes) below MIN_FREE_HEAP_FOR_CSS (%u), returning empty style",
-              ESP.getFreeHeap(), static_cast<unsigned>(MIN_FREE_HEAP_FOR_CSS));
-    }
-    return CssStyle{};
-  }
 
   CssStyle result;
 
@@ -974,11 +960,6 @@ bool CssParser::loadFromCache() {
     // Same heap-safety check as during initial parse: stop loading rules when
     // the largest contiguous block drops below the threshold so page turns
     // (ZIP inflate ~32 KB + grayscale chunks ~8 KB) still have headroom.
-    if ((rulesBySelector_.size() & 0x7) == 0 && ESP.getMaxAllocHeap() < MIN_MAX_ALLOC_FOR_INSERT) {
-      LOG_ERR("CSS", "MaxAlloc %u below safe threshold after %zu rules, stopping cache load", ESP.getMaxAllocHeap(),
-              rulesBySelector_.size());
-      return true;  // Partial load is better than failing outright.
-    }
     rulesBySelector_[selector] = style;
   }
 

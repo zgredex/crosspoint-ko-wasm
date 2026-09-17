@@ -50,7 +50,6 @@ struct PngContext {
 // is only consumed while actually decoding/querying PNG images. This is critical on
 // the ESP32-C3 where total RAM is ~320 KB.
 constexpr size_t PNG_DECODER_APPROX_SIZE = 44 * 1024;                          // ~42 KB + overhead
-constexpr size_t MIN_FREE_HEAP_FOR_PNG = PNG_DECODER_APPROX_SIZE + 16 * 1024;  // decoder + 16 KB headroom
 
 // PNGdec keeps TWO scanlines in its internal ucPixels buffer (current + previous)
 // and each scanline includes a leading filter byte.
@@ -308,12 +307,6 @@ bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath
   // (total free): the PNG decoder is a single ~44 KB allocation, so total free
   // can be misleading on a fragmented heap — the 4× repeated PNG-decoder alloc
   // failures we saw on ko.17 were exactly this case.
-  const size_t maxAlloc = ESP.getMaxAllocHeap();
-  if (maxAlloc < MIN_FREE_HEAP_FOR_PNG) {
-    LOG_ERR("PNG", "Not enough contiguous heap for PNG decoder (maxAlloc %u, need %u)", maxAlloc,
-            MIN_FREE_HEAP_FOR_PNG);
-    return false;
-  }
 
   // Header-only probe: libpng reads and parses the IHDR from a whole-file buffer. The
   // old path allocated a ~42 KB PNGdec (plus its zlib state) just to read two integers.
@@ -358,12 +351,6 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   // (total free): the PNG decoder is a single ~44 KB allocation, so total free
   // can be misleading on a fragmented heap — the 4× repeated PNG-decoder alloc
   // failures we saw on ko.17 were exactly this case.
-  const size_t maxAlloc = ESP.getMaxAllocHeap();
-  if (maxAlloc < MIN_FREE_HEAP_FOR_PNG) {
-    LOG_ERR("PNG", "Not enough contiguous heap for PNG decoder (maxAlloc %u, need %u)", maxAlloc,
-            MIN_FREE_HEAP_FOR_PNG);
-    return false;
-  }
 
   // Heap-allocate PNG decoder (~42 KB) - freed at end of function
 

@@ -448,8 +448,8 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(HalFile& pngFile, Print& bmpO
   }
 
   // Safety limits
-  constexpr int MAX_IMAGE_WIDTH = 2048;
-  constexpr int MAX_IMAGE_HEIGHT = 3072;
+  constexpr int MAX_IMAGE_WIDTH = 8192;  // was 2048 (device refusal); bound only
+  constexpr int MAX_IMAGE_HEIGHT = 8192;  // was 3072 (device refusal); bound only
 
   if (width > MAX_IMAGE_WIDTH || height > MAX_IMAGE_HEIGHT || width == 0 || height == 0) {
     LOG_ERR("PNG", "Image too large or zero (%ux%u)", width, height);
