@@ -5,9 +5,13 @@
 #include <HalStorage.h>
 #include <Logging.h>
 #include <Memory.h>
-#include <PNGdec.h>
+#include <PNGdec.h>  // remaining: the scanline decode path
 
 #include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include <png.h>
 #include <memory>
 #include <new>
 
@@ -279,6 +283,54 @@ int pngDrawCallback(PNGDRAW* pDraw) {
 
 }  // namespace
 
+
+// ---------------------------------------------------------------------------
+// libpng plumbing.
+//
+// Unlike JPEG - where implementations legitimately differ in IDCT rounding, which is why
+// libjpeg-turbo is vendored with SIMD off - PNG decoding is exact integer arithmetic and
+// inflate is deterministic, so the toolchain's own libpng (brew on host, the emscripten
+// port for wasm) produces bit-identical pixels.
+// ---------------------------------------------------------------------------
+
+struct PngMemReader {
+  const std::vector<uint8_t>* data;
+  size_t offset;
+};
+
+void pngMemReadFn(png_structp png, png_bytep out, png_size_t count) {
+  PngMemReader* reader = static_cast<PngMemReader*>(png_get_io_ptr(png));
+  if (!reader || !reader->data || reader->offset + count > reader->data->size()) {
+    png_error(png, "PNG read past end of buffer");
+    return;
+  }
+  std::memcpy(out, reader->data->data() + reader->offset, count);
+  reader->offset += count;
+}
+
+// Whole-file read: no streaming, no decoder-object heap budget.
+bool readWholeFilePng(const std::string& path, std::vector<uint8_t>& out) {
+  HalFile f;
+  if (!Storage.openFileForRead("PNG", path, f)) {
+    LOG_ERR("PNG", "Failed to open %s", path.c_str());
+    return false;
+  }
+  const int64_t size = f.size();
+  if (size <= 0) {
+    LOG_ERR("PNG", "Empty file: %s", path.c_str());
+    f.close();
+    return false;
+  }
+  out.resize(static_cast<size_t>(size));
+  const int32_t got = f.read(out.data(), static_cast<int32_t>(out.size()));
+  f.close();
+  if (got != static_cast<int32_t>(size)) {
+    LOG_ERR("PNG", "Short read on %s", path.c_str());
+    return false;
+  }
+  return true;
+}
+
 bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath, ImageDimensions& out) {
   // Use getMaxAllocHeap() (largest contiguous block) instead of getFreeHeap()
   // (total free): the PNG decoder is a single ~44 KB allocation, so total free
@@ -291,23 +343,35 @@ bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath
     return false;
   }
 
-  std::unique_ptr<PNG> png(new (std::nothrow) PNG());
+  // Header-only probe: libpng reads and parses the IHDR from a whole-file buffer. The
+  // old path allocated a ~42 KB PNGdec (plus its zlib state) just to read two integers.
+  std::vector<uint8_t> file;
+  if (!readWholeFilePng(imagePath, file)) return false;
+
+  png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
   if (!png) {
-    LOG_ERR("PNG", "Failed to allocate PNG decoder for dimensions");
+    LOG_ERR("PNG", "Failed to create PNG read struct");
+    return false;
+  }
+  png_infop info = png_create_info_struct(png);
+  if (!info) {
+    png_destroy_read_struct(&png, nullptr, nullptr);
+    return false;
+  }
+  // Canonical libpng error handling: libpng's default error function longjmps here on a
+  // malformed file, so a bad image fails this probe instead of the process.
+  if (setjmp(png_jmpbuf(png))) {
+    png_destroy_read_struct(&png, &info, nullptr);
+    LOG_ERR("PNG", "Bad PNG header: %s", imagePath.c_str());
     return false;
   }
 
-  int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
-                     nullptr);
-  const ScopedCleanup cleanup{[&png]() { png->close(); }};
-
-  if (rc != 0) {
-    LOG_ERR("PNG", "Failed to open PNG for dimensions: %d", rc);
-    return false;
-  }
-
-  out.width = png->getWidth();
-  out.height = png->getHeight();
+  PngMemReader reader{&file, 0};
+  png_set_read_fn(png, &reader, pngMemReadFn);
+  png_read_info(png, info);
+  out.width = static_cast<int>(png_get_image_width(png, info));
+  out.height = static_cast<int>(png_get_image_height(png, info));
+  png_destroy_read_struct(&png, &info, nullptr);
 
   return true;
 }
