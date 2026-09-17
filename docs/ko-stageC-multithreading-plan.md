@@ -419,3 +419,120 @@ threads, and not from further scheduling.
 구속 조건은 렌더 단계 자체입니다. 추가 이득은 renderPage를 더 싸게 만드는 데서 나와야 하며
 (글리프/양자화 경로의 SIMD, 디더 연결, 디코딩 결정), 스레드를 늘리거나 스케줄링을 더 다듬는
 데서 나오지 않습니다.
+
+
+---
+
+# RE-ORDERED ROADMAP (decision): make renderPage cheaper FIRST, parallelise SECOND
+
+Stage C (multithreading) is **deferred**. The measured reason is in this document's own numbers:
+renderPage is 1,353.5 ms of a 1,502.4 ms export (90%), and at max-minus-one cores the Amdahl ceiling
+is ~10x with ~150 ms as the floor. So after parallelism the wall clock is a straight readout of
+single-page render cost - which means **reducing renderPage buys more, and buys it on every machine,
+including single-core ones**, than any further scheduling work. Parallelism multiplies whatever the
+per-page cost is; it does not reduce it.
+
+New order:
+
+  1. renderPage internals - MEASURE FIRST (below)
+  2. SIMD on the glyph and quantise paths, placed by that measurement
+  3. ED-dither wiring (FS / Atkinson / JJN / Stucki / Burkes)
+  4. full-resolution-decode decisions
+  5. Stage C parallelism (this document's earlier sections; unchanged, just later)
+
+## Step 1 - measure inside renderPage before optimising it
+
+Total is known: 0.67 ms/page text, 2.30-2.34 ms/page image. **The split is not.** Optimising an
+unmeasured sub-phase is how this session wasted effort twice already (the "-msimd128 will give
+2-4x" claim produced zero SIMD instructions, because the loop bodies were branchy; the "14 render
+passes" figure did not reproduce). So the first deliverable is a sub-phase profile of renderPage:
+
+  - glyph rasterisation (coverage to 4-level per glyph)
+  - quantise / dither (the thresholds and the dither mapping)
+  - blit / memory traffic (plane writes)
+  - image decode, separately, for image pages
+
+Gate for step 1: numbers, not code. Then the SIMD work is placed where the time actually is.
+
+## Step 2 - SIMD on glyph + quantise, in the order the measurement dictates
+
+Recorded preconditions and lessons, so this does not repeat the -msimd128 failure:
+
+  - **Branchless first, then SIMD.** The compose result is the proof: `-msimd128` emitted no SIMD
+    until the 4-level decision became a masked lookup. A branchy loop will not vectorise no matter
+    which flags are set. Expect the same here - the quantise path's threshold comparisons are the
+    same shape as the compose's level decision.
+  - **The compiler will not do it for us.** `-msimd128` is in place and produced nothing on branchy
+    code, so this needs explicit intrinsics (or restructuring the loop until auto-vectorisation
+    fires, and *verifying* it did by checking the module for the simd128 feature).
+  - **The oracle gate stays mandatory.** Every step is byte-compared against a frozen reference
+    before it ships - the compose work caught its own `c*8*kW` bug that way, and that gate is what
+    kept a wrong-pixel optimisation out of the engine.
+  - Verify SIMD actually landed: `strings ko_xtch_wasm.wasm | grep -c simd128` must stop being 0.
+    "It compiled" is not evidence that it vectorised.
+
+## Step 3 - ED-dither wiring
+
+FS / Atkinson / JJN / Stucki / Burkes are implemented and measured but **not wired** into the image
+decoders, because error diffusion needs row-error state and the old band/MCU structure made the
+plumbing awkward. **That precondition is now gone**: both JPEG and PNG decoders were rewritten to
+decode whole frames in one call (libjpeg-turbo, libpng) and PNGdec/JPEGDEC are removed. The band
+machinery that blocked this no longer exists on the decode path.
+
+Status from earlier measurement: FS has the best tone fidelity and pattern invisibility for photos;
+Atkinson is punchier but discards 25% of the error; blue noise is cheapest and stateless. ED costs
+FS 2.8 ms / Atkinson 3.3 ms versus ~0.2 ms ordered and ~0.5 ms blue noise per (420x525) image - so
+this is a **quality decision with a measured cost**, not a free win.
+
+## Step 4 - full-resolution-decode decisions
+
+DCT scaling (`chooseScaleDenom`) and the `smoothUpscale` band hack exist to fit images into device
+RAM. The progressive-JPEG blur (DC-only 1/8, measured 21.76 grey mean / RMSE 51.91) was a symptom
+and is already fixed for JPEG. The open question is a **per-size-class decision, measured**: decode
+full resolution and resample properly, versus decode scaled. Quality improves either way, but the
+CPU cost differs by size class - so measure both, per class, and decide on numbers.
+
+## What this ordering does not change
+
+The auditing and gates stay exactly as they are: page-level comparison (never whole-file - the
+container carries a varying millis-derived field), one change at a time, measure before and after.
+Stage C's analysis is not discarded, only sequenced later.
+
+---
+
+# 재정렬된 로드맵 (결정): renderPage를 먼저 싸게, 병렬화는 나중
+
+Stage C(멀티스레딩)를 **보류**합니다. 근거는 이 문서 자체의 측정값입니다: renderPage는 1,502.4 ms
+내보내기 중 1,353.5 ms(90%)이고, max-minus-one 코어에서 Amdahl 상한은 약 10배, 바닥은 약 150 ms입니다.
+즉 병렬화 후의 벽시계는 페이지당 렌더 비용을 그대로 읽은 값이 됩니다 — 그러므로 **renderPage를 줄이는
+것이 더 큰 이득이며 단일 코어 기기를 포함한 모든 기기에서 이득**입니다. 병렬화는 페이지당 비용을
+곱할 뿐, 줄이지 않습니다.
+
+새 순서: 1) renderPage 내부 — **먼저 측정**, 2) 측정이 가리키는 곳의 글리프/양자화 SIMD, 3) ED 디더
+연결, 4) 전체 해상도 디코딩 결정, 5) Stage C 병렬화(문서 앞부분 그대로, 순서만 뒤로).
+
+**1단계 — 최적화 전에 renderPage 내부 측정.** 합계는 알려져 있습니다(텍스트 0.67 ms/페이지, 이미지
+2.30-2.34). **내부 분해는 모릅니다.** 측정되지 않은 하위 단계를 최적화한 것이 이번 세션에서 두 번
+낭비되었습니다(-msimd128의 2-4배 주장은 분기 있는 루프 때문에 SIMD를 전혀 만들지 못했고, '14회
+렌더 패스' 수치는 재현되지 않았습니다). 따라서 첫 산출물은 renderPage의 하위 단계 프로파일입니다:
+글리프 래스터화 / 양자화·디더 / 블릿(메모리) / 이미지 디코딩(별도). 게이트: 코드가 아니라 수치.
+
+**2단계 — 글리프·양자화 SIMD.** 기록된 전제: (a) **먼저 분기 제거, 그다음 SIMD** — compose가
+증명했습니다. 분기 있는 루프는 어떤 플래그로도 벡터화되지 않습니다. (b) **컴파일러는 해주지
+않습니다** — 명시적 인트린직이 필요합니다. (c) **오라클 게이트 필수** — 매 단계를 동결 기준과 바이트
+비교하고, SIMD가 실제로 들어갔는지 `strings ... | grep -c simd128`이 0이 아닌지로 확인합니다.
+'컴파일됐다'는 벡터화 증거가 아닙니다.
+
+**3단계 — ED 디더 연결.** FS/Atkinson/JJN/Stucki/Burkes는 구현·측정되었지만 이미지 디코더에 연결되지
+않았습니다. 행 오차 상태가 필요하고 예전 밴드/MCU 구조가 배관을 어렵게 했기 때문입니다. **그 전제가
+이제 사라졌습니다**: 두 디코더 모두 전체 프레임을 한 번에 디코딩하도록 재작성되었고
+(libjpeg-turbo, libpng) PNGdec/JPEGDEC은 제거되었습니다. 측정된 비용: FS 2.8 ms, Atkinson 3.3 ms
+(420x525) 대 ordered 약 0.2 ms, blue noise 약 0.5 ms — **공짜가 아니라 측정된 비용이 있는 품질 결정**입니다.
+
+**4단계 — 전체 해상도 디코딩 결정.** DCT 축소와 smoothUpscale은 기기 RAM에 맞추기 위한 것이었습니다.
+progressive 흐림(DC-only 1/8, 21.76 grey / RMSE 51.91)은 증상이었고 JPEG는 이미 수정되었습니다. 남은
+문제는 **크기 등급별로 측정한 결정**입니다: 전체 해상도 디코딩 후 적절히 리샘플 vs 축소 디코딩.
+
+**바뀌지 않는 것:** 감사와 게이트 방식은 그대로입니다 — 페이지 단위 비교(전체 파일 비교 금지, 컨테이너에
+millis 파생 필드가 있음), 한 번에 하나씩 변경, 전후 측정. Stage C 분석은 버려지지 않고 순서만 뒤로
+갑니다.
