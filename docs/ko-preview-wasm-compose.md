@@ -184,3 +184,40 @@ mono: `MONO32 = {0xFF000000, 0xFFFFFFFF}`를 plane 비트로 인덱싱 (0 = 검�
 
 `web/app.js`의 209–216행 부근에 동일한 픽셀 단위 패턴이 있다(`bytesPerRow` / `rowPad`를
 다루는 2bpp 루프, 표지 경로). 같은 처리를 이어서 적용한다.
+
+---
+
+## Stage 1 DONE - algorithm ported, verified and measured (2026-09-17)
+
+Standalone source:  (the same function body moves
+into `src/wasm_api.cpp` in stage 2). It is native-testable precisely so the algorithm is
+proven before it touches the engine.
+
+### Verification - cross-implementation byte gate
+
+The frozen JS compose (itself proven byte-identical to its predecessor) is the oracle. Both
+implementations ran on identical dumped planes (seed 42, 3 x 48,000 bytes):
+
+    cmp rgba_js_2bit.bin  rgba_cpp_2bit.bin  -> IDENTICAL (1,536,000 bytes)
+    cmp rgba_js_mono.bin  rgba_cpp_mono.bin  -> IDENTICAL (1,536,000 bytes)
+
+### Measured
+
+| implementation | 2-bit | 1-bit |
+|---|---|---|
+| original JS (per-pixel helper) | 3.71 ms/page | 2.02 ms/page |
+| optimised JS (LUT + u32 stores) | 2.88 ms/page | 0.385 ms/page |
+| **C++ grouped (stage 1)** | **1.419 ms/page** | **0.088 ms/page** |
+| C++ naive, same file | 2.033 ms/page | - |
+
+- vs optimised JS: **2.03x** (2-bit), **4.4x** (1-bit).
+- vs the original JS: **2.6x** and **23x**.
+- Grouped beats naive **within C++ by 1.43x**, which confirms the diagnosis: the win comes
+  from the 8-bit grouping (one strided fetch per eight logical rows), not from the language.
+
+### Stage 2 (next)
+
+Add `ko_rgba_ptr()` + `ko_compose_rgba()` to `src/wasm_api.cpp` (inside `extern \C\`,
+`KO_EXPORT`), point the worker at them with the zero-copy `ImageData` view, delete both JS
+compose functions and their LUTs, rebuild wasm, and re-run the gate against the same oracle.
+Browser timing via `performance.now()` around compose + `putImageData` still outstanding.
