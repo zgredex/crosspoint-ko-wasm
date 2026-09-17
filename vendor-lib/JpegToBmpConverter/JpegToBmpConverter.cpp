@@ -2,16 +2,25 @@
 
 #include <HalDisplay.h>
 #include <HalStorage.h>
-#include <JPEGDEC.h>
+#include "../Epub/Epub/converters/BandBlock.h"
+#include <csetjmp>
+#include <jpeglib.h>
 #include <Logging.h>
 #include <Memory.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 #include "BitmapHelpers.h"
+// Device-era cooperative yield: the decoder used to run long enough on an ESP32 to trip
+// the task watchdog, so the MCU path yielded to the idle task between blocks. On host and
+// wasm there is nothing to yield to, so this is deliberately a no-op rather than a
+// reimplementation of a scheduler we do not have.
+void yieldToIdle() {}
 
 // ============================================================================
 // IMAGE PROCESSING OPTIONS - Toggle these to test different configurations
@@ -162,55 +171,27 @@ static void writeBmpHeader2bit(Print& bmpOut, const int width, const int height)
 
 namespace {
 
+// libjpeg's default error_exit is exit(). A corrupt cover must fail the conversion,
+// not the process (and in wasm, not the whole app).
+struct BmpJpegError {
+  jpeg_error_mgr pub;
+  jmp_buf escape;
+  char message[JMSG_LENGTH_MAX]{};
+};
+
+void bmpJpegErrorExit(j_common_ptr cinfo) {
+  BmpJpegError* self = reinterpret_cast<BmpJpegError*>(cinfo->err);
+  (*cinfo->err->format_message)(cinfo, self->message);
+  longjmp(self->escape, 1);
+}
+
+
 // Max MCU height supported by any JPEG (4:2:0 chroma = 16 rows, 4:4:4 = 8 rows)
 constexpr int MAX_MCU_HEIGHT = 16;
 constexpr size_t JPEG_DECODER_SIZE = 20 * 1024;
 constexpr size_t MIN_FREE_HEAP = JPEG_DECODER_SIZE + 32 * 1024;
 constexpr uint32_t FP_ONE = 1UL << 16;
 
-// Static file pointer for JPEGDEC open callback.
-// Safe in single-threaded embedded context; never accessed concurrently.
-static HalFile* s_jpegFile = nullptr;
-static uint8_t s_jpegIoSinceYield = 0;
-
-static void yieldToIdle() { vTaskDelay(1); }
-
-static void yieldDuringJpegIo() {
-  if (++s_jpegIoSinceYield < 4) return;
-  s_jpegIoSinceYield = 0;
-  yieldToIdle();
-}
-
-void* bmpJpegOpen(const char* /*filename*/, int32_t* size) {
-  if (!s_jpegFile || !*s_jpegFile) return nullptr;
-  s_jpegIoSinceYield = 0;
-  s_jpegFile->seek(0);
-  *size = static_cast<int32_t>(s_jpegFile->size());
-  yieldDuringJpegIo();
-  return s_jpegFile;
-}
-
-void bmpJpegClose(void* /*handle*/) {
-  // Caller owns the file — do not close it here
-}
-
-int32_t bmpJpegRead(JPEGFILE* pFile, uint8_t* pBuf, int32_t len) {
-  auto* f = reinterpret_cast<HalFile*>(pFile->fHandle);
-  if (!f) return 0;
-  int32_t n = f->read(pBuf, len);
-  if (n < 0) n = 0;
-  pFile->iPos += n;
-  yieldDuringJpegIo();
-  return n;
-}
-
-int32_t bmpJpegSeek(JPEGFILE* pFile, int32_t pos) {
-  auto* f = reinterpret_cast<HalFile*>(pFile->fHandle);
-  if (!f || !f->seek(pos)) return -1;
-  pFile->iPos = pos;
-  yieldDuringJpegIo();
-  return pos;
-}
 
 // Context passed to the JPEGDEC draw callback via setUserPointer()
 struct BmpConvertCtx {
@@ -433,7 +414,7 @@ static void flushScaledRow(BmpConvertCtx* ctx) {
 // in left-to-right, top-to-bottom order (baseline JPEG).
 // Accumulates columns into mcuBuf; once the last column arrives (completing the MCU
 // row), applies scaling + dithering and writes packed BMP rows to bmpOut.
-int bmpDrawCallback(JPEGDRAW* pDraw) {
+int bmpDrawCallback(BandBlock* pDraw) {
   auto* ctx = reinterpret_cast<BmpConvertCtx*>(pDraw->pUser);
   if (!ctx || ctx->error) return 0;
   yieldDuringDecodeBlock(ctx);
@@ -515,39 +496,52 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
                                                      int targetHeight, bool oneBit, bool crop) {
   LOG_DBG("JPG", "Converting JPEG to %s BMP (target: %dx%d)", oneBit ? "1-bit" : "2-bit", targetWidth, targetHeight);
 
-  if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
-    LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", ESP.getFreeHeap(), MIN_FREE_HEAP);
+  // No heap gate: that existed to fit an MCU-era decoder into an ESP32 heap. The whole
+  // file is read into memory instead of being streamed through MCU callbacks.
+  std::vector<uint8_t> file;
+  {
+    uint8_t chunk[16 * 1024];
+    for (;;) {
+      const int n = jpegFile.read(chunk, sizeof(chunk));
+      if (n <= 0) break;
+      file.insert(file.end(), chunk, chunk + n);
+    }
+  }
+  if (file.size() < 4) {
+    LOG_ERR("JPG", "Could not read JPEG (%u bytes)", (unsigned)file.size());
     return false;
   }
 
-  s_jpegFile = &jpegFile;
-
-  const auto jpeg = makeUniqueNoThrow<JPEGDEC>();
-  if (!jpeg) {
-    LOG_ERR("JPG", "OOM: JPEG decoder");
+  BmpJpegError err;
+  jpeg_decompress_struct cinfo;
+  std::memset(&cinfo, 0, sizeof(cinfo));
+  bool created = false;
+  cinfo.err = jpeg_std_error(&err.pub);
+  err.pub.error_exit = bmpJpegErrorExit;
+  if (setjmp(err.escape)) {
+    if (created) jpeg_destroy_decompress(&cinfo);
+    LOG_ERR("JPG", "Cover decode failed: %s", err.message);
     return false;
   }
 
-  int rc = jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, bmpDrawCallback);
-  if (rc != 1) {
-    LOG_ERR("JPG", "JPEG open failed (err=%d)", jpeg->getLastError());
+  jpeg_create_decompress(&cinfo);
+  created = true;
+  jpeg_mem_src(&cinfo, file.data(), static_cast<unsigned long>(file.size()));
+  if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+    jpeg_destroy_decompress(&cinfo);
+    LOG_ERR("JPG", "Not a JPEG");
     return false;
   }
 
-  const ScopedCleanup cleanup{[&jpeg]() { jpeg->close(); }};
-
-  const int srcWidth = jpeg->getWidth();
-  const int srcHeight = jpeg->getHeight();
-  const bool progressiveDecode = (jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE);
-  // JPEGDEC forces progressive streams to JPEG_SCALE_EIGHTH in DecodeJPEG,
-  // so callback coordinates and MCU buffering must use the reduced decode grid.
-  const int decodedSrcWidth = progressiveDecode ? ((srcWidth + 7) >> 3) : srcWidth;
-  const int decodedSrcHeight = progressiveDecode ? ((srcHeight + 7) >> 3) : srcHeight;
+  const int srcWidth = static_cast<int>(cinfo.image_width);
+  const int srcHeight = static_cast<int>(cinfo.image_height);
+  // Progressive is decoded at FULL resolution now: the old 1/8 path was a decoder
+  // limitation (an 8x blur on every progressive cover), not a requirement.
+  const int decodedSrcWidth = srcWidth;
+  const int decodedSrcHeight = srcHeight;
+  int rc = 1;
 
   LOG_DBG("JPG", "JPEG dimensions: %dx%d", srcWidth, srcHeight);
-  if (progressiveDecode) {
-    LOG_DBG("JPG", "Progressive JPEG decode uses 1/8 source: %dx%d", decodedSrcWidth, decodedSrcHeight);
-  }
 
   constexpr int MAX_IMAGE_WIDTH = 2048;
   constexpr int MAX_IMAGE_HEIGHT = 3072;
@@ -599,8 +593,10 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     needsScaling = true;
   }
 
-  const bool smoothUpscale =
-      progressiveDecode && needsScaling && scaleSrcWidth <= outWidth && scaleSrcHeight <= outHeight;
+  // Used to be gated on progressiveDecode, because progressive arrived at 1/8 resolution
+  // and every cover needed heavy smoothing back up. Progressive now decodes at full
+  // resolution, so the gate is simply "are we upscaling?".
+  const bool smoothUpscale = needsScaling && scaleSrcWidth <= outWidth && scaleSrcHeight <= outHeight;
 
   // Write BMP header with output dimensions
   int bytesPerRow;
@@ -694,17 +690,52 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     }
   }
 
-  jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
-  jpeg->setUserPointer(&ctx);
+  // Whole-frame greyscale decode with the integer ISLOW IDCT (SIMD is off in both
+  // builds, so host and wasm produce identical pixels).
+  cinfo.out_color_space = JCS_GRAYSCALE;
+  cinfo.dct_method = JDCT_ISLOW;
+  jpeg_start_decompress(&cinfo);
 
-  rc = jpeg->decode(0, 0, 0);
+  const int decW = static_cast<int>(cinfo.output_width);
+  const int decH = static_cast<int>(cinfo.output_height);
+  if (decW != decodedSrcWidth || decH != decodedSrcHeight) {
+    LOG_ERR("JPG", "Decoded %dx%d but expected %dx%d", decW, decH, decodedSrcWidth, decodedSrcHeight);
+    jpeg_destroy_decompress(&cinfo);
+    return false;
+  }
+
+  std::vector<uint8_t> frame(static_cast<size_t>(decW) * static_cast<size_t>(decH));
+  while (cinfo.output_scanline < cinfo.output_height) {
+    JSAMPROW rows[1] = {frame.data() + static_cast<size_t>(cinfo.output_scanline) * decW};
+    jpeg_read_scanlines(&cinfo, rows, 1);
+  }
+  jpeg_finish_decompress(&cinfo);
+  jpeg_destroy_decompress(&cinfo);
+  created = false;
+
+  // Feed the unchanged MCU-row callback one band at a time. blockX = 0 makes the
+  // callback's "last MCU column" test true immediately, so each call processes exactly
+  // its own rows; bandH is capped by MAX_MCU_HEIGHT, the height of its row buffer.
+  for (int bandY = 0; bandY < decH && !ctx.error; bandY += MAX_MCU_HEIGHT) {
+    const int bandH = std::min(MAX_MCU_HEIGHT, decH - bandY);
+    BandBlock draw{};
+    draw.pUser = &ctx;
+    draw.x = 0;
+    draw.y = bandY;
+    draw.iWidth = decW;
+    draw.iWidthUsed = decW;
+    draw.iHeight = bandH;
+    draw.pPixels = reinterpret_cast<uint16_t*>(frame.data() + static_cast<size_t>(bandY) * decW);
+    bmpDrawCallback(&draw);
+  }
+  rc = ctx.error ? 0 : 1;
 
   if (rc == 1 && ctx.smoothUpscale && !ctx.error) {
     finishSmoothUpscale(&ctx);
   }
 
   if (rc != 1 || ctx.error) {
-    LOG_ERR("JPG", "JPEG decode failed (rc=%d, err=%d)", rc, jpeg->getLastError());
+    LOG_ERR("JPG", "JPEG decode failed (rc=%d)", rc);
     return false;
   }
 

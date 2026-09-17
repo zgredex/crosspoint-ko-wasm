@@ -3,7 +3,7 @@
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
-#include <JPEGDEC.h>
+#include "BandBlock.h"
 #include <Logging.h>
 #include <Memory.h>
 
@@ -56,7 +56,7 @@ struct JpegContext {
 // The old decoder (JPEGDEC) streamed MCU bands through file callbacks because it
 // had fixed internal buffers, and that banding is why the sampling math below is
 // block-relative. We keep that math untouched and simply hand it the whole frame
-// as a single band via a synthetic JPEGDRAW (x=0, y=0), so `x - blockX` and
+// as a single band via a synthetic BandBlock (x=0, y=0), so `x - blockX` and
 // `y - blockY` become the identity and the destination box cannot drift.
 // ---------------------------------------------------------------------------
 
@@ -114,7 +114,7 @@ constexpr int FP_SHIFT = 16;
 constexpr int32_t FP_ONE = 1 << FP_SHIFT;
 constexpr int32_t FP_MASK = FP_ONE - 1;
 
-int jpegDrawCallback(JPEGDRAW* pDraw) {
+int jpegDrawCallback(BandBlock* pDraw) {
   JpegContext* ctx = reinterpret_cast<JpegContext*>(pDraw->pUser);
   if (!ctx || !ctx->config || !ctx->renderer) return 0;
 
@@ -484,7 +484,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
 
   // Hand the whole frame to the unchanged band callback as one band.
   const unsigned long decodeStart = millis();
-  JPEGDRAW draw{};
+  BandBlock draw{};
   draw.pUser = &ctx;
   draw.x = 0;
   draw.y = 0;

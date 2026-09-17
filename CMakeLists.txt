@@ -47,7 +47,6 @@ include_directories(
   ${VL}/uzlib/src
   ${VL}/expat
   ${VL}/XmlParserUtils
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/JPEGDEC
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/PNGdec
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4
   ${STUB_DIR}
@@ -80,7 +79,6 @@ set(ENGINE_SOURCES
   ${VL}/Epub/Epub/converters/PngToFramebufferConverter.cpp
   ${VL}/JpegToBmpConverter/JpegToBmpConverter.cpp
   ${VL}/PngToBmpConverter/PngToBmpConverter.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/JPEGDEC/JPEGDEC.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/PNGdec/PNGdec.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/PNGdec/adler32.c
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/PNGdec/crc32.c
