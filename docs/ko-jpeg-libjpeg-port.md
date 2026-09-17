@@ -140,3 +140,40 @@ Same recipe: vendor libpng + zlib (ExternalProject, SIMD off, one source for hos
 wasm), whole-file read, whole-frame decode, feed the existing callback via a synthetic
 BandBlock (the band-block struct is already shared, so no new plumbing is needed).
 Then remove PNGdec from CMake.
+
+
+## 1-bit blue-noise dither: KEPT AS IS (decision 2026-09-17)
+
+User reported 1-bit XTG text looking "a bit too thick black". Measured before changing
+anything, on 4 text pages of demo.epub (dither ON vs OFF vs the 2-bit reference):
+
+| page | 2-bit implied ink mass | 1-bit dither | 1-bit old threshold |
+|------|------------------------|--------------|---------------------|
+|   20 | 10.64%                 | 10.61%       | 11.60%              |
+|  120 | 12.58%                 | 12.51%       | 13.71%              |
+|  500 |  9.24%                 |  9.18%       | 10.09%              |
+| 1000 | 10.70%                 | 10.64%       | 11.69%              |
+
+Empirical density actually applied (page 120): v=1 0.916 (nominal 0.922), v=2 0.658
+(0.667), v=3 0.997 (1.0). Implementation does what it claims.
+
+CONCLUSIONS - the dither is NOT what made it heavy. It matches the 4-level reference to
+within 0.1% and is ~9% LIGHTER than the old hard threshold. Two real causes remain:
+
+1. mono/core = 1.50x. The solid-black core is only 7-8% of a text page; the AA band
+   (v=1,2) adds ~50% on top. In the 2-bit page those pixels are grey; in 1-bit they are
+   dithered near-black dots ATTACHED to the stroke, and on 2-3 px strokes there is no
+   area for the eye to average over. Dot gain plus zero averaging area - intrinsic.
+2. ROOT CAUSE: the reference is bold by construction. The font pack thresholds in
+   tools/ttf_to_epdfont_fast.py quantize coverage >=25% -> dark grey, >=50% -> light
+   grey, >=75% -> BLACK. A 25% edge pixel is already dark grey, so faithful dithering
+   reproduces a heavy look.
+
+Calibration curve if this is ever revisited (ink mass, page 120, no rebuild needed):
+  reference 12.58% | current(235/170) 12.57% | x0.80 11.74% | x0.65 11.12%
+  | x0.50 10.49% | PR#2179(160/48) 10.49%
+
+If it IS revisited: raise the FONT coverage thresholds (helps both output modes, but
+diverges from the stock font compilation) rather than only lightening the densities.
+Best done alongside a real test pattern from the device, because the panel anchors
+15/30/80/210 used to derive the densities are still unverified.
