@@ -115,3 +115,28 @@ progressive, which currently arrives as a 1/8 blur).
 The `master` profile anomaly reproduced on a third independent source (11.6 vs 1.37),
 which is why the default is the ko fork triple. Read tone WITH detail/grain: legacy and
 master win detail and grain precisely because they band.
+
+
+## DONE: JPEGDEC removed
+
+Both JPEG converters (framebuffer + cover) decode with libjpeg-turbo. JPEGDEC survived
+only as the JPEGDRAW struct, so it was replaced by a local `BandBlock.h` and dropped
+from CMake - 0 references in the build, verified on host AND wasm.
+
+Verified after removal: 2048 pages, 0 differing pages, 0 differing pixels.
+
+NOT verified: end-to-end cover rendering. Covers are library-UI only and our host
+harness never renders them, so the cover converter compiles and its geometry code is
+untouched, but its decoded input changed (JPEGDEC -> libjpeg ISLOW), which will differ by
+up to ~1 LSB from IDCT rounding. Worth a visual check on device/browser.
+
+## REMAINING: PNGdec -> libpng
+
+`third_party/PNGdec` is still in use by BOTH PNG converters:
+- `Epub/Epub/converters/PngToFramebufferConverter.cpp` (~437 lines, framebuffer path)
+- `PngToBmpConverter/PngToBmpConverter.cpp` (845 lines, cover path)
+
+Same recipe: vendor libpng + zlib (ExternalProject, SIMD off, one source for host and
+wasm), whole-file read, whole-frame decode, feed the existing callback via a synthetic
+BandBlock (the band-block struct is already shared, so no new plumbing is needed).
+Then remove PNGdec from CMake.
