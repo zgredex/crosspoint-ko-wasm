@@ -41,6 +41,37 @@
 // a calibrated measurement of our own unit. If a real test pattern says otherwise, these
 // three numbers are the only thing that needs to change.
 inline constexpr uint8_t kMonoInkDensity[4] = {0, 235, 170, 255};
+
+// Precomputed 8-bit masks for the mono dither. Densities are {0, 235, 170, 255} and the test is
+// `noise < density`, so there are THREE real thresholds: 235 (v=1 dark), 170 (v=2 light), 255 (v=3
+// black). The 255 layer is NOT optional - the comparison is strict and the table holds all 256
+// values, so 1 in 256 black pixels must not ink. Omitting it cost ~70 wrong bits per page, which is
+// exactly the deficit a gate run measured.
+// Indexed [layer][y & 63][k]; bit (7 - j) answers for the pixel at x = 8k + j (phyY = 479-8k-j).
+struct MonoNoiseMasks {
+  uint8_t m[3][64][60];
+  MonoNoiseMasks() {
+    const int thr[3] = {235, 170, 255};
+    for (int t = 0; t < 3; ++t) {
+      for (int y = 0; y < 64; ++y) {
+        for (int k = 0; k < 60; ++k) {
+          uint8_t mask = 0;
+          for (int j = 0; j < 8; ++j) {
+            const int phyY = 479 - 8 * k - j;
+            if (kBlueNoise64[(phyY & 63) * 64 + (y & 63)] < thr[t]) {
+              mask |= static_cast<uint8_t>(1u << (7 - j));
+            }
+          }
+          m[t][y][k] = mask;
+        }
+      }
+    }
+  }
+};
+inline const MonoNoiseMasks& monoNoiseMasks() {
+  static const MonoNoiseMasks inst;
+  return inst;
+}
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -112,26 +143,41 @@ class XtchWriter {
       return (buf[phyY * 100 + (phyX >> 3)] >> (7 - (phyX & 7))) & 1;
     };
 
+    // Bit-parallel: one OUTPUT BYTE (8 pixels) per iteration instead of one pixel. The output
+    // byte at [y * 60 + k] holds x = 8k..8k+7; those eight pixels sit at phyY = 479-8k-j with
+    // phyX = y fixed, so they are the same bit position (7 - (y & 7)) of eight plane bytes.
+    // The dither uses precomputed mask layers instead of a per-pixel table lookup - that lookup
+    // was measured at ~0.32 ns/pixel, about one cycle each.
+    const MonoNoiseMasks& nm = monoNoiseMasks();
     for (int y = 0; y < LOGICAL_H; y++) {
-      for (int x = 0; x < LOGICAL_W; x++) {
-        const int phyX = y;
-        const int phyY = 479 - x;
-        const int ink = physBit(bw, phyX, phyY) == 0;  // ink bit = 0 in engine BW
-        bool putInk = ink;
-        if (dither && ink) {
-          // Recover the 4-level grey value from the two planes, using the same encoding
-          // as addGrayPage: p1 = ink & ~l (v & 2), p2 = ink & (l | ~m) (v & 1).
-          const int l = physBit(lsb, phyX, phyY);
-          const int m = physBit(msb, phyX, phyY);
-          const uint8_t v = static_cast<uint8_t>(((l ? 0 : 1) << 1) | ((l || !m) ? 1 : 0));
-          // Blue-noise threshold: the density IS the ink fraction, so a grey edge pixel
-          // inks in proportion to how dark it is instead of collapsing to solid black.
-          putInk = kBlueNoise64[(phyY & 63) * 64 + (phyX & 63)] < kMonoInkDensity[v];
+      const int planeBit = 7 - (y & 7);
+      const uint8_t yc = static_cast<uint8_t>(y & 63);
+      const uint8_t* bwRow = bw.data() + (y >> 3);
+      const uint8_t* lsbRow = haveGray ? lsb.data() + (y >> 3) : nullptr;
+      const uint8_t* msbRow = haveGray ? msb.data() + (y >> 3) : nullptr;
+      uint8_t* outRow = plane.data() + static_cast<size_t>(y) * 60;
+      for (int k = 0; k < LOGICAL_W / 8; k++) {
+        uint8_t bwBits = 0, lBits = 0, mBits = 0;
+        for (int j = 0; j < 8; ++j) {
+          const size_t off = static_cast<size_t>(479 - 8 * k - j) * 100;
+          const uint8_t sh = static_cast<uint8_t>(1u << (7 - j));
+          if (((bwRow[off] >> planeBit) & 1) == 0) bwBits |= sh;   // ink bit = 0 in engine BW
+          if (haveGray) {
+            if (((lsbRow[off] >> planeBit) & 1) != 0) lBits |= sh;
+            if (((msbRow[off] >> planeBit) & 1) != 0) mBits |= sh;
+          }
         }
-        if (putInk) {
-          // XTG bit 0 = black
-          plane[y * 60 + (x >> 3)] &= static_cast<uint8_t>(~(1 << (7 - (x & 7))));
+        uint8_t inkBits = bwBits;
+        if (dither && inkBits) {
+          // v: 1 = lsb; 2 = !lsb && msb; 3 = !lsb && !msb (same encoding as the scalar path).
+          const uint8_t m3 = static_cast<uint8_t>(~lBits & ~mBits);
+          const uint8_t m2 = static_cast<uint8_t>(~lBits &  mBits);
+          inkBits = static_cast<uint8_t>(
+              inkBits & static_cast<uint8_t>((m3 & nm.m[2][yc][k]) |
+                                             (lBits & nm.m[0][yc][k]) |
+                                             (m2 & nm.m[1][yc][k])));
         }
+        outRow[k] &= static_cast<uint8_t>(~inkBits);   // XTG bit 0 = black
       }
     }
 
