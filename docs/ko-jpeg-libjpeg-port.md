@@ -81,3 +81,37 @@ enough surrounding context to make the match unique.**
 - **Progressive EPUB test** end-to-end.
 - **Re-run the dither comparison** now that decode no longer degrades the source.
 - JPEGDEC removal: blocked on `vendor-lib/JpegToBmpConverter` (still uses it).
+
+
+## Next: the cover path (this is what still blocks JPEGDEC removal)
+
+JPEGDEC cannot be deleted until the cover converters stop using it:
+
+- `vendor-lib/JpegToBmpConverter/JpegToBmpConverter.cpp` (733 lines) - used by
+  `Epub.cpp` for covers (line ~628) and thumbnails (~725), and by `Txt.cpp` (~142)
+- `vendor-lib/PngToBmpConverter/PngToBmpConverter.cpp` (845 lines) - `Epub.cpp` (~662)
+
+Same shape as the framebuffer port: read the whole file, decode the whole frame with
+libjpeg (`JCS_GRAYSCALE`, `JDCT_ISLOW`) / libpng, and replace the MCU draw callback
+with a direct row loop. Keep the BMP writer, the crop math and the 1-bit output path
+untouched; drop the heap gates; stop forcing progressive to 1/8. Then remove
+`third_party/JPEGDEC` and `third_party/PNGdec` from CMake and the include path.
+
+Gate: cover BMP bytes identical for baseline images (and strictly better for
+progressive, which currently arrives as a 1/8 blur).
+
+## Dither comparison on the now-undegraded source
+
+`prog_panel` (the progressive image, full decode), local tone error / detail / grain:
+
+| candidate | tone | detail | grain |
+|---|---|---|---|
+| blue noise (kofork) - SHIPPED | 1.372 | 0.775 | 1043 |
+| kohash (fork hash dither) | 3.102 | 0.778 | 1022 |
+| fs (pr1614) | 4.067 | 0.828 | 780 |
+| legacy Bayer +/-40 - PREVIOUS | 9.734 | 0.949 | 6.3 |
+| all *_master variants | 11.6-13.7 | 0.91-0.94 | <=11 |
+
+The `master` profile anomaly reproduced on a third independent source (11.6 vs 1.37),
+which is why the default is the ko fork triple. Read tone WITH detail/grain: legacy and
+master win detail and grain precisely because they band.
