@@ -13,7 +13,6 @@
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
-#include "PixelCache.h"
 
 namespace {
 
@@ -34,7 +33,6 @@ struct PngContext {
   int dstHeight{0};
   int lastDstY{-1};  // Track last rendered destination Y to avoid duplicates
 
-  PixelCache cache;
   bool caching{false};
 
   uint8_t* grayLineBuffer{nullptr};
@@ -249,17 +247,6 @@ int pngDrawCallback(PNGDRAW* pDraw) {
     // (PNGdec delivers scanlines top to bottom) repositions the single-row band.
     // A flush failure stops caching for the rest of the decode so we never write
     // past the band buffer; finalize() then drops the partial file.
-    bool caching = ctx->caching;
-    DirectCacheWriter cw;
-    if (caching) {
-      if (!ctx->cache.advanceTo(dstY)) {
-        caching = false;
-        ctx->caching = false;
-      } else {
-        cw.init(ctx->cache.buffer, ctx->cache.bytesPerRow, ctx->cache.bandRows, ctx->cache.originX);
-        cw.beginRow(outY, ctx->config->y + ctx->cache.bandStart);
-      }
-    }
 
     int srcX = 0;
     int error = 0;
@@ -276,7 +263,6 @@ int pngDrawCallback(PNGDRAW* pDraw) {
           ditheredGray = quantizeToLevel(gray);
         }
         pw.writePixel(outX, ditheredGray);
-        if (caching) cw.writePixel(outX, ditheredGray);
       }
 
       // Bresenham-style stepping: advance srcX based on ratio srcWidth/dstWidth
@@ -432,13 +418,6 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   // unlike the old full-image buffer it neither competes with the ~44KB decoder
   // nor forces larger images to skip caching - which previously meant a full
   // re-decode on every one of an image page's ~14 render passes.
-  ctx.caching = !config.cachePath.empty();
-  if (ctx.caching) {
-    if (!ctx.cache.begin(config.cachePath, ctx.dstWidth, ctx.dstHeight, config.x, config.y, 1)) {
-      LOG_ERR("PNG", "Failed to start cache stream, continuing without caching");
-      ctx.caching = false;
-    }
-  }
 
   unsigned long decodeStart = millis();
   rc = png->decode(&ctx, 0);
@@ -448,16 +427,11 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
 
   if (rc != PNG_SUCCESS) {
     LOG_ERR("PNG", "Decode failed: %d", rc);
-    if (ctx.caching) ctx.cache.abort();
     return false;
   }
 
   LOG_DBG("PNG", "PNG decoding complete - render time: %lu ms", decodeTime);
 
-  // Finalize the streamed cache (caching may have been cleared on a flush error).
-  if (ctx.caching) {
-    ctx.cache.finalize();
-  }
 
   return true;
 }

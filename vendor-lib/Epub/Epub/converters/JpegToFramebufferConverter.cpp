@@ -18,7 +18,6 @@
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
-#include "PixelCache.h"
 
 namespace {
 
@@ -49,8 +48,6 @@ struct JpegContext {
   int32_t fineScaleFPY{1 << 16};  // Y: src -> dst row mapping
   int32_t invScaleFPY{1 << 16};   // Y: dst -> src row mapping
 
-  PixelCache cache;
-  bool caching{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -131,7 +128,6 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
   if (stride <= 0 || blockH <= 0 || validW <= 0) return 1;
 
   const bool useDithering = ctx->config->useDithering;
-  bool caching = ctx->caching;
   const int32_t fineScaleFPX = ctx->fineScaleFPX;
   const int32_t invScaleFPX = ctx->invScaleFPX;
   const int32_t fineScaleFPY = ctx->fineScaleFPY;
@@ -168,29 +164,12 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
   DirectPixelWriter pw;
   pw.init(renderer);
 
-  // The cache streams to disk one MCU-row band at a time. Flushing rows below
-  // this block (raster order guarantees they are final) repositions the band;
-  // cacheOriginY then maps screen rows to the band-local buffer rows. If a flush
-  // write fails, stop caching for the rest of this decode (and let finalize drop
-  // the partial file) rather than writing past the band buffer.
-  DirectCacheWriter cw;
-  int cacheOriginY = 0;
-  if (caching) {
-    if (!ctx->cache.advanceTo(dstYStart)) {
-      caching = false;
-      ctx->caching = false;
-    } else {
-      cw.init(ctx->cache.buffer, ctx->cache.bytesPerRow, ctx->cache.bandRows, ctx->cache.originX);
-      cacheOriginY = ctx->config->y + ctx->cache.bandStart;
-    }
-  }
 
   // === 1:1 fast path: no scaling math ===
   if (fineScaleFPX == FP_ONE && fineScaleFPY == FP_ONE) {
     for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
       const int outY = cfgY + dstY;
       pw.beginRow(outY);
-      if (caching) cw.beginRow(outY, cacheOriginY);
       const uint8_t* row = &pixels[(dstY - blockY) * stride];
       for (int dstX = dstXStart; dstX < dstXEnd; dstX++) {
         const int outX = cfgX + dstX;
@@ -203,7 +182,6 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           if (dithered > 3) dithered = 3;
         }
         pw.writePixel(outX, dithered);
-        if (caching) cw.writePixel(outX, dithered);
       }
     }
     return 1;
@@ -224,7 +202,6 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
     for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
       const int outY = cfgY + dstY;
       pw.beginRow(outY);
-      if (caching) cw.beginRow(outY, cacheOriginY);
       const int32_t srcFyFP = dstY * invScaleFPY;
       const int32_t fy = srcFyFP & FP_MASK;
       const int32_t fyInv = FP_ONE - fy;
@@ -262,7 +239,6 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           if (dithered > 3) dithered = 3;
         }
         pw.writePixel(outX, dithered);
-        if (caching) cw.writePixel(outX, dithered);
       }
 
       // Interior (no X boundary checks — lx0 and lx0+1 guaranteed in bounds)
@@ -285,7 +261,6 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           if (dithered > 3) dithered = 3;
         }
         pw.writePixel(outX, dithered);
-        if (caching) cw.writePixel(outX, dithered);
       }
 
       // Right edge (with X boundary clamping)
@@ -311,7 +286,6 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
           if (dithered > 3) dithered = 3;
         }
         pw.writePixel(outX, dithered);
-        if (caching) cw.writePixel(outX, dithered);
       }
     }
     return 1;
@@ -321,7 +295,6 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
   for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
     const int outY = cfgY + dstY;
     pw.beginRow(outY);
-    if (caching) cw.beginRow(outY, cacheOriginY);
     const int32_t srcFyFP = dstY * invScaleFPY;
     int ly = (srcFyFP >> FP_SHIFT) - blockY;
     if (ly < 0) ly = 0;
@@ -344,7 +317,6 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         if (dithered > 3) dithered = 3;
       }
       pw.writePixel(outX, dithered);
-      if (caching) cw.writePixel(outX, dithered);
     }
   }
 
@@ -481,11 +453,6 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   LOG_DBG("JPG", "JPEG %dx%d -> %dx%d (scale %.2f, jpegScale 1/%d, fineScale %.2f)%s", srcWidth, srcHeight, destWidth,
           destHeight, targetScale, jpegScaleDenom, (float)destWidth / ctx.scaledSrcWidth,
           isProgressive ? " [progressive]" : "");
-
-  // No pixel cache: it was an SD-card payload cache for a slow MCU re-rendering a
-  // page ~13 times. We render each page once, and the decoded frame is already in
-  // memory, so the cache has nothing to save and its band cap is device-shaped.
-  ctx.caching = false;
 
   // Decode the whole frame once, greyscale, with the integer ISLOW IDCT so host and
   // wasm produce identical pixels (SIMD is disabled in both builds).
