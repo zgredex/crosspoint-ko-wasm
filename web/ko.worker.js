@@ -11,6 +11,35 @@ importScripts('ko_xtch_wasm.js');   // defines createKoEngine (MODULARIZE)
 let Module = null;         // wasm module instance
 let api = null;            // C-export surface
 let spineCount = 0;
+// Composed-frame cache: a navigation that repeats a (spine, page, mode, spec, font) tuple
+// reuses the frame instead of re-rendering and re-composing. Bounded by bytes because a frame
+// is 1.5 MB (480*800*4) and the wasm heap is 2 GB - 128 frames is ~192 MB.
+const FRAME_CACHE_BUDGET = 192 * 1024 * 1024;
+const frameCache = new Map();          // key -> { data: Uint8ClampedArray }, insertion ordered
+let frameCacheBytes = 0;
+
+function frameCacheGet(key) {
+  const hit = frameCache.get(key);
+  if (!hit) return null;
+  frameCache.delete(key);              // refresh recency
+  frameCache.set(key, hit);
+  return hit;
+}
+
+function frameCachePut(key, img) {
+  // Store a COPY: the buffer handed to post() is transferred, which detaches it.
+  const copy = new Uint8ClampedArray(img.data.length);
+  copy.set(img.data);
+  if (frameCache.has(key)) frameCacheBytes -= frameCache.get(key).data.length;
+  frameCache.set(key, { data: copy });
+  frameCacheBytes += copy.length;
+  while (frameCacheBytes > FRAME_CACHE_BUDGET && frameCache.size > 1) {
+    const oldest = frameCache.keys().next().value;
+    frameCacheBytes -= frameCache.get(oldest).data.length;
+    frameCache.delete(oldest);
+  }
+}
+
 let currentSpine = -1;
 let currentPages = 0;
 let currentSpec = null;
@@ -181,7 +210,7 @@ async function init() {
   // Cache-bust the engine binaries: the emscripten glue fetches the .wasm with no version
   // query, so without this the edge serves a previously cached engine indefinitely and no
   // engine change can ever reach a returning browser.
-  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=8' : path) });
+  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=9' : path) });
   api = Module;
   // deterministic viewport: engine computes from margins; init with full logical
   api._ko_init(464, 778); // will be fixed up by ko_set_margins on first spec
@@ -192,6 +221,8 @@ async function init() {
 // what the ENGINE has built; a whole-book export runs every spine through the
 // engine, so its end state is undefined — force a real rebuild next render.
 function invalidateEngine() {
+  frameCache.clear();
+  frameCacheBytes = 0;
   currentSpine = -1;
   currentPages = 0;
   builtKey = null;
@@ -378,20 +409,30 @@ self.onmessage = async (ev) => {
         let page = ev.data.page;
         if (page < 0) page = 0;
         if (page >= currentPages) page = currentPages - 1;
+        // Repeat navigation: the composed frame is a pure function of these five inputs, and
+        // the cached copy is already out of wasm memory.
+        const frameKey = currentSpine + ':' + page + ':' + (wantMono ? 1 : 0) + ':' + builtKey + ':' + builtFontStamp;
+        const cachedFrame = frameCacheGet(frameKey);
+        if (cachedFrame) {
+          const reply = new Uint8ClampedArray(cachedFrame.data.length);
+          reply.set(cachedFrame.data);
+          post(id, true, { page, pages: currentPages, image: reply.buffer, mono: wantMono, cached: true },
+               [reply.buffer]);
+          break;
+        }
+
         tick('renderPage');
         const rc = api._ko_render_page(page);
         tock('renderPage');
         if (rc !== 0) { post(id, false, { error: 'render failed' }); return; }
-        tick('copyPlanes');
-        const bw = copyPlane(0);
-        const lsb = copyPlane(1);
-        const msb = copyPlane(2);
-        tock('copyPlanes');
+        // No plane copies: the compose runs inside the engine and reads the engine's own
+        // planes, so copying 3 x 48 KB out of wasm here was pure waste.
         tick('compose');
         // compose through the SAME quantization the encoder uses for the chosen
         // mode: 1-bit → BW plane only (no AA greys), 2-bit → full 4-level
-        const img = wantMono ? composeMono(bw) : composePage(bw, lsb, msb);
+        const img = wantMono ? composeMono() : composePage();
         tock('compose');
+        frameCachePut(frameKey, img);
         const tx = img.data.buffer;
         post(id, true, { page, pages: currentPages, image: tx, mono: wantMono }, [tx]);
         break;
