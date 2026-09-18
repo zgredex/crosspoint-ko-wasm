@@ -5,7 +5,7 @@
   const $ = (id) => document.getElementById(id);
 
   const els = {
-    file: $('epubFile'), openBtn: $('openBtn'), status: $('status'),
+    file: $('epubFile'), status: $('status'),
     page: $('page'), loading: $('loading'), pagerEl: $('pager'),
     prevBtn: $('prevBtn'), nextBtn: $('nextBtn'), pageInfo: $('pageInfo'),
     spineSel: $('spineSel'), coverBtn: $('coverBtn'),
@@ -56,7 +56,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=22');
+    const w = new Worker(base + 'ko.worker.js?v=23');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -165,6 +165,9 @@
   }
 
   function setStatus(msg, isErr) {
+    // A polite region for progress, assertive for failures (item 4). Toggling aria-live is the
+    // supported way to raise severity on one region without double-announcing the message.
+    if (els.status) els.status.setAttribute('aria-live', isErr ? 'assertive' : 'polite');
     els.status.textContent = msg;
     // long titles truncate in the header — hover reveals the full message
     els.status.title = (msg || '').replace(/\s+/g, ' ').trim();
@@ -382,6 +385,10 @@
       updatePager();
       setStatus(book.title + ' — ' + (r.page + 1) + '/' + r.pages + '쪽' +
                 (r.mono ? ' · 1-bit 미리보기' : ''));
+      // a screen reader cannot read rasterized text, but it can say what this object is
+      els.page.setAttribute('aria-label',
+        '도서 미리보기, ' + (els.spineSel.value ? (Number(els.spineSel.value) + 1) + '장 ' : '') +
+        (r.page + 1) + '쪽');
     } catch (e) {
       if (tok === renderToken) reportError(e, '페이지 렌더링');
     } finally {
@@ -436,11 +443,8 @@
     const v = els.fontPreset.value;
     const seg = els.fontPreset.closest('.segRow');
     if (!seg) return;
-    seg.querySelectorAll('.segBtn').forEach((b) => {
-      const on = b.dataset.value === v;
-      b.classList.toggle('active', on);
-      b.setAttribute('aria-checked', on ? 'true' : 'false');
-    });
+    // native radios: checked state only — no aria-checked, no click plumbing
+    seg.querySelectorAll('input[name=fontPresetRadio]').forEach((r) => { r.checked = r.value === v; });
   }
 
   function toggleFontPanel() {
@@ -598,7 +602,6 @@
       book = { title: r.title, spineCount: r.spineCount, hrefs: r.hrefs };
       populateSpines(r.hrefs);
       state = { spine: 0, page: 0, pages: 0, mode: state.mode };  // keep output mode
-      els.openBtn.disabled = false;
       els.coverBtn.disabled = false;
       document.body.classList.remove('no-book');   // ②/③ become available
       els.downloadBtn.disabled = exporting;
@@ -648,7 +651,6 @@
     startLoad(f);
   });
 
-  els.openBtn.addEventListener('click', () => els.file.click());
   els.coverBtn.addEventListener('click', () => loadCover());
 
   // ---- unified settings scheduler (rAF-paced hot path) ----
@@ -912,6 +914,8 @@
     if (o.fontPreset === 'custom') {          // the .epdfont itself is not remembered
       const p = els.fontPreset; if (p) p.value = 'ridibatang';
     }
+    syncFontSeg();                            // the radios mirror the (restored) select
+    toggleFontPanel();
     if (els.zoom && o.zoom) els.zoom.value = o.zoom;
     if (state) {                       // the seg buttons are driven by state.mode
       state.mode = o.mode === 0 ? 0 : 1;
@@ -974,7 +978,7 @@
   syncDependentControls();
   // live slider outputs on input (per-frame); repaint + warm on change
   const SLIDER_ROWS = [
-    ['screenMargin', 'screenMarginOut', (v) => v],
+    ['screenMargin', 'screenMarginOut', (v) => v + ' px'],
     ['fontSize', 'fontSizeOut', (v) => v + ' pt'],
     ['fontWeight', 'fontWeightOut', (v) => v],
     ['fontSpacePx', 'fontSpacePxOut', (v) => v + ' px'],
@@ -999,10 +1003,10 @@
   // ---- font face + custom conversion ----
   // segmented face preset: click a segment → mirror into the hidden select →
   // re-render (preset faces) or hot-apply (custom, if a font is loaded)
-  els.fontPreset.closest('.segRow').querySelector('.seg').addEventListener('click', (e) => {
-    const seg = e.target.closest('.segBtn');
-    if (!seg || seg.dataset.value === els.fontPreset.value) return;
-    els.fontPreset.value = seg.dataset.value;
+  els.fontPreset.closest('.segRow').querySelector('.seg').addEventListener('change', (e) => {
+    const seg = e.target.closest('input[name=fontPresetRadio]');
+    if (!seg || seg.value === els.fontPreset.value) return;
+    els.fontPreset.value = seg.value;
     syncFontSeg();
     toggleFontPanel();
     if (els.fontPreset.value !== 'custom') {
@@ -1057,16 +1061,14 @@
   // how it is quantized. The worker composes the preview through the same
   // quantization the encoder applies, so preview == file by construction.
   function syncExportSeg() {
-    els.exportSeg.querySelectorAll('.segBtn').forEach((b) => {
-      const on = b.dataset.value === String(state.mode);
-      b.classList.toggle('active', on);
-      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    els.exportSeg.querySelectorAll('input[name=exportModeRadio]').forEach((r) => {
+      r.checked = Number(r.value) === state.mode;
     });
   }
-  els.exportSeg.addEventListener('click', (e) => {
-    const seg = e.target.closest('.segBtn');
-    if (!seg || Number(seg.dataset.value) === state.mode) return;
-    state.mode = Number(seg.dataset.value);
+  els.exportSeg.addEventListener('change', (e) => {
+    const seg = e.target.closest('input[name=exportModeRadio]');
+    if (!seg || Number(seg.value) === state.mode) return;
+    state.mode = Number(seg.value);
     syncExportSeg();
     syncAaToMode();
     savePrefs();
@@ -1198,9 +1200,15 @@
   if (restored) syncDependentControls();
   hasFontBackend();   // one probe: is the server-side converter deployed here?
   worker = spawnWorker();
-  bootEngine().catch((e) => {
-    setStatus('엔진 시작 실패: ' + e.message, true);
-  }).then(() => {
+  // The engine init is deferred to an idle slot so the picker paints without waiting on the
+  // ~7 MB wasm. Safe: ko.worker.js awaits its own initPromise before handling any command, so
+  // early calls simply queue, and the ?epub= dev path below awaits this same promise.
+  const bootEngineWhenIdle = () => new Promise((done) => {
+    const start = () => { bootEngine().catch((e) => reportError(e, '엔진 시작')).then(done); };
+    if (window.requestIdleCallback) requestIdleCallback(start, { timeout: 1500 });
+    else setTimeout(start, 120);
+  });
+  bootEngineWhenIdle().then(() => {
     // convenience: /?epub=path triggers fetch+load (for local dev/test)
     const q = new URLSearchParams(location.search);
     const auto = q.get('epub');
