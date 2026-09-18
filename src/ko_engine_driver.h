@@ -29,9 +29,26 @@
 #include <EpdFontFamily.h>
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
+// §5 font-contribution measurement toggles. Default 1 so every other build (native host, any TU
+// that misses the definition) keeps the fonts embedded and behaves exactly as before.
+#ifndef KO_EMBED_KOPUB
+#define KO_EMBED_KOPUB 1
+#endif
+#ifndef KO_EMBED_PRETENDARD
+#define KO_EMBED_PRETENDARD 1
+#endif
+#ifndef KO_EMBED_RIDI
+#define KO_EMBED_RIDI 1
+#endif
+#if KO_EMBED_KOPUB
 #include <builtinFonts/kopub_14_regular.h>
+#endif
+#if KO_EMBED_PRETENDARD
 #include <builtinFonts/pretendard_10_regular.h>
+#endif
+#if KO_EMBED_RIDI
 #include <builtinFonts/ridibatang_14_regular.h>
+#endif
 #include "fontIds.h"
 
 namespace ko {

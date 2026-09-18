@@ -80,12 +80,18 @@ KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
     g_renderer->begin();
     g_driver = new ko::EngineDriver(*g_renderer, *g_display);
 
+#if KO_EMBED_PRETENDARD
     g_pretendard = new EpdFont(&pretendard_10_regular);
     g_uiFamily = new EpdFontFamily(g_pretendard);
+#endif
+#if KO_EMBED_KOPUB
     g_kopub = new EpdFont(&kopub_14_regular);
     g_kopubFamily = new EpdFontFamily(g_kopub);
+#endif
+#if KO_EMBED_RIDI
     g_ridibatang = new EpdFont(&ridibatang_14_regular);
     g_ridibatangFamily = new EpdFontFamily(g_ridibatang);
+#endif
     g_renderer->insertFont(UI_FONT_ID, g_uiFamily);
     g_renderer->insertFont(UI_10_FONT_ID, g_uiFamily);
     g_renderer->insertFont(UI_12_FONT_ID, g_uiFamily);
@@ -107,10 +113,14 @@ KO_EXPORT void ko_close() {
   delete g_driver; g_driver = nullptr;
   delete g_renderer; g_renderer = nullptr;
   delete g_display; g_display = nullptr;
+#if KO_EMBED_PRETENDARD
   delete g_uiFamily; g_uiFamily = nullptr;
   delete g_pretendard; g_pretendard = nullptr;
+#endif
+#if KO_EMBED_KOPUB
   delete g_kopubFamily; g_kopubFamily = nullptr;
   delete g_kopub; g_kopub = nullptr;
+#endif
   delete g_ridibatangFamily; g_ridibatangFamily = nullptr;
   delete g_ridibatang; g_ridibatang = nullptr;
   delete g_xtch; g_xtch = nullptr;

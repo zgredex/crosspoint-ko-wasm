@@ -160,6 +160,17 @@ add_dependencies(jpeg-static libjpeg_turbo_ext)
 # the dependency explicit for the targets that link it.
 file(MAKE_DIRECTORY ${JPEG_TURBO_INSTALL}/include)
 
+# §5 font-contribution measurement. Temporary measurement switches, not production architecture:
+# flip one off, rebuild, and compare artifact size to see what that font costs the payload.
+option(KO_EMBED_RIDI "Embed RIDIBatang (default reader face)" ON)
+option(KO_EMBED_KOPUB "Embed KoPub Batang" ON)
+option(KO_EMBED_PRETENDARD "Embed Pretendard (UI fallback)" ON)
+add_compile_definitions(
+  KO_EMBED_RIDI=$<BOOL:${KO_EMBED_RIDI}>
+  KO_EMBED_KOPUB=$<BOOL:${KO_EMBED_KOPUB}>
+  KO_EMBED_PRETENDARD=$<BOOL:${KO_EMBED_PRETENDARD}>
+)
+
 add_library(koengine STATIC ${ENGINE_SOURCES} ${STUB_SOURCES})
 target_link_libraries(koengine PUBLIC jpeg-static)
 
