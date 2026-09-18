@@ -36,3 +36,9 @@ web/ko_xtch_wasm.wasm
 web/ko_build_info.js
 web/ft_wasm.js
 web/ft_wasm.wasm
+
+# Local fixtures too large to track (regenerated on demand):
+#   web/demo.epub       60 spines / 1,690 pages / 162 MB container
+#   web/demo-large.epub 80 MB, built to measure the open path transfer and copy costs
+web/demo.epub
+web/demo-large.epub
