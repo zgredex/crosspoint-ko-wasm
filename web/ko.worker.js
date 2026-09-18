@@ -256,19 +256,15 @@ function renderKey(spec) { return keyOf(spec, LAYOUT_FIELDS.concat(RENDER_FIELDS
 function specKey(spec) { return layoutKey(spec); }   // kept for the spec reply's field name
 
 // §4: interactive work must not queue behind speculative export work.
-let lastInteractiveAt = 0;
-function markInteractive() { lastInteractiveAt = Date.now(); }
-const INTERACTIVE_COOLOFF_MS = 120;
+// lastInteractiveAt / INTERACTIVE_COOLOFF_MS lived here: the warm used to stand aside for 120 ms
+// whenever the reader turned a page, because warm and preview shared one engine. The export engine is
+// separate, so there is nothing to stand aside for.
 
 // §4 of the 1.4 audit: a 2,000-page XTCH is ~195 MB. Pre-rendering that speculatively and keeping it
 // in the JS heap is a bad mobile trade, so a background warm stops once the RAW projection (the writer
 // accumulates uncompressed pages even for XTZ4) passes this budget. A user-requested export is never
 // capped.
-const WARM_RAW_LIMIT = 64 * 1024 * 1024;
-function estimatedContainerBytes(mode, pages) {
-  const pageBytes = (mode === 0) ? (22 + 48000) : (22 + 96000);
-  return pages * pageBytes;
-}
+
 
 // A macrotask hop that is NOT clamped: browsers clamp nested setTimeout(0) to ~4 ms, which would add
 // seconds to a whole-book pass. postMessage to our own port yields just as effectively at ~0.1 ms,
@@ -366,27 +362,6 @@ function composePage() {
 // and Emscripten never returns linear memory, so the high-water mark stayed grown even after the abort.
 // Decide from pagination alone, before any encoded page exists. Small books get paginated twice; that
 // is deliberate, and measure before caching page counts by layout key.
-async function preflightWarmSize(mode, maxRawBytes, cancelCheck, cooloff) {
-  let pages = 0;
-  const t0 = performance.now();
-  for (let s = 0; s < spineCount; s++) {
-    const n = api._ko_build_spine(s);
-    if (n < 0) throw new Error('warm preflight: spine ' + s + ' build failed');
-    invalidateSectionTracking();          // _ko_build_spine changes EngineDriver::section_
-    pages += n;
-    if (estimatedContainerBytes(mode, pages) > maxRawBytes) return { tooLarge: true, pages };
-    await yieldToLoop();
-    if (cancelCheck && cancelCheck()) return { cancelled: true, pages };
-    if (cooloff) {
-      while (Date.now() - lastInteractiveAt < INTERACTIVE_COOLOFF_MS) {
-        await new Promise((r) => setTimeout(r, INTERACTIVE_COOLOFF_MS));
-        if (cancelCheck && cancelCheck()) return { cancelled: true, pages };
-      }
-    }
-  }
-  preflightTimes = { ms: +(performance.now() - t0).toFixed(1), pages, spines: spineCount };
-  return { tooLarge: false, pages };
-}
 
 // §2 + §5 of the 1.1 audit: speculation must never sit in front of the requested frame, and a
 // cache HIT must schedule a prefetch too — otherwise a sequential read alternates miss/hit and only
@@ -614,7 +589,6 @@ function invalidateEngine() {
 async function exportWholeBook(opts, onProgress) {
   const xtcz = !!(opts && opts.xtcz);
   const cancelCheck = (opts && opts.cancelCheck) || null;
-  const cooloff = !!(opts && opts.cooloff);   // §4: speculative warms stand aside; exports do not
   tick('exportBegin');
   const spines = api._ko_export_begin();
   tock('exportBegin');
@@ -638,10 +612,6 @@ async function exportWholeBook(opts, onProgress) {
       throw new Error('export spine ' + s + ' failed');
     }
     total += n;
-    if (opts.maxRawBytes && estimatedContainerBytes(opts.mode, total) > opts.maxRawBytes) {
-      const c = cancelCurrentExport(total);     // §4: releases the pages accumulated so far
-      return { cancelled: true, reason: 'too-large', pages: c.pages };
-    }
     // §1: _ko_export_spine() just rebuilt the C++ section_ for THIS spine. Never let JS claim an
     // interactive spine is still built across this point.
     invalidateSectionTracking();
@@ -651,17 +621,6 @@ async function exportWholeBook(opts, onProgress) {
     COUNTERS.warmYields += 1;
     await yieldToLoop();
     if (cancelCheck && cancelCheck()) return cancelCurrentExport(total);
-    if (cooloff) {
-      // and if the user just turned a page, keep standing aside until they are idle again — this is
-      // speculative work, so interactive latency wins.
-      while (Date.now() - lastInteractiveAt < INTERACTIVE_COOLOFF_MS) {
-        COUNTERS.warmCooldowns += 1;
-        await new Promise((r) => setTimeout(r, INTERACTIVE_COOLOFF_MS));
-        // §1: the cool-off is a cancellation path too — it used to return without aborting, leaking
-        // everything accumulated so far.
-        if (cancelCheck && cancelCheck()) return cancelCurrentExport(total);
-      }
-    }
   }
   tick('exportFinish');
   const pages = api._ko_export_finish();
@@ -864,7 +823,11 @@ self.onmessage = async (ev) => {
         // alone only asks it to abort at its next spine yield, and the suspended warm handler would
         // then resume its spine loop against the NEW book.
         await stopWarmBeforeMutation();
-        const epub = ev.data.epub;               // ArrayBuffer
+        // EITHER an ArrayBuffer or a Blob. A Blob matters now that two engines exist: an ArrayBuffer
+        // handed to one worker is DETACHED by the transfer, so the second engine could never read it,
+        // and keeping a second copy in the page would double the book's memory for a 200 MB book.
+        // Each worker reads the same Blob instead.
+        const epub = ev.data.epub || await ev.data.blob.arrayBuffer();
         const bytes = new Uint8Array(epub);
         const bufPtr = api._malloc(bytes.length);
         api.HEAPU8.set(bytes, bufPtr);
@@ -906,7 +869,6 @@ self.onmessage = async (ev) => {
         // exposed for debugging, so a raw spec during a warm must not change g_spec between spines.
         await stopWarmBeforeMutation();
         tick('spec');
-        markInteractive();
         // margins: viewable area + screenMargin on all four sides (no UI reserve)
         await applySpec(ev.data.spec);
         const vp = viewportInfo(currentSpec);
@@ -938,7 +900,6 @@ self.onmessage = async (ev) => {
       }
 
       case 'render': {
-        markInteractive();
         // §2/§8: the spec travels with the render, so an ordinary page turn is one request and a
         // settings change is one request too. When it has not changed, this does nothing at all.
         let vpInfo = null;
@@ -1139,25 +1100,22 @@ self.onmessage = async (ev) => {
           const warmDepth = selectedWarmMode === 0 ? 2 : 4;
           api._ko_set_image_tone_depth(warmDepth);
           if (currentSpec) currentSpec.imageToneDepth = warmDepth;
-          // §2 of the 1.5 audit: refuse an oversized book BEFORE allocating any page buffers
-          const pre = await preflightWarmSize(selectedWarmMode, WARM_RAW_LIMIT,
-                                              () => myTok < warmToken, true);
-          if (pre.cancelled) { post(id, true, { warm: 'cancelled' }); break; }
-          if (pre.tooLarge) { post(id, true, { warm: 'skipped-large', pages: pre.pages }); break; }
+          // No size preflight and no cap. The preflight paginated every spine to decide whether to
+          // paginate every spine, so a book that passed it was laid out TWICE, and a book that failed
+          // it was laid out once for nothing and then again at export time. Both were artefacts of
+          // sharing this engine with the reader; with a dedicated export engine there is no
+          // interactive work here to starve, so the honest thing is to convert the book the user
+          // asked for.
+          //
+          // Cancellation is still cheap: a superseding warm bumps the token and the loop checks it at
+          // every spine, and the app terminates this worker outright when the request itself changes.
           const res = await exportWholeBook({
             mode: selectedWarmMode,
             xtcz: !!ev.data.xtcz,
             cancelCheck: () => myTok < warmToken,   // a newer warm superseded us
-            cooloff: true,                          // §4: speculative work yields to the reader
-            maxRawBytes: WARM_RAW_LIMIT,            // §4: never speculate a ~200 MB file
           });
           if (myTok < warmToken) { post(id, true, { warm: 'superseded' }); break; }
-          if (res.cancelled) {
-            post(id, true, res.reason === 'too-large'
-              ? { warm: 'skipped-large', pages: res.pages }
-              : { warm: 'cancelled' });
-            break;
-          }
+          if (res.cancelled) { post(id, true, { warm: 'cancelled' }); break; }
           warmBytes = res.file;
           warmPages = res.pages;
           warmRaw = res.rawBytes || 0;

@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=44');
+    const w = new Worker(base + 'ko.worker.js?v=45');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -101,6 +101,9 @@
   function respawn() {
     if (respawning) return;
     respawning = true;
+    // the export engine holds the same book and must go with it, or it would convert a book the reader
+    // has already replaced
+    killExportEngine();
     // kill worker + reject in-flight calls so no promise hangs forever
     try { worker.terminate(); } catch (_) {}
     worker = spawnWorker();
@@ -114,11 +117,11 @@
       // drag/drop, neither of which the input's FileList can do.
       const f = currentBookFile || (els.file.files && els.file.files[0]) || null;
       if (f) {
-        f.arrayBuffer().then((buf) => { pendingBookFile = f; return loadBook(buf, f.name); });
+        pendingBookFile = f; return loadBook(f, f.name);
       } else {
         const q = new URLSearchParams(location.search);
         const auto = q.get('epub');
-        if (auto) fetch(auto).then((r) => r.arrayBuffer()).then((buf) => { pendingBookFile = null; return loadBook(buf, auto.split('/').pop()); });
+        if (auto) fetch(auto).then((r) => r.blob()).then((b) => { pendingBookFile = null; return loadBook(b, auto.split('/').pop()); });
       }
     }).catch(() => { respawning = false; });
   }
@@ -138,6 +141,82 @@
     });
   }
   window.__call = call;   // debug hook (stats etc.)
+
+  // ---- the export engine ------------------------------------------------------
+  // A SECOND worker instance running the same ko.worker.js. Everything whole-book — the speculative
+  // warm and the export itself — happens here, so a conversion never shares an engine with the page
+  // the reader is looking at. That is what lets the rest of this file get simpler: the interactive
+  // cooldown, the preview-section invalidation after every export spine, the whole-book size
+  // preflight and the "never speculate past 64 MB" cap all existed to stop one engine's two jobs from
+  // fighting. The protection is now a process boundary, and cancellation is terminate() — which
+  // cannot be starved by a long spine, because it drops the heap that spine is running in.
+  let exportWorker = null;
+  let exportNextId = 1;
+  const exportPending = new Map();
+  let exportLoaded = null;        // promise: "this engine has the current book"
+
+  function spawnExportWorker() {
+    const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
+    const w = new Worker(base + 'ko.worker.js?v=45');
+    w.onmessage = (ev) => {
+      const m = ev.data;
+      if (m && m.progress) {           // progress reports carry no id
+        els.exportProgress.textContent = '생성 중 ' + m.spine + '/' + m.ofSpines + ' ' +
+          '(' + m.pages + '쪽 완료)…';
+        if (els.exportStatus.textContent !== '기기 파일 생성 중…')
+          els.exportStatus.textContent = '기기 파일 생성 중…';
+        return;
+      }
+      const p = exportPending.get(m.id);
+      if (!p) return;
+      exportPending.delete(m.id);
+      clearTimeout(p.timer);
+      m.ok ? p.resolve(m) : p.reject(new Error(m.error || 'export worker error'));
+    };
+    // The export engine is auxiliary: its death must never take the preview down with it.
+    w.onerror = (e) => { e.preventDefault(); failExportEngine('worker error'); };
+    w.onmessageerror = () => failExportEngine('message error');
+    return w;
+  }
+
+  function failExportEngine(why) {
+    console.warn('[export] engine failed:', why);
+    killExportEngine();
+    if (els.exportStatus) els.exportStatus.textContent = '⚠ 내보내기 엔진을 다시 시작했습니다. 다시 시도해 주세요.';
+  }
+
+  function exportCall(cmd, payload = {}, transfer, timeoutMs) {
+    if (!exportWorker) exportWorker = spawnExportWorker();
+    const id = exportNextId++;
+    const w = exportWorker;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        exportPending.delete(id);
+        reject(new Error('timeout: ' + cmd));
+      }, timeoutMs || CALL_TIMEOUT_MS);
+      exportPending.set(id, { resolve, reject, timer });
+      w.postMessage(Object.assign({ id, cmd }, payload), transfer || []);
+    });
+  }
+
+  // Hard cancel: reject everything in flight, drop the worker and its heap, and let the next call
+  // spawn a fresh engine. This is also how the engine is reset on a book or engine change.
+  function killExportEngine() {
+    if (exportWorker) { try { exportWorker.terminate(); } catch (_) {} }
+    exportWorker = null;
+    exportLoaded = null;
+    for (const [, p] of exportPending) { clearTimeout(p.timer); p.reject(new Error('export engine stopped')); }
+    exportPending.clear();
+  }
+
+  // Load the current book into the export engine. Each worker reads the same Blob separately: a
+  // transferred ArrayBuffer is DETACHED for the first reader, so the second engine could never see
+  // it, and keeping a page-side copy would double a 200 MB book's memory.
+  function loadExportEngine(blob) {
+    exportLoaded = exportCall('load', { blob }, null, 300000)
+      .catch((e) => { exportLoaded = null; throw e; });
+    return exportLoaded;
+  }
 
   // ---- Korean, actionable error copy (item 8) ------------------------------
   // The raw WASM/JS message is never shown to the user; it goes to the console and onto the
@@ -417,7 +496,6 @@
   // applyFont() in the worker, which for a custom font re-malloc'ed and re-parsed the whole
   // .epdfont — on every single page turn. Ordinary navigation is now one worker request.
   let lastPushedSpecKey = null;
-  let warmSkippedKey = null;      // outputKey of a book we decided is too large to warm (§3)
   function currentSpecKey() {
     try { return JSON.stringify(readSpec()); } catch (_) { return null; }
   }
@@ -663,7 +741,7 @@
     els.spineSel.selectedIndex = 0;
   }
 
-  async function loadBook(buf, name) {
+  async function loadBook(blob, name) {
     renderToken++;                      // kill in-flight renders
     // §2 of the 1.2 audit: cancel the warm BEFORE asking the engine to load. Cancelling afterwards
     // left the warm free to resume between spines against a book that had already been replaced (the
@@ -672,7 +750,17 @@
     setStatus('EPUB 분석 중…');
     busy('EPUB 분석 중');
     try {
-      const r = await call('load', { epub: buf }, [buf], 120000);
+      // The preview engine is loaded authoritatively; the export engine reads the same Blob in
+      // parallel, so the conversion can start the moment the reader can see page one. A failure there
+      // is not fatal — the preview still works and the export path loads on demand — but it is
+      // reported, because a silent failure would present as an export that re-renders the whole book.
+      // A book change resets the export engine outright: one engine per book, and no chance of a
+      // leftover instance still converting the previous one.
+      killExportEngine();
+      loadExportEngine(blob).catch((e) => {
+        console.warn('[export] engine load failed:', e && e.message);
+      });
+      const r = await call('load', { blob }, null, 120000);
       // §5: canonicalize ONCE, here. The header, the export filename and every later comparison
       // then use one composed string. An NFD metadata title used to reach the filename sanitizer
       // raw, where only composed syllables ([가-힣]) are allowed, and a book with no metadata title
@@ -732,7 +820,7 @@
       picked.hidden = false;
       picked.title = normalizeDisplayText(f.name);
     }
-    f.arrayBuffer().then((buf) => loadBook(buf, f.name));
+    loadBook(f, f.name);
   }
 
   // §3: the picker does not fire change when the same path is chosen again (e.g. the user
@@ -831,7 +919,7 @@
     if (!book || exporting) return;
     // §3: a book we already decided is too large must not be probed again on every settings change
     const key = outputKey();
-    if (warmSpecKey === key || warmSkippedKey === key) return;
+    if (warmSpecKey === key) return;
     clearTimeout(warmSettleTimer);
     warmSettleTimer = setTimeout(fireWarm, delayMs == null ? 2000 : delayMs);
   }
@@ -840,8 +928,11 @@
     warmVersion++;               // supersedes + cancels any in-flight warm
     // tell the WORKER too: an in-flight warm holds the engine; abort it at the
     // next spine yield so a font change doesn't queue behind a whole-book pass
-    if (worker) {
-      try { worker.postMessage({ id: 'warmCancel', cmd: 'warmCancel' }); } catch (_) {}
+    // Ask the export engine to stop at its next spine yield. This is the graceful path, used for
+    // settings changes: it keeps the loaded book, so the next warm re-parses nothing. A book or engine
+    // change uses killExportEngine() instead, which drops the heap outright.
+    if (exportWorker) {
+      try { exportWorker.postMessage({ id: 'warmCancel', cmd: 'warmCancel' }); } catch (_) {}
     }
   }
   async function fireWarm() {
@@ -852,15 +943,18 @@
     warmKeyAtFire = key;
     const tok = warmVersion;
     try {
+      // the warm needs the export engine to hold the book; if its load failed, do not retry-storm —
+      // the export path loads on demand
+      if (!exportLoaded) return;
+      try { await exportLoaded; } catch (_) { return; }
       // §3 of the 1.3 audit: the warm carries the spec it is producing. Otherwise it silently
       // depends on a preview render having already applied the same settings to the engine.
       const warmSpec = readSpec();
-      const r = await call('warm', { spec: warmSpec, mode: state.mode, xtcz: els.lz4Wrap.checked, token: tok },
-                            null, 900000);
+      const r = await exportCall('warm', { spec: warmSpec, mode: state.mode, xtcz: els.lz4Wrap.checked, token: tok },
+                                 null, 900000);
       if (tok !== warmVersion) return;    // settings changed mid-warm → stale
       if (r && r.warm === 'ready') {
         warmSpecKey = key;
-        warmSkippedKey = null;
         els.exportStatus.textContent = '✓ 미리 변환 완료 — 내보내면 바로 저장됩니다';
         // Surface the conversion's own timings: the warm is the common path in the app, so a report
         // that only rides the explicit-export response is invisible exactly when someone is looking at
@@ -882,12 +976,6 @@
       }
       // busy → a previous warm still finishing; it will supersede itself, so
       // just re-schedule once it has had time to stop
-      else if (r && r.warm === 'skipped-large') {
-        // §3: remember the decision for this exact output state, or the next settings change (and the
-        // post-export reschedule) starts probing the oversized warm all over again
-        warmSkippedKey = key;
-        els.exportStatus.textContent = '대용량 도서는 내보낼 때 변환됩니다';
-      }
       else if (r && r.warm === 'busy') scheduleWarm(400);
     } catch (_) { /* engine busy/restarting — try again later */ scheduleWarm(1500); }
     finally { warmKeyAtFire = null; }
@@ -1295,7 +1383,7 @@
       setExportLocked(true);
       els.downloadBtn.disabled = true;
       try {
-        const res = await call('fetchWarm', {}, null, 60000);
+        const res = await exportCall('fetchWarm', {}, null, 60000);
         const u8 = new Uint8Array(res.file);
         const filename = exportFilename(res.xtcz !== undefined ? res.xtcz : xtcz);
         const ratio = res.xtcz && res.rawBytes ? ' (원본의 ' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '%)' : '';
@@ -1328,7 +1416,16 @@
       // reached the engine yet. Idempotent and cheap.
       // §3: one message = one transaction. The worker applies this snapshot after taking the export
       // lock, so the file cannot be built from a mixture of settings.
-      const res = await call('exportBook', { spec: readSpec(), mode, xtcz }, null, 600000);
+      // Make sure the export engine holds this book before asking for the container. It normally
+      // already does — loaded in parallel with the preview — but a load failure or a setting change
+      // that killed the engine lands here, and re-loading is far cheaper than a failed export.
+      if (!exportLoaded) {
+        const f = currentBookFile || (els.file.files && els.file.files[0]) || null;
+        if (f) { try { await loadExportEngine(f); } catch (_) {} }
+      } else {
+        try { await exportLoaded; } catch (_) {}
+      }
+      const res = await exportCall('exportBook', { spec: readSpec(), mode, xtcz }, null, 600000);
       // Export cost, on the page, for measurement: per-spine ms proves where the time goes and how
       // unevenly it is distributed, which is the input a spine pool needs.
       if (res && res.spineTimes) {
@@ -1521,7 +1618,7 @@
     if (auto) {
       fetch(auto).then((r) => r.arrayBuffer()).then((buf) => {
         pendingBookFile = null;   // §8: no File behind a fetch-loaded book
-        return loadBook(buf, auto.split('/').pop());
+        return fetch(auto).then((r) => r.blob()).then((b) => loadBook(b, auto.split('/').pop()));
       });
     }
   });
