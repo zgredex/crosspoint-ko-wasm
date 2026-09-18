@@ -690,6 +690,20 @@ async function exportWholeBook(opts, onProgress) {
   api._ko_xtch_release();
   LAST_EXPORT.spines = spineTimes;
   LAST_EXPORT.preflight = preflightTimes;
+  // Reported here as well as returned, because the *warm* path builds the container too — and the
+  // warm is the common case in the app, so a report that only rides the explicit-export response is
+  // invisible exactly when someone is looking at the conversion they just waited for.
+  if (spineTimes.length && typeof console !== 'undefined' && console.log) {
+    const ms = spineTimes.map((x) => x.ms).sort((a, b) => a - b);
+    const sum = ms.reduce((a, b) => a + b, 0);
+    const heaviest = Math.max(...ms);
+    const speedup = (n) => sum / Math.max(sum / n, heaviest);
+    console.log(`[export] ${spines} spines, ${pages} pages, ${sum.toFixed(0)} ms of spine work `
+                + `(min ${ms[0].toFixed(1)} p50 ${ms[Math.floor(ms.length * 0.5)].toFixed(1)} `
+                + `p90 ${ms[Math.floor(ms.length * 0.9)].toFixed(1)} max ${heaviest.toFixed(1)}) `
+                + `ceiling ${speedup(4).toFixed(2)}x@4w ${speedup(8).toFixed(2)}x@8w`
+                + (preflightTimes ? ` | preflight ${preflightTimes.ms} ms for ${preflightTimes.pages} pages` : ''));
+  }
   return { file: out, pages, bytes: out.byteLength, spines, xtcz, rawBytes: rawBytes || 0 };
 }
 
@@ -1151,7 +1165,8 @@ self.onmessage = async (ev) => {
           warmXtcz = !!ev.data.xtcz;
           tock('warm');
           invalidateEngine();
-          post(id, true, { warm: 'ready', pages: res.pages });
+          post(id, true, { warm: 'ready', pages: res.pages,
+                           spineTimes: LAST_EXPORT.spines, preflight: LAST_EXPORT.preflight });
         } finally {
           invalidateSectionTracking();   // §1: also on a cancelled or superseded warm
           endWarm();
@@ -1233,7 +1248,10 @@ self.onmessage = async (ev) => {
         const tx = takeTransferBuffer(res.file)     // §2: no full-file copy;
         post(id, true, { file: tx, mode: ev.data.mode === 0 ? 0 : 1,
                          pages: res.pages, spines: res.spines,
-                         xtcz: res.xtcz, rawBytes: res.rawBytes }, [tx]);
+                         xtcz: res.xtcz, rawBytes: res.rawBytes,
+                         // diagnostic: per-spine ms and the preflight cost, if any. Storing these
+                         // in the worker alone was useless — nothing could ask for them.
+                         spineTimes: LAST_EXPORT.spines, preflight: LAST_EXPORT.preflight }, [tx]);
         break;
       }
 

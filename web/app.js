@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=42');
+    const w = new Worker(base + 'ko.worker.js?v=44');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -862,6 +862,23 @@
         warmSpecKey = key;
         warmSkippedKey = null;
         els.exportStatus.textContent = '✓ 미리 변환 완료 — 내보내면 바로 저장됩니다';
+        // Surface the conversion's own timings: the warm is the common path in the app, so a report
+        // that only rides the explicit-export response is invisible exactly when someone is looking at
+        // the conversion they just waited for.
+        if (r && r.spineTimes && r.spineTimes.length) {
+          const ms = r.spineTimes.map((x) => x.ms).slice().sort((a, b) => a - b);
+          const sum = ms.reduce((a, b) => a + b, 0);
+          const heaviest = ms[ms.length - 1];
+          const speedup = (n) => sum / Math.max(sum / n, heaviest);
+          window.__koExportStats = {
+            source: 'warm', spines: r.spineTimes.length, pages: r.pages,
+            spineMs: { min: ms[0], p50: ms[Math.floor(ms.length * 0.5)],
+                       p90: ms[Math.floor(ms.length * 0.9)], max: heaviest, sum: +sum.toFixed(1) },
+            ceiling: { w4: +speedup(4).toFixed(2), w8: +speedup(8).toFixed(2) },
+            preflight: r.preflight || null,
+            spineTimes: r.spineTimes,
+          };
+        }
       }
       // busy → a previous warm still finishing; it will supersede itself, so
       // just re-schedule once it has had time to stop
@@ -1312,6 +1329,22 @@
       // §3: one message = one transaction. The worker applies this snapshot after taking the export
       // lock, so the file cannot be built from a mixture of settings.
       const res = await call('exportBook', { spec: readSpec(), mode, xtcz }, null, 600000);
+      // Export cost, on the page, for measurement: per-spine ms proves where the time goes and how
+      // unevenly it is distributed, which is the input a spine pool needs.
+      if (res && res.spineTimes) {
+        const totalMs = res.spineTimes.reduce((n, x) => n + x.ms, 0);
+        const times = res.spineTimes.map((x) => x.ms).sort((a, b) => a - b);
+        window.__koExportStats = {
+          spines: res.spineTimes.length,
+          pages: res.pages,
+          bytes: res.bytes,
+          spineMs: { min: times[0], p50: times[Math.floor(times.length * 0.5)],
+                     p90: times[Math.floor(times.length * 0.9)], max: times[times.length - 1],
+                     sum: +totalMs.toFixed(1) },
+          spineTimes: res.spineTimes,
+          preflight: res.preflight,
+        };
+      }
       const u8 = new Uint8Array(res.file);
       const filename = exportFilename(xtcz);
       const ratio = xtcz && res.rawBytes ? ' (원본의 ' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '%)' : '';
