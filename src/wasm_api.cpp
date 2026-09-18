@@ -92,13 +92,22 @@ KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
     g_ridibatang = new EpdFont(&ridibatang_14_regular);
     g_ridibatangFamily = new EpdFontFamily(g_ridibatang);
 #endif
+    // Registration must be guarded exactly like construction. It was not: with KO_EMBED_KOPUB=OFF the
+    // family pointer was never assigned, yet the (unconditional) insertFont registered a null family —
+    // so every measurement build except the baseline registered nulls for the disabled faces.
+#if KO_EMBED_PRETENDARD
     g_renderer->insertFont(UI_FONT_ID, g_uiFamily);
     g_renderer->insertFont(UI_10_FONT_ID, g_uiFamily);
     g_renderer->insertFont(UI_12_FONT_ID, g_uiFamily);
     g_renderer->insertFont(SMALL_FONT_ID, g_uiFamily);
-    g_renderer->insertFont(KOPUB_14_FONT_ID, g_kopubFamily);
-    g_renderer->insertFont(RIDIBATANG_14_FONT_ID, g_ridibatangFamily);
     g_renderer->setFallbackFont(UI_FONT_ID);
+#endif
+#if KO_EMBED_KOPUB
+    g_renderer->insertFont(KOPUB_14_FONT_ID, g_kopubFamily);
+#endif
+#if KO_EMBED_RIDI
+    g_renderer->insertFont(RIDIBATANG_14_FONT_ID, g_ridibatangFamily);
+#endif
     g_xtch = new ko::XtchWriter();
   }
   g_spec = ko::Spec();
@@ -151,11 +160,23 @@ KO_EXPORT void ko_set_image_tone_depth(int v) { g_spec.imageToneDepth = (v == 2)
 KO_EXPORT void ko_set_focus_reading(int v) { (void)v; g_spec.focusReadingEnabled = 0; }  // EN-only; hardcoded off in KO
 
 // Reader font: RIDIBATANG_14_FONT_ID (default) / KOPUB_14_FONT_ID / CUSTOM_FONT_ID
+// §2/§3 of the KoPub-externalization groundwork. ko_set_font() accepted KOPUB_14_FONT_ID by id alone,
+// so with the face compiled out (or before a lazy fetch has landed) the JS believed the layout was
+// KoPub while the renderer drew whatever it actually had. A face that is not registered must fail
+// visibly instead.
+KO_EXPORT int ko_has_font(int fontId) {
+  return (g_renderer && g_renderer->hasFont(fontId)) ? 1 : 0;
+}
+
 KO_EXPORT int ko_set_font(int fontId) {
   switch (fontId) {
     case RIDIBATANG_14_FONT_ID:
     case KOPUB_14_FONT_ID:
     case CUSTOM_FONT_ID:
+      if (!g_renderer || !g_renderer->hasFont(fontId)) {
+        setError("font not loaded");
+        return -1;
+      }
       g_spec.fontId = fontId;
       return 0;
     default:
