@@ -3,6 +3,7 @@
 // ko::EngineDriver, then encodes pages with ko::XtchWriter into a real XTCH
 // container (56B header + 256B metadata + chapters + index + XTH page data).
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -26,7 +27,7 @@ HalDisplay display;
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: %s <book.epub> [out.xtch] [--1bit] [--no-mono-dither]\n", argv[0]);
+    fprintf(stderr, "usage: %s <book.epub> [out.xtch] [--1bit] [--image-dither N] [--image-dither-name NAME]\n", argv[0]);
     return 2;
   }
   const std::string epubPath = argv[1];
@@ -89,7 +90,16 @@ int main(int argc, char** argv) {
   // greys are still halftoned.
   for (int i = 1; i < argc; i++) {
     const std::string flag = argv[i];
-    if (flag == "--1bit") writer.setMode(ko::XtcMode::Mono1Bit);
+    if (flag == "--1bit") {
+      writer.setMode(ko::XtcMode::Mono1Bit);
+      spec.imageToneDepth = 2;   // 1-bit pages are dithered straight to 2 tones
+    } else if (flag == "--tone-depth-2") {
+      spec.imageToneDepth = 2;
+    } else if (flag == "--image-dither" && i + 1 < argc) {
+      spec.imageDither = std::atoi(argv[++i]);
+    } else if (flag == "--image-dither-name" && i + 1 < argc) {
+      spec.imageDither = ko::ditherModeFromName(argv[++i]);
+    }
     else if (flag == "--no-text-aa") spec.textAntiAliasing = 0;
     else if (flag == "--text-aa") spec.textAntiAliasing = 1;
   }

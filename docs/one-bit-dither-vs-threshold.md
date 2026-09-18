@@ -92,3 +92,26 @@ reflectance difference|. `ink` = % of that level's pixels inked vs its ideal den
 Nothing here argues for changing the shipped 1-bit behaviour. The one thing this measurement
 does argue against is judging dither quality in the preview's RGB space, which is where the
 first pass of this very analysis went wrong.
+
+## Addendum: the candidates changed when the models landed (docs/image-dither-models.md)
+
+The measurements above compare ways of deriving 2 tones FROM THE 4-LEVEL INTERMEDIATE, because
+that is what the engine did at the time. The model work replaced that two-stage route with one
+pass from the SOURCE image, which changes the candidate set: "no dither" now thresholds the
+source at the panel midpoint instead of thresholding a 4-level page, and the two-stage route is
+gone.
+
+Re-measured on the same page (`demo-images.epub` spine 5 p1), against the 4-level page, from the
+exported planes:
+
+| 1-bit route | tone error | ink | pepper/1k |
+|---|---|---|---|
+| two-stage (4-level dither -> writer masks) - the OLD behaviour | 8.58% | 17.33% | 65.7 |
+| single pass, blue noise | **0.68%** | 8.16% | 5.1 |
+| single pass, hard threshold | 1.26% | 7.72% | 0.9 |
+
+The old route's 8.58% was the `kofork`-levels vs panel-model mismatch (greys declared as nominal
+0/85/170/255 while the halftone masks assume the panel's 15/30/80/210), which over-inked the
+page's greys ~2x. With one pass from the source, the ranking is unchanged in kind - dithering
+wins tone, a threshold is the cleanest - but the margins are smaller, because thresholding the
+source is a much better decision than thresholding an already-dithered intermediate.

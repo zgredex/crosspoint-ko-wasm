@@ -18,6 +18,7 @@
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
+#include "ImageDither.h"
 
 namespace {
 
@@ -26,6 +27,9 @@ namespace {
 // The file I/O callbacks receive the HalFile* via pFile->fHandle (set by jpegOpen()).
 struct JpegContext {
   GfxRenderer* renderer{nullptr};
+  // Dither model + tone depth for this image (one instance per decode: the diffusion
+  // models keep per-image error rows). Set in decodeToFramebuffer.
+  std::unique_ptr<ko::ImageDitherer> dither;
   const RenderConfig* config{nullptr};
   int screenWidth{0};
   int screenHeight{0};
@@ -174,13 +178,9 @@ int jpegDrawCallback(BandBlock* pDraw) {
       for (int dstX = dstXStart; dstX < dstXEnd; dstX++) {
         const int outX = cfgX + dstX;
         uint8_t gray = row[dstX - blockX];
-        uint8_t dithered;
-        if (useDithering) {
-          dithered = applyOrderedDither4Level(gray, outX, outY);
-        } else {
-          dithered = gray / 85;
-          if (dithered > 3) dithered = 3;
-        }
+        const uint8_t dithered = ctx->dither ? (*ctx->dither)(gray, outX, outY)
+
+                                                : static_cast<uint8_t>(gray / 85);
         pw.writePixel(outX, dithered);
       }
     }
@@ -231,13 +231,10 @@ int jpegDrawCallback(BandBlock* pDraw) {
         int bot = ((int)row1[lx0] * fxInv + (int)row1[lx1] * fx) >> FP_SHIFT;
         uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
 
-        uint8_t dithered;
-        if (useDithering) {
-          dithered = applyOrderedDither4Level(gray, outX, outY);
-        } else {
-          dithered = gray / 85;
-          if (dithered > 3) dithered = 3;
-        }
+        const uint8_t dithered = ctx->dither ? (*ctx->dither)(gray, outX, outY)
+
+
+                                                : static_cast<uint8_t>(gray / 85);
         pw.writePixel(outX, dithered);
       }
 
@@ -253,13 +250,10 @@ int jpegDrawCallback(BandBlock* pDraw) {
         int bot = ((int)row1[lx0] * fxInv + (int)row1[lx0 + 1] * fx) >> FP_SHIFT;
         uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
 
-        uint8_t dithered;
-        if (useDithering) {
-          dithered = applyOrderedDither4Level(gray, outX, outY);
-        } else {
-          dithered = gray / 85;
-          if (dithered > 3) dithered = 3;
-        }
+        const uint8_t dithered = ctx->dither ? (*ctx->dither)(gray, outX, outY)
+
+
+                                                : static_cast<uint8_t>(gray / 85);
         pw.writePixel(outX, dithered);
       }
 
@@ -278,13 +272,10 @@ int jpegDrawCallback(BandBlock* pDraw) {
         int bot = ((int)row1[lx0] * fxInv + (int)row1[lx1] * fx) >> FP_SHIFT;
         uint8_t gray = (uint8_t)((top * fyInv + bot * fy) >> FP_SHIFT);
 
-        uint8_t dithered;
-        if (useDithering) {
-          dithered = applyOrderedDither4Level(gray, outX, outY);
-        } else {
-          dithered = gray / 85;
-          if (dithered > 3) dithered = 3;
-        }
+        const uint8_t dithered = ctx->dither ? (*ctx->dither)(gray, outX, outY)
+
+
+                                                : static_cast<uint8_t>(gray / 85);
         pw.writePixel(outX, dithered);
       }
     }
@@ -309,13 +300,10 @@ int jpegDrawCallback(BandBlock* pDraw) {
       if (lx >= validW) lx = validW - 1;
       uint8_t gray = row[lx];
 
-      uint8_t dithered;
-      if (useDithering) {
-        dithered = applyOrderedDither4Level(gray, outX, outY);
-      } else {
-        dithered = gray / 85;
-        if (dithered > 3) dithered = 3;
-      }
+      const uint8_t dithered = ctx->dither ? (*ctx->dither)(gray, outX, outY)
+
+
+                                              : static_cast<uint8_t>(gray / 85);
       pw.writePixel(outX, dithered);
     }
   }
@@ -365,6 +353,8 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   JpegContext ctx;
   ctx.renderer = &renderer;
   ctx.config = &config;
+  ctx.dither = std::make_unique<ko::ImageDitherer>(ko::imageDitherOptions());
+  ctx.dither->reset(config.maxWidth > 0 ? config.maxWidth : renderer.getScreenWidth(), config.x, config.y);
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
 

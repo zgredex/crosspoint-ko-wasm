@@ -12,7 +12,7 @@
     lineCompression: $('lineCompression'), paragraphAlignment: $('paragraphAlignment'),
     paragraphIndent: $('paragraphIndent'), extraParagraphSpacing: $('extraParagraphSpacing'),
     characterWrap: $('characterWrap'), hyphenation: $('hyphenation'),
-    embeddedStyle: $('embeddedStyle'), textAa: $('textAa'),
+    embeddedStyle: $('embeddedStyle'), textAa: $('textAa'), imageDither: $('imageDither'),
     viewportOut: $('viewportOut'),
     screenMargin: $('screenMargin'), screenMarginOut: $('screenMarginOut'),
     imageRendering: $('imageRendering'), zoom: $('zoom'), zoomOut: $('zoomOut'),
@@ -56,7 +56,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=15');
+    const w = new Worker(base + 'ko.worker.js?v=16');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -151,6 +151,12 @@
       characterWrap: els.characterWrap.checked ? 1 : 0,
       hyphenation: els.hyphenation.checked ? 1 : 0,
       embeddedStyle: els.embeddedStyle.checked ? 1 : 0,
+      // Image dither model + the tone depth this export needs (4 tones for a 2-bit
+      // page, 2 for a 1-bit one). The depth is part of the spec on purpose: changing
+      // the output mode must re-render, because a 1-bit page is dithered straight to
+      // two tones from the source instead of halftoning a 4-level intermediate.
+      imageDither: parseInt(els.imageDither.value, 10),
+      imageToneDepth: state.mode === 0 ? 2 : 4,
       textAa: els.textAa.checked ? 1 : 0,
       screenMargin: parseInt(els.screenMargin.value, 10),
       imageRendering: parseInt(els.imageRendering.value, 10),
@@ -180,6 +186,7 @@
     // hidden). Keeping the file UI-free is why there is no status-bar control
     // in this panel.
     els.imageRendering.value = '0';
+    els.imageDither.value = '2';              // blue noise (the firmware's model)
     els.fontPreset.value = 'ridibatang';
     els.fontSize.value = '14';
     els.fontSizeOut.textContent = '14 pt';
@@ -812,10 +819,12 @@
   const KNOB_IDS = [
     'lineCompression', 'paragraphAlignment', 'paragraphIndent',
     'extraParagraphSpacing', 'characterWrap', 'hyphenation',
-    'embeddedStyle', 'textAa', 'imageRendering',
+    'embeddedStyle', 'textAa', 'imageRendering', 'imageDither',
   ];
   KNOB_IDS.forEach((id) => els[id].addEventListener('change', () => {
-    invalidateWarm();            // pagination changed → warm bytes stale
+    // imageDither does not move a single page break (image size is fixed), but the
+    // EXPORTED PIXELS change, so the warmed file is stale either way.
+    invalidateWarm();            // pagination or pixels changed → warm bytes stale
     requestRepaint(60);
     scheduleWarm(800);
   }));
@@ -949,15 +958,15 @@
   //   2-bit XTCH — text anti-aliasing, exactly as the firmware does it: the grey
   //                (lsb/msb) planes carry 2-bit glyph coverage; off renders text
   //                1-bit (the engine skips the text grey passes).
-  //   1-bit XTC  — images are ALWAYS blue-noise halftoned to 2 levels (that is how a
-  //                4-level page becomes a 1-bit one, and photos need it). The switch
-  //                decides whether TEXT is halftoned too (on) or left as crisp 1-bit
-  //                ink (off, which also stops the writer thinning solid ink).
+  //   1-bit XTC  — images are dithered to 2 tones by the Image dither model, in ONE
+  //                pass from the source image. The AA switch decides whether TEXT is
+  //                halftoned too (on) or left as crisp 1-bit ink (off, which also stops
+  //                the writer thinning solid ink).
   // The engine, the writer and the mono preview all read the same spec switch, so the
   // preview shows the page the file will carry in either position.
   function syncAaToMode() {
     const hint = document.querySelector('.aaHint');
-    if (hint) hint.textContent = state.mode === 0 ? '(text dither; photos always halftoned)' : '';
+    if (hint) hint.textContent = state.mode === 0 ? '(text dither; images use the Image dither model)' : '';
     const lab = document.getElementById('textAaLab');
     if (lab) lab.classList.remove('disabled');
   }

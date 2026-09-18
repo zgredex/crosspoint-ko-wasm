@@ -24,6 +24,7 @@
 #include <Section.h>
 #include <Epub/Page.h>
 #include <Epub/blocks/ImageBlock.h>
+#include <converters/ImageDither.h>
 #include <EpdFont.h>
 #include <EpdFontFamily.h>
 #include <FontCacheManager.h>
@@ -56,6 +57,11 @@ struct Spec {
   int imageRendering = 0;             // 0 DISPLAY 1 PLACEHOLDER 2 SUPPRESS
   int textAntiAliasing = 1;           // 0/1 (device default on: 2-bit glyph gray)
   int focusReadingEnabled = 0;
+  // --- image dithering (ko-wasm extension; the device has no such knob) ---
+  // Model codes are ko::DitherMode: 0 NONE, 1 BAYER, 2 BLUE_NOISE, 3 FS, 4 ATK, 5 JJN,
+  // 6 STUCKI, 7 BURKES, 8 KO_HASH, 9 ZHOU_FANG. Applied at the export's tone depth.
+  int imageDither = 2;                // BLUE_NOISE (the previous fixed behaviour)
+  int imageToneDepth = 4;             // 4 = 2-bit XTCH, 2 = 1-bit XTC
   // --- page geometry ---
   uint16_t viewportWidth = 0;         // set by driver from margins
   uint16_t viewportHeight = 0;
@@ -116,8 +122,22 @@ class EngineDriver {
   // 2-bit glyphs contribute their gray; with AA off, text renders only in the
   // BW pass (1-bit) while images still get their grayscale passes
   // (EpubReaderActivity: needsTextGrayscale ? page->render : page->renderImages).
+  // The image decoders read these through ko::imageDitherOptions(); setting them here
+  // keeps the decoders free of spec dependencies (they are shared with the device build).
+  static void applyImageDitherOptions(const Spec& spec) {
+    ko::ImageDitherOptions opts;
+    const int maxCode = static_cast<int>(DitherMode::ZHOU_FANG);
+    const int code = (spec.imageDither >= 0 && spec.imageDither <= maxCode)
+                         ? spec.imageDither
+                         : static_cast<int>(DitherMode::BLUE_NOISE);
+    opts.mode = static_cast<DitherMode>(code);
+    opts.toneDepth = (spec.imageToneDepth == 2) ? 2 : 4;
+    ko::setImageDitherOptions(opts);
+  }
+
   bool renderPage(int pageIndex, const Spec& spec, RenderedPage& out) {
     if (!section_) return false;
+    applyImageDitherOptions(spec);
     auto page = section_->loadPage(pageIndex);
     if (!page) return false;
 

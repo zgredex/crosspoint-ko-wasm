@@ -91,6 +91,8 @@ function defaultSpec() {
     embeddedStyle: 1,
     imageRendering: 0,
     textAa: 1,
+    imageDither: 2,        // blue noise
+    imageToneDepth: 4,     // 2-bit until the app says otherwise
     screenMargin: 5,
     font: 'ridibatang',      // reader face preset
   };
@@ -154,7 +156,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '15';
+const FT_MODULE_VERSION = '16';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -232,7 +234,7 @@ async function init() {
   // Cache-bust the engine binaries: the emscripten glue fetches the .wasm with no version
   // query, so without this the edge serves a previously cached engine indefinitely and no
   // engine change can ever reach a returning browser.
-  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=15' : path) });
+  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=16' : path) });
   api = Module;
   // deterministic viewport: engine computes from margins; init with full logical
   api._ko_init(464, 778); // will be fixed up by ko_set_margins on first spec
@@ -376,6 +378,9 @@ self.onmessage = async (ev) => {
         api._ko_set_embedded_style(currentSpec.embeddedStyle);
         api._ko_set_image_rendering(currentSpec.imageRendering);
         api._ko_set_text_aa(currentSpec.textAa);
+        // image dither model + the tone depth the export needs (4 = 2-bit, 2 = 1-bit)
+        api._ko_set_image_dither(currentSpec.imageDither);
+        api._ko_set_image_tone_depth(currentSpec.imageToneDepth);
         tick('applyFont');
         applyFont(currentSpec.font);   // reader face (default ridibatang)
         tock('applyFont');

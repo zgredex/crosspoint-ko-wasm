@@ -78,7 +78,7 @@
         <span>Paragraph indent <i>들여쓰기</i></span>
       </label>
 
-      <label class="ctrl check" id="textAaLab" title="Text anti-aliasing. 2-bit XTCH: grey planes carry 2-bit glyph coverage, exactly as the firmware does it (off = text renders 1-bit). 1-bit XTC: images are ALWAYS blue-noise halftoned to 2 levels either way; this switch decides whether text is halftoned too (on, smoother text edges) or rendered as crisp 1-bit pixels (off)">
+      <label class="ctrl check" id="textAaLab" title="Text anti-aliasing. 2-bit XTCH: grey planes carry 2-bit glyph coverage, exactly as the firmware does it (off = text renders 1-bit). 1-bit XTC: images are dithered by the Image dither model either way; this switch decides whether text is halftoned too (on, smoother text edges) or rendered as crisp 1-bit pixels (off)">
         <input type="checkbox" id="textAa" checked>
         <span>Text anti-aliasing <i>텍스트 안티앨리어싱</i> <em class="aaHint"></em></span>
       </label>
@@ -203,6 +203,22 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
         </select>
       </label>
 
+      <label class="ctrl" title="Dither model for IMAGE pixels only (photos, covers, illustrations) — text is never touched by this control; that is what Text anti-aliasing is for. The model is applied at whichever tone depth the export uses: 2-bit XTCH keeps 4 tones, 1-bit XTC gets 2 (one pass from the source image, not a second dither of an already-dithered page). Tone anchors are the firmware's own panel model — white 210 / light grey 80 / dark grey 30 / black 15 — so a dithered patch reproduces the average reflectance of the grey it replaces. Ordered: blue-noise (default, 64x64), bayer (4x4). Error diffusion: Floyd-Steinberg, Atkinson, Jarvis-Judice-Ninke, Stucki, Burkes, and Zhou-Fang (per-intensity kernels + threshold modulation; deterministic here, the reference uses Math.random()). ko-fork hash is the fork's own noise dither. None = hard threshold, which cannot show a grey at all: on a grey-heavy page it measured 8.8% local tone error against 2.2% for blue noise.">
+        <span>Image dither <i>이미지 디더링</i></span>
+        <select id="imageDither">
+          <option value="2" selected>Blue noise (default)</option>
+          <option value="1">Bayer 4×4 (ordered)</option>
+          <option value="3">Floyd–Steinberg</option>
+          <option value="4">Atkinson</option>
+          <option value="5">Jarvis–Judice–Ninke</option>
+          <option value="6">Stucki</option>
+          <option value="7">Burkes</option>
+          <option value="9">Zhou–Fang 2003</option>
+          <option value="8">ko-fork hash</option>
+          <option value="0">None (hard threshold)</option>
+        </select>
+      </label>
+
       <button id="resetBtn" class="btn secondary">Reset defaults / 기본값</button>
     </section>
 
@@ -251,6 +267,6 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
   </aside>
 </main>
 
-<script src="app.js?v=15"></script>
+<script src="app.js?v=16"></script>
 </body>
 </html>

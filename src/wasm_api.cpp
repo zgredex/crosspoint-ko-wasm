@@ -134,6 +134,10 @@ KO_EXPORT void ko_set_image_rendering(int v) { g_spec.imageRendering = v; }
 // Text anti-aliasing (device Text AA toggle). Off = text renders 1-bit in the
 // BW pass only; images still get their grayscale passes.
 KO_EXPORT void ko_set_text_aa(int v) { g_spec.textAntiAliasing = v ? 1 : 0; }
+// Image dither model (ko::DitherMode code) and the tone depth the export needs
+// (4 for a 2-bit page, 2 for a 1-bit page). Re-render after changing either.
+KO_EXPORT void ko_set_image_dither(int v) { g_spec.imageDither = v; }
+KO_EXPORT void ko_set_image_tone_depth(int v) { g_spec.imageToneDepth = (v == 2) ? 2 : 4; }
 KO_EXPORT void ko_set_focus_reading(int v) { (void)v; g_spec.focusReadingEnabled = 0; }  // EN-only; hardcoded off in KO
 
 // Reader font: RIDIBATANG_14_FONT_ID (default) / KOPUB_14_FONT_ID / CUSTOM_FONT_ID

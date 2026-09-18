@@ -17,6 +17,7 @@
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
+#include "ImageDither.h"
 
 namespace {
 
@@ -26,6 +27,8 @@ namespace {
 struct PngContext {
   GfxRenderer* renderer{nullptr};
   const RenderConfig* config{nullptr};
+  // Dither model + tone depth for this image (one instance per decode).
+  std::unique_ptr<ko::ImageDitherer> dither;
   int screenWidth{0};
   int screenHeight{0};
 
@@ -231,12 +234,8 @@ int pngDrawCallback(PNGDRAW* pDraw) {
       if (outX < screenWidth) {
         uint8_t gray = ctx->grayLineBuffer[srcX];
 
-        uint8_t ditheredGray;
-        if (useDithering) {
-          ditheredGray = applyOrderedDither4Level(gray, outX, outY);
-        } else {
-          ditheredGray = quantizeToLevel(gray);
-        }
+        const uint8_t ditheredGray =
+            ctx->dither ? (*ctx->dither)(gray, outX, outY) : quantizeToLevel(gray);
         pw.writePixel(outX, ditheredGray);
       }
 
@@ -357,6 +356,8 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   PngContext ctx;
   ctx.renderer = &renderer;
   ctx.config = &config;
+  ctx.dither = std::make_unique<ko::ImageDitherer>(ko::imageDitherOptions());
+  ctx.dither->reset(config.maxWidth > 0 ? config.maxWidth : renderer.getScreenWidth(), config.x, config.y);
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
 

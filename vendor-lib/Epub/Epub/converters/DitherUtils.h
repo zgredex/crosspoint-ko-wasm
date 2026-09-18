@@ -75,6 +75,7 @@ enum class DitherMode : uint8_t {
   STUCKI,
   BURKES,
   KO_HASH,      // the ko fork's own hash-based noise dither (BitmapHelpers.cpp)
+  ZHOU_FANG,    // Zhou & Fang 2003: per-intensity kernels + threshold modulation
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +98,81 @@ inline uint8_t quantizeToLevel(uint8_t gray) {
 // Ordered dithering (bayer / blue-noise), verbatim from the converter
 // ---------------------------------------------------------------------------
 inline constexpr uint8_t kBayer4x4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+
+// ---------------------------------------------------------------------------
+// Zhou & Fang, "Improving mid-tone quality of variable-coefficient error
+// diffusion using threshold modulation", SIGGRAPH 2003 - tables ported verbatim
+// from zgredex/crosspoint-pxc-converter (src/domain/dither.ts, ZF_MOD_KEYS /
+// ZF_COEFF_KEYS), interpolated on the same keys and mirrored about 128.
+//
+// The reference draws its threshold modulation from Math.random(), which cannot be
+// reproduced (and would make an export non-deterministic run to run), so the engine
+// feeds the same formula a deterministic integer hash instead. Deliberate deviation:
+// same distribution, reproducible output. See docs/image-dither-models.md.
+// ---------------------------------------------------------------------------
+inline float ditherNoise01(int x, int y) {
+  uint32_t hash = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u;
+  hash = (hash ^ (hash >> 13)) * 1274126177u;
+  hash ^= hash >> 16;
+  return static_cast<float>(hash >> 8) * (1.0f / 16777216.0f);   // [0,1)
+}
+
+struct ZhouFangTables {
+  float mod[256];        // threshold modulation amplitude per source intensity
+  float coeff[256 * 3];  // normalised (right, below-left, below) per source intensity
+  ZhouFangTables() {
+    static constexpr int kModN = 9;
+    static constexpr int kModKey[kModN] = {0, 44, 64, 85, 95, 102, 107, 112, 127};
+    static constexpr float kModVal[kModN] = {0.0f, 0.34f, 0.5f, 1.0f, 0.17f, 0.5f, 0.7f, 0.79f, 1.0f};
+    static constexpr int kCoefN = 18;
+    static constexpr int kCoefKey[kCoefN] = {0, 1, 2, 3, 4, 10, 22, 32, 44, 64, 72, 77, 85, 95, 102, 107, 112, 127};
+    static constexpr int kCoefRaw[kCoefN][3] = {
+        {13, 0, 5},          {1300249, 0, 499250},  {213113, 287, 99357}, {351854, 0, 199965},
+        {801100, 0, 490999}, {704075, 297466, 303694}, {46613, 31917, 21469}, {47482, 30617, 21900},
+        {43024, 42131, 14826}, {36411, 43219, 20369}, {38477, 53843, 7678}, {40503, 51547, 7948},
+        {35865, 34108, 30026}, {34117, 36899, 28983}, {35464, 35049, 29485}, {16477, 18810, 14712},
+        {33360, 37954, 28685}, {35269, 36066, 28664}};
+    float halfMod[128] = {};
+    for (int seg = 0; seg + 1 < kModN; seg++) {
+      const int k0 = kModKey[seg], k1 = kModKey[seg + 1];
+      const bool last = (seg == kModN - 2);
+      const int num = k1 - k0 + (last ? 1 : 0);
+      for (int j = 0; j < num; j++) {
+        const float t = last ? static_cast<float>(j) / static_cast<float>(num - 1)
+                             : static_cast<float>(j) / static_cast<float>(num);
+        halfMod[k0 + j] = kModVal[seg] + t * (kModVal[seg + 1] - kModVal[seg]);
+      }
+    }
+    float halfCoeff[3][128] = {};
+    for (int seg = 0; seg + 1 < kCoefN; seg++) {
+      const int k0 = kCoefKey[seg], k1 = kCoefKey[seg + 1];
+      const bool last = (seg == kCoefN - 2);
+      const int num = k1 - k0 + (last ? 1 : 0);
+      for (int j = 0; j < num; j++) {
+        const float t = last ? static_cast<float>(j) / static_cast<float>(num - 1)
+                             : static_cast<float>(j) / static_cast<float>(num);
+        for (int c = 0; c < 3; c++) {
+          halfCoeff[c][k0 + j] = static_cast<float>(kCoefRaw[seg][c]) +
+                                 t * static_cast<float>(kCoefRaw[seg + 1][c] - kCoefRaw[seg][c]);
+        }
+      }
+    }
+    for (int i = 0; i < 128; i++) {
+      const float sum = halfCoeff[0][i] + halfCoeff[1][i] + halfCoeff[2][i];
+      const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+      mod[i] = halfMod[i];
+      mod[255 - i] = halfMod[i];
+      for (int c = 0; c < 3; c++) {
+        coeff[i * 3 + c] = halfCoeff[c][i] * inv;
+        coeff[(255 - i) * 3 + c] = halfCoeff[c][i] * inv;
+      }
+    }
+  }
+};
+inline const ZhouFangTables& zhouFangTables() {
+  static const ZhouFangTables inst;
+  return inst;
+}
 
 inline uint32_t orderedThresholdQ16(DitherMode mode, int x, int y) {
   if (mode == DitherMode::BLUE_NOISE) return blueNoiseThresholdQ16(x, y);
@@ -160,15 +236,12 @@ struct ErrorDiffusionDither {
 
   void beginRow(int y) { dir = serpentine ? (((y - firstRow) & 1) ? -1 : 1) : 1; }
 
-  uint8_t apply(uint8_t gray, int x, DitherMode mode, const QuantProfile& p = kDefaultProfile) {
+  // Scatters one pixel's error with the mode's kernel. Direction follows beginRow() so
+  // serpentine scans mirror correctly: line0 = the row being written (ahead of x),
+  // line1 = the next row, line2 = the row after that.
+  void scatter(float e, int x, DitherMode mode) {
     const int k = x + kBase;
-    float v = static_cast<float>(gray) + line0[k];
-    if (v < 0.0f) v = 0.0f;
-    if (v > 255.0f) v = 255.0f;
-    const uint8_t qv = quantizeWithThresholds(v, p.ditherThresholds);
-    const float e = v - static_cast<float>(p.ditherLevels[qv]);
     const int w = width;
-
     switch (mode) {
       case DitherMode::ATK: {
         const float c = e / 8.0f;
@@ -231,7 +304,66 @@ struct ErrorDiffusionDither {
         break;
       }
     }
+  }
+
+  // Entry point for a 4-LEVEL page: bin with the profile's ditherThresholds, diffuse the
+  // error between the sample and the profile's perceived level luminance.
+  uint8_t apply(uint8_t gray, int x, DitherMode mode, const QuantProfile& p = kDefaultProfile) {
+    const int k = x + kBase;
+    float v = static_cast<float>(gray) + line0[k];
+    if (v < 0.0f) v = 0.0f;
+    if (v > 255.0f) v = 255.0f;
+    const uint8_t qv = quantizeWithThresholds(v, p.ditherThresholds);
+    scatter(v - static_cast<float>(p.ditherLevels[qv]), x, mode);
     return qv;
+  }
+
+  // Entry point for a 2-TONE page (1-bit XTC): the palette is the two extremes of the same
+  // panel model, the binning threshold their midpoint. One pass, straight from the source -
+  // no 4-level intermediate to dither a second time.
+  uint8_t applyTwoTone(uint8_t gray, int x, DitherMode mode, uint8_t lo, uint8_t hi) {
+    const int k = x + kBase;
+    float v = static_cast<float>(gray) + line0[k];
+    if (v < 0.0f) v = 0.0f;
+    if (v > 255.0f) v = 255.0f;
+    const float mid = 0.5f * (static_cast<float>(lo) + static_cast<float>(hi));
+    const bool upper = v >= mid;
+    scatter(v - static_cast<float>(upper ? hi : lo), x, mode);
+    return upper ? 1 : 0;
+  }
+
+  // Zhou & Fang: thresholds are modulated by a per-intensity amplitude and the kernel is
+  // per-intensity too, so it cannot share scatter(). levels[] must be ascending.
+  uint8_t applyZhouFang(uint8_t gray, int x, int y, const uint8_t* levels, int nLevels) {
+    const ZhouFangTables& zf = zhouFangTables();
+    const int k = x + kBase;
+    float v = static_cast<float>(gray) + line0[k];
+    if (v < 0.0f) v = 0.0f;
+    if (v > 255.0f) v = 255.0f;
+
+    int lo = 0;
+    for (int i = nLevels - 2; i >= 0; i--) {
+      if (v >= static_cast<float>(levels[i])) {
+        lo = i;
+        break;
+      }
+    }
+    const int hi = (lo + 1 < nLevels) ? lo + 1 : nLevels - 1;
+    const float span = static_cast<float>(levels[hi]) - static_cast<float>(levels[lo]);
+    const float frac = span > 0.0f ? (v - static_cast<float>(levels[lo])) / span : 1.0f;
+
+    const int idx = v >= 255.0f ? 255 : static_cast<int>(v);
+    const float r = ditherNoise01(x, y);
+    const float thr = 0.5f + (r - static_cast<float>(static_cast<int>(r / 0.5f)) * 0.5f) * zf.mod[idx];
+    const int qv = frac >= thr ? hi : lo;
+
+    const float e = v - static_cast<float>(levels[qv]);
+    const float* c = &zf.coeff[idx * 3];
+    const int d = dir;
+    if (x + d >= 0 && x + d < width) line0[k + d] += e * c[0];
+    if (x - d >= 0 && x - d < width) line1[k - d] += e * c[1];
+    line1[k] += e * c[2];
+    return static_cast<uint8_t>(qv);
   }
 
   void endRow() {
