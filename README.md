@@ -1,6 +1,13 @@
-# KO-Fork EPUB → XTCH WASM Module — Build & API
+# XTCKO — KO 포크 렌더링 규칙을 따르는 EPUB → XTC 변환기
 
 **Live:** https://crosspoint-ko-wasm.pages.dev
+
+An EPUB to XTC converter that follows the KO fork rendering rules — the site is Korean-first
+(the engine and the rendering rules are unchanged; see the note below for the engineering write-up).
+
+---
+
+# KO-Fork EPUB → XTCH WASM Module — Build & API
 
 Status: **DONE — verified end-to-end** (2026-09-09)
 

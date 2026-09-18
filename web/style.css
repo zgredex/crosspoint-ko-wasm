@@ -33,6 +33,9 @@ header {
 }
 h1 { font-size: 17px; margin: 0; font-weight: 600; }
 h1 .dim { color: var(--dim); font-weight: 400; font-size: 13px; margin-left: 8px; }
+/* brand tagline: second line under XTCKO, dim and small */
+h1 .tagline { display: block; color: var(--dim); font-weight: 400;
+  font-size: 11.5px; margin: 2px 0 0 0; letter-spacing: 0.01em; }
 #fileRow { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 320px; }
 .status {
   color: var(--dim); font-size: 13px; margin-left: auto;

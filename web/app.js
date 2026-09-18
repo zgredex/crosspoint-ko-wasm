@@ -56,13 +56,13 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=18');
+    const w = new Worker(base + 'ko.worker.js?v=19');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
       if (m && m.progress && els.exportStatus) {
-        els.exportStatus.textContent = 'exporting spine ' + m.spine + '/' + m.ofSpines +
-          ' (' + m.pages + ' pages so far)…';
+        els.exportStatus.textContent = '스파인 ' + m.spine + '/' + m.ofSpines + ' 내보내는 중 ' +
+          '(' + m.pages + '쪽 완료)…';
         return;
       }
       const p = pending.get(m.id);
@@ -71,8 +71,8 @@
       clearTimeout(p.timer);
       if (m.fatal) {
         // engine aborted (OOM etc.) — respawn, then reject this call
-        setStatus('⚠ engine aborted (' + (m.error || '') + ') — auto-restarting…', true);
-        p.reject(new Error(m.error || 'engine aborted'));
+        setStatus('⚠ 엔진 중단 (' + (m.error || '') + ') — 자동 재시작…', true);
+        p.reject(new Error(m.error || '엔진 중단'));
         respawn();
         return;
       }
@@ -80,11 +80,11 @@
     };
     w.onerror = (e) => {
       e.preventDefault();
-      setStatus('⚠ engine worker crashed (' + (e.message || 'unknown') + ') — auto-restarting…', true);
+      setStatus('⚠ 엔진 워커 충돌 (' + (e.message || '알 수 없음') + ') — 자동 재시작…', true);
       respawn();
     };
     w.onmessageerror = () => {
-      setStatus('⚠ engine worker message error — auto-restarting…', true);
+      setStatus('⚠ 엔진 워커 메시지 오류 — 자동 재시작…', true);
       respawn();
     };
     return w;
@@ -118,8 +118,8 @@
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
-        setStatus('⚠ engine call "' + cmd + '" timed out after ' +
-                  Math.round((timeoutMs || CALL_TIMEOUT_MS) / 1000) + 's — restarting engine…', true);
+        setStatus('⚠ 엔진 호출 "' + cmd + '" 시간 초과 ' +
+                  Math.round((timeoutMs || CALL_TIMEOUT_MS) / 1000) + 's — 엔진 재시작…', true);
         respawn();
         reject(new Error('timeout: ' + cmd));
       }, timeoutMs || CALL_TIMEOUT_MS);
@@ -138,7 +138,7 @@
 
   async function bootEngine() {
     const r = await call('ping', {}, [], 15000);
-    setStatus('engine ' + r.version + ' ready — load an EPUB');
+    setStatus('엔진 ' + r.version + ' 준비됨 — EPUB을 불러오세요');
   }
 
   // ---- spec snapshot ----
@@ -261,15 +261,15 @@
     if (!book) return;
     ++renderToken;
     viewingCover = true;
-    setStatus('cover…');
-    busy('표지 generating cover');
+    setStatus('표지…');
+    busy('표지 생성 중');
     try {
       const r = await call('cover', { kind: 0 });
       const img = bmpToImageData(r.cover);
       drawCoverFitted(img);          // letterbox into the fixed 480×800 screen
       setStatus(book.title + ' — cover (표지)');
     } catch (e) {
-      setStatus('cover error: ' + e.message, true);
+      setStatus('표지 오류: ' + e.message, true);
       viewingCover = false;
     } finally {
       idle();
@@ -315,9 +315,9 @@
     if (els.viewportOut && r && r.viewport) {
       const m = r.margins || {};
       els.viewportOut.textContent =
-        'Text viewport 본문 영역: ' + r.viewport.width + '×' + r.viewport.height +
-        ' px  ·  margins T/R/B/L ' + m.top + '/' + m.right + '/' + m.bottom + '/' + m.left +
-        '  ·  no UI baked into the file (파일에는 UI 미포함)';
+        '본문 영역: ' + r.viewport.width + '×' + r.viewport.height +
+        ' px · 여백 T/R/B/L ' + m.top + '/' + m.right + '/' + m.bottom + '/' + m.left +
+        ' · 파일에 UI 없음';
     }
   }
 
@@ -325,7 +325,7 @@
     if (!book) return;
     const tok = ++renderToken;
     viewingCover = false;
-    if (!quiet) busy('rendering');   // scrub-path re-renders stay silent
+    if (!quiet) busy('렌더링');   // scrub-path re-renders stay silent
     try {
       // spec first (idempotent cheap), then render (worker rebuilds spine on
       // change). The chosen export mode travels with the render so the preview
@@ -345,10 +345,10 @@
       drawImage(r.image);
       updateZoomCss();
       updatePager();
-      setStatus(book.title + ' — page ' + (r.page + 1) + '/' + r.pages +
-                (r.mono ? ' · 1-bit preview' : ''));
+      setStatus(book.title + ' — ' + (r.page + 1) + '/' + r.pages + '쪽' +
+                (r.mono ? ' · 1-bit 미리보기' : ''));
     } catch (e) {
-      if (tok === renderToken) setStatus('render error: ' + e.message, true);
+      if (tok === renderToken) setStatus('렌더 오류: ' + e.message, true);
     } finally {
       if (tok === renderToken) idle();
     }
@@ -383,7 +383,7 @@
   function updatePager() {
     // page counter is spine-local (matches the device's chapter page display);
     // prev/next themselves cross chapter boundaries in goPage().
-    els.pageInfo.textContent = viewingCover ? 'cover' : (state.pages > 0
+    els.pageInfo.textContent = viewingCover ? '표지' : (state.pages > 0
       ? (state.page + 1) + ' / ' + state.pages
       : '– / –');
     const atBookStart = state.spine <= 0 && state.page <= 0;
@@ -556,8 +556,8 @@
 
   async function loadBook(buf, name) {
     renderToken++;                      // kill in-flight renders
-    setStatus('parsing…');
-    busy('parsing EPUB');
+    setStatus('EPUB 분석 중…');
+    busy('EPUB 분석 중');
     try {
       const r = await call('load', { epub: buf }, [buf], 120000);
       book = { title: r.title, spineCount: r.spineCount, hrefs: r.hrefs };
@@ -571,7 +571,7 @@
       await refresh(false);
       scheduleWarm(500);          // pre-convert the fresh book once idle
     } catch (e) {
-      setStatus('load error: ' + e.message, true);
+      setStatus('불러오기 오류: ' + e.message, true);
       idle();
     }
   }
@@ -663,7 +663,7 @@
       if (tok !== warmVersion) return;    // settings changed mid-warm → stale
       if (r && r.warm === 'ready') {
         warmSpecKey = key;
-        els.exportStatus.textContent = '✓ whole book pre-converted — export is instant';
+        els.exportStatus.textContent = '✓ 책 전체 사전 변환 완료 — 내보내기는 즉시';
       }
       // busy → a previous warm still finishing; it will supersede itself, so
       // just re-schedule once it has had time to stop
@@ -747,7 +747,7 @@
     if (want === lastFontSig) return;           // already applied exactly this
     fontConverting = true;
     const tok = ++fontConvertToken;
-    fontStatus('converting… ' + (f.name || ''), false);
+    fontStatus('변환 중… ' + (f.name || ''), false);
     try {
       const meta = await convertFont(f);
       // superseded while converting → drop; a later run will use newer knobs
@@ -756,15 +756,15 @@
       if (want !== fontKnobSig()) { scheduleFontConvert(); return; }
       customFontLoaded = true;
       lastFontSig = want;
-      const wm = meta.weightMode === 'wght-instance' ? 'wght-instanced @' + meta.weight :
-                  meta.weightMode === 'embolden' ? 'embolden +' + (meta.emboldenPx64 / 64).toFixed(2) + 'px' :
-                  meta.weightMode === 'native' ? 'weight ≤ native (' + meta.weight + ' no-op)' : 'weight n/a';
+      const wm = meta.weightMode === 'wght-instance' ? 'wght 인스턴스 @' + meta.weight :
+                  meta.weightMode === 'embolden' ? '합성 볼드 +' + (meta.emboldenPx64 / 64).toFixed(2) + 'px' :
+                  meta.weightMode === 'native' ? '원본 굵기 이하 (' + meta.weight + ' 무시)' : '굵기 해당 없음';
       fontStatus('✓ ' + (meta.name || 'custom') + ' ' + meta.size + 'pt · w' + meta.weight +
-                 ' [' + wm + '] · ' + meta.glyphs + ' glyphs — applying…', false);
+                 ' [' + wm + '] · ' + meta.glyphs + '글리프 — 적용 중…', false);
       await applyCustomFont(meta);
-      fontStatus('✓ ' + (meta.name || 'custom') + ' ' + meta.size + 'pt active (' +
-                 meta.glyphs + ' glyphs, ' + Math.round(meta.bytes / 1024) + ' KB' +
-                 (meta.inBrowser ? ', converted in your browser in ' + meta.ms + ' ms — ' +
+      fontStatus('✓ ' + (meta.name || 'custom') + ' ' + meta.size + 'pt 활성 (' +
+                 meta.glyphs + '글리프, ' + Math.round(meta.bytes / 1024) + ' KB' +
+                 (meta.inBrowser ? ', 브라우저에서 ' + meta.ms + ' ms 만에 변환 — ' +
                    (meta.ftVersion || 'FreeType') : '') + ')', false);
       invalidateWarm();
       scheduleWarm(700);
@@ -898,7 +898,7 @@
       if (f && lastFontSig !== fontKnobSig()) scheduleFontConvert();
     } else {
       // nothing uploaded yet → engine stays on default; hint the user
-      fontStatus('choose an OTF/TTF above — it converts and applies automatically', false);
+      fontStatus('위에서 OTF/TTF를 선택하세요 — 자동으로 변환해 적용합니다', false);
     }
   });
   els.fontFile.addEventListener('change', () => {
@@ -966,7 +966,7 @@
   // preview shows the page the file will carry in either position.
   function syncAaToMode() {
     const hint = document.querySelector('.aaHint');
-    if (hint) hint.textContent = state.mode === 0 ? '(text dither; images use the Image dither model)' : '';
+    if (hint) hint.textContent = state.mode === 0 ? '(텍스트 하프톤 · 이미지는 이미지 디더링 모델)' : '';
     const lab = document.getElementById('textAaLab');
     if (lab) lab.classList.remove('disabled');
   }
@@ -997,14 +997,14 @@
         const res = await call('fetchWarm', {}, null, 60000);
         const u8 = new Uint8Array(res.file);
         const filename = exportFilename(res.xtcz !== undefined ? res.xtcz : xtcz);
-        const ratio = res.xtcz && res.rawBytes ? ' (' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '% of raw)' : '';
-        els.exportStatus.textContent = '✓ ' + filename + ' — ' + res.pages + ' pages, ' +
-          (u8.byteLength / 1048576).toFixed(1) + ' MB' + ratio + ' (pre-converted)';
+        const ratio = res.xtcz && res.rawBytes ? ' (원본의 ' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '%)' : '';
+        els.exportStatus.textContent = '✓ ' + filename + ' — ' + res.pages + '쪽, ' +
+          (u8.byteLength / 1048576).toFixed(1) + ' MB' + ratio + ' (사전 변환)';
         saveBlob(u8, filename);
         warmSpecKey = null;   // bytes handed over; next warm refills
         refresh(true);        // engine was invalidated by the warm pass
       } catch (e) {
-        els.exportStatus.textContent = '✗ warm fetch failed: ' + e.message;
+        els.exportStatus.textContent = '✗ 사전 변환본 불러오기 실패: ' + e.message;
       } finally {
         exporting = false;
         els.downloadBtn.disabled = !book;
@@ -1013,11 +1013,11 @@
     }
     exporting = true;
     els.downloadBtn.disabled = true;
-    busy('exporting (whole book)');
+    busy('내보내는 중 (책 전체)');
     const depthLabel = mode === 0 ? 'XTC 1-bit' : 'XTCH 2-bit';
-    setStatus('exporting whole book as ' + depthLabel + (xtcz ? ' + LZ4 (.xtcz)' : '') +
-              ' — re-renders every page with the current settings');
-    els.exportStatus.textContent = 'exporting…';
+    setStatus('책 전체를 ' + depthLabel + (xtcz ? ' + LZ4 (.xtcz)' : '') + '로 내보내는 중' +
+              ' — 현재 설정으로 모든 페이지를 다시 렌더링합니다');
+    els.exportStatus.textContent = '내보내는 중…';
     try {
       // Push the spec first: the export must use exactly the switch positions on
       // screen (in 1-bit the AA switch decides the blue-noise dither), and a knob
@@ -1027,8 +1027,8 @@
       const res = await call('exportBook', { mode, xtcz }, null, 600000);
       const u8 = new Uint8Array(res.file);
       const filename = exportFilename(xtcz);
-      const ratio = xtcz && res.rawBytes ? ' (' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '% of raw)' : '';
-      els.exportStatus.textContent = '✓ ' + filename + ' — ' + res.pages + ' pages, ' +
+      const ratio = xtcz && res.rawBytes ? ' (원본의 ' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '%)' : '';
+      els.exportStatus.textContent = '✓ ' + filename + ' — ' + res.pages + '쪽, ' +
         (u8.byteLength / 1048576).toFixed(1) + ' MB' + ratio;
       saveBlob(u8, filename);
       // the export ran every spine through the engine; the next preview render
@@ -1037,7 +1037,7 @@
       invalidateWarm();
       scheduleWarm(700);
     } catch (e) {
-      els.exportStatus.textContent = '✗ export failed: ' + e.message;
+      els.exportStatus.textContent = '✗ 내보내기 실패: ' + e.message;
     } finally {
       exporting = false;
       els.downloadBtn.disabled = !book;
@@ -1074,7 +1074,7 @@
   hasFontBackend();   // one probe: is the server-side converter deployed here?
   worker = spawnWorker();
   bootEngine().catch((e) => {
-    setStatus('engine failed to start: ' + e.message, true);
+    setStatus('엔진 시작 실패: ' + e.message, true);
   }).then(() => {
     // convenience: /?epub=path triggers fetch+load (for local dev/test)
     const q = new URLSearchParams(location.search);
