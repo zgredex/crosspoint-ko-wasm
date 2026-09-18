@@ -29,9 +29,25 @@ let spineCount = 0;
 // Composed-frame cache: a navigation that repeats a (spine, page, mode, spec, font) tuple
 // reuses the frame instead of re-rendering and re-composing. Bounded by bytes because a frame
 // is 1.5 MB (480*800*4) and the wasm heap is 2 GB - 128 frames is ~192 MB.
-const FRAME_CACHE_BUDGET = 192 * 1024 * 1024;
+// §5: 192 MB of 1.5 MB RGBA frames was excessive — rendering a text page is sub-millisecond, so a
+// huge retrospective cache bought little and cost mobile memory. 48 MB still holds a few dozen
+// frames (plenty for flipping back and forth) and the next-page prefetch below makes the common
+// sequential turn a hit.
+const FRAME_CACHE_BUDGET = 48 * 1024 * 1024;
 const frameCache = new Map();          // key -> { data: Uint8ClampedArray }, insertion ordered
 let frameCacheBytes = 0;
+// A new book reuses spine/page numbers, so frames must not survive a load. The generation counter
+// is part of every frame key (belt and braces next to the explicit clear).
+let bookGen = 0;
+const COUNTERS = {
+  epdfontLoads: 0, fontApplies: 0, fontSkips: 0, specApplies: 0, layoutApplies: 0,
+  renderApplies: 0, builds: 0, renders: 0, framesPosted: 0, cacheHits: 0, prefetches: 0,
+  cacheEvictions: 0, warmYields: 0, warmCooldowns: 0,
+};
+function clearFrameCache() {
+  frameCache.clear();
+  frameCacheBytes = 0;
+}
 
 function frameCacheGet(key) {
   const hit = frameCache.get(key);
@@ -52,6 +68,7 @@ function frameCachePut(key, img) {
     const oldest = frameCache.keys().next().value;
     frameCacheBytes -= frameCache.get(oldest).data.length;
     frameCache.delete(oldest);
+    COUNTERS.cacheEvictions += 1;
   }
 }
 
@@ -158,8 +175,35 @@ function viewportFor(spec) {
   return { width: SCREEN_W - mg.left - mg.right, height: SCREEN_H - mg.top - mg.bottom, margins: mg };
 }
 
-function specKey(spec) {
-  return JSON.stringify(spec);
+// §3: pagination depends on these fields only. Changing XTC/XTCH, the dither model or text AA
+// must NOT repaginate the chapter — those are pixel-only.
+const LAYOUT_FIELDS = [
+  'lineCompression', 'paragraphAlignment', 'paragraphIndent', 'extraParagraphSpacing',
+  'characterWrap', 'hyphenation', 'embeddedStyle', 'screenMargin', 'font', 'imageRendering',
+];
+const RENDER_FIELDS = ['textAa', 'imageDither', 'imageToneDepth'];
+function keyOf(spec, fields) {
+  const o = {};
+  for (const f of fields) o[f] = (spec || {})[f];
+  return JSON.stringify(o);
+}
+function layoutKey(spec) { return keyOf(spec, LAYOUT_FIELDS); }
+function renderKey(spec) { return keyOf(spec, LAYOUT_FIELDS.concat(RENDER_FIELDS)); }
+function specKey(spec) { return layoutKey(spec); }   // kept for the spec reply's field name
+
+// §4: interactive work must not queue behind speculative export work.
+let lastInteractiveAt = 0;
+function markInteractive() { lastInteractiveAt = Date.now(); }
+const INTERACTIVE_COOLOFF_MS = 120;
+
+// A macrotask hop that is NOT clamped: browsers clamp nested setTimeout(0) to ~4 ms, which would add
+// seconds to a whole-book pass. postMessage to our own port yields just as effectively at ~0.1 ms,
+// so a page-turn message can be serviced after every single spine.
+const yieldPort = new MessageChannel();
+let yieldResolve = null;
+yieldPort.port1.onmessage = () => { const r = yieldResolve; yieldResolve = null; if (r) r(); };
+function yieldToLoop() {
+  return new Promise((res) => { yieldResolve = res; yieldPort.port2.postMessage(0); });
 }
 
 function post(id, ok, payload, transfer) {
@@ -171,7 +215,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '34';
+const FT_MODULE_VERSION = '36';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -259,12 +303,15 @@ async function init() {
 // Engine build-state invalidation. currentSpine/currentPages/builtKey describe
 // what the ENGINE has built; a whole-book export runs every spine through the
 // engine, so its end state is undefined — force a real rebuild next render.
+// The warm pass drives the engine through every spine, so the JS tracker can't follow it (spine
+// and page counts are invalidated). Composed frames stay valid, though: a frame is a pure function
+// of (book generation, spine, page, mode, render key, font stamp). So the frame cache is NOT cleared
+// here any more — only the tracking state — and clearing on a load is explicit.
 function invalidateEngine() {
-  frameCache.clear();
-  frameCacheBytes = 0;
   currentSpine = -1;
   currentPages = 0;
   builtKey = null;
+  appliedFont = null;          // the warm walked whole spines; re-send the face on the next spec
 }
 
 // Export the whole loaded book with the current spec, spine by spine (progress
@@ -277,6 +324,7 @@ function invalidateEngine() {
 async function exportWholeBook(opts, onProgress) {
   const xtcz = !!(opts && opts.xtcz);
   const cancelCheck = (opts && opts.cancelCheck) || null;
+  const cooloff = !!(opts && opts.cooloff);   // §4: speculative warms stand aside; exports do not
   tick('exportBegin');
   const spines = api._ko_export_begin();
   tock('exportBegin');
@@ -289,10 +337,19 @@ async function exportWholeBook(opts, onProgress) {
     if (n < 0) throw new Error('export spine ' + s + ' failed');
     total += n;
     if (onProgress) onProgress(s + 1, spines, total);
-    // let the busy ticker breathe between spines on giant books
-    if ((s & 3) === 3) {
-      await new Promise((r) => setTimeout(r, 0));
-      if (cancelCheck && cancelCheck()) return { cancelled: true, pages: total };
+    // §4: yield after EVERY spine (measured: yielding every 4th let a page turn queue behind ~150 ms
+    // of export work).
+    COUNTERS.warmYields += 1;
+    await yieldToLoop();
+    if (cancelCheck && cancelCheck()) return { cancelled: true, pages: total };
+    if (cooloff) {
+      // and if the user just turned a page, keep standing aside until they are idle again — this is
+      // speculative work, so interactive latency wins.
+      while (Date.now() - lastInteractiveAt < INTERACTIVE_COOLOFF_MS) {
+        COUNTERS.warmCooldowns += 1;
+        await new Promise((r) => setTimeout(r, INTERACTIVE_COOLOFF_MS));
+        if (cancelCheck && cancelCheck()) return { cancelled: true, pages: total };
+      }
     }
   }
   tick('exportFinish');
@@ -318,18 +375,88 @@ const initPromise = init();
 
 // Apply the reader-face choice to the engine. Custom fonts need their bytes
 // re-sent after every book load (ko_load_epub clears the in-memory FS).
+// §1: which face the ENGINE currently has, and which custom-font generation it was built from.
+// applyFont() used to run on every 'spec' — i.e. on every page turn — malloc'ing and re-parsing the
+// whole .epdfont each time. Reset to null on load (the book load clears the engine's font state) and
+// on clearFont, which is what makes the cache safe.
+let appliedFont = null;
+let appliedFontStamp = -1;
+
 function applyFont(name) {
   const fontId = FONT_IDS[name];
   if (fontId === undefined) return false;
   if (name === 'custom') {
     if (!customFontBytes) return false;   // nothing uploaded yet → keep default
+    if (appliedFont === 'custom' && appliedFontStamp === fontStamp) {
+      COUNTERS.fontSkips += 1;
+      return true;                        // already loaded, byte-for-byte the same font
+    }
     const fp = api._malloc(customFontBytes.length);
     api.HEAPU8.set(customFontBytes, fp);
     const rc = api._ko_load_epdfont(fp, customFontBytes.length, customFontName);
+    COUNTERS.epdfontLoads += 1;
     api._free(fp);
+    if (rc === 0) { appliedFont = 'custom'; appliedFontStamp = fontStamp; }
+    COUNTERS.fontApplies += 1;
     return rc === 0;
   }
-  return api._ko_set_font(fontId) === 0;
+  if (appliedFont === name && appliedFontStamp === fontStamp) {
+    COUNTERS.fontSkips += 1;
+    return true;                          // built-in already active
+  }
+  const ok = api._ko_set_font(fontId) === 0;
+  if (ok) { appliedFont = name; appliedFontStamp = fontStamp; }
+  COUNTERS.fontApplies += 1;
+  return ok;
+}
+
+// §2/§3: one place that turns a spec object into engine state. The per-field setters are cheap
+// (field writes in the engine) and run unconditionally so the spec is always authoritative; only the
+// expensive parts are gated — the font (custom = malloc + copy + reparse) and the margins.
+function applySpec(raw) {
+  const before = currentSpec;
+  currentSpec = Object.assign(defaultSpec(), raw || {});
+  const lkBefore = before ? layoutKey(before) : null;
+  const rkBefore = before ? renderKey(before) : null;
+  const lk = layoutKey(currentSpec);
+  const rk = renderKey(currentSpec);
+  COUNTERS.specApplies += 1;
+
+  api._ko_set_line_compression(currentSpec.lineCompression);
+  api._ko_set_paragraph_indent(currentSpec.paragraphIndent);
+  api._ko_set_character_wrap(currentSpec.characterWrap);
+  api._ko_set_paragraph_alignment(currentSpec.paragraphAlignment);
+  api._ko_set_extra_paragraph_spacing(currentSpec.extraParagraphSpacing);
+  // Firmware gates hyphenation on word-wrap mode (CrossPointSettings::readerRenderSpec):
+  // hyphenationEnabled = hyphenationEnabled && characterWrap == 0.
+  api._ko_set_hyphenation((currentSpec.hyphenation && currentSpec.characterWrap === 0) ? 1 : 0);
+  api._ko_set_embedded_style(currentSpec.embeddedStyle);
+  api._ko_set_image_rendering(currentSpec.imageRendering);
+  api._ko_set_text_aa(currentSpec.textAa);
+  api._ko_set_image_dither(currentSpec.imageDither);
+  api._ko_set_image_tone_depth(currentSpec.imageToneDepth);
+
+  tick('applyFont');
+  applyFont(currentSpec.font);            // no-op unless the face or the font stamp changed
+  tock('applyFont');
+
+  if (lk !== lkBefore) {
+    const mg = marginsFor(currentSpec);
+    api._ko_set_margins(mg.top, mg.right, mg.bottom, mg.left);
+    COUNTERS.layoutApplies += 1;
+  }
+  if (rk !== rkBefore) clearFrameCache();  // frames are keyed by render key: old ones are dead weight
+  return { layout: lk, layoutChanged: lk !== lkBefore };
+}
+
+// The render path carries the spec, so an unchanged spec costs nothing at all (§2).
+function applySpecIfChanged(raw) {
+  if (currentSpec && renderKey(currentSpec) === renderKey(Object.assign(defaultSpec(), raw || {}))) {
+    COUNTERS.renderApplies += 1;
+    return false;
+  }
+  applySpec(raw);
+  return true;
 }
 
 self.onmessage = async (ev) => {
@@ -368,6 +495,9 @@ self.onmessage = async (ev) => {
         api._free(tbuf);
         currentSpine = -1;
         currentPages = 0;
+        bookGen += 1;                // §5: new book, new frame namespace
+        clearFrameCache();
+        appliedFont = null;          // §1: a load resets the engine's font state, so force a re-apply
         // a new book cleared the in-memory FS: re-apply the custom font if one
         // is loaded, so the reader face survives chapter navigation
         if (customFontBytes && currentSpec && currentSpec.font === 'custom') {
@@ -379,32 +509,15 @@ self.onmessage = async (ev) => {
 
       case 'spec': {
         tick('spec');
-        currentSpec = Object.assign(defaultSpec(), ev.data.spec || {});
-        // forward every knob to the engine
-        api._ko_set_line_compression(currentSpec.lineCompression);
-        api._ko_set_paragraph_indent(currentSpec.paragraphIndent);
-        api._ko_set_character_wrap(currentSpec.characterWrap);
-        api._ko_set_paragraph_alignment(currentSpec.paragraphAlignment);
-        api._ko_set_extra_paragraph_spacing(currentSpec.extraParagraphSpacing);
-        // Firmware gates hyphenation on word-wrap mode (CrossPointSettings::
-        // readerRenderSpec): hyphenationEnabled = hyphenationEnabled && characterWrap == 0.
-        // Character wrap can already break anywhere, so hyphenation is inert there.
-        api._ko_set_hyphenation((currentSpec.hyphenation && currentSpec.characterWrap === 0) ? 1 : 0);
-        api._ko_set_embedded_style(currentSpec.embeddedStyle);
-        api._ko_set_image_rendering(currentSpec.imageRendering);
-        api._ko_set_text_aa(currentSpec.textAa);
-        // image dither model + the tone depth the export needs (4 = 2-bit, 2 = 1-bit)
-        api._ko_set_image_dither(currentSpec.imageDither);
-        api._ko_set_image_tone_depth(currentSpec.imageToneDepth);
-        tick('applyFont');
-        applyFont(currentSpec.font);   // reader face (default ridibatang)
-        tock('applyFont');
+        markInteractive();
         // margins: viewable area + screenMargin on all four sides (no UI reserve)
+        applySpec(ev.data.spec);
         const mg = marginsFor(currentSpec);
-        api._ko_set_margins(mg.top, mg.right, mg.bottom, mg.left);
         tock('spec');
         post(id, true, {
-          specKey: specKey(currentSpec),
+          specKey: layoutKey(currentSpec),          // layout key: the only thing that repaginates
+          renderKey: renderKey(currentSpec),
+          layoutChanged: true,
           margins: mg,
           viewport: { width: SCREEN_W - mg.left - mg.right, height: SCREEN_H - mg.top - mg.bottom },
         });
@@ -428,12 +541,18 @@ self.onmessage = async (ev) => {
       }
 
       case 'render': {
-        const key = specKey(currentSpec || {});
+        markInteractive();
+        // §2: the spec travels with the render, so an ordinary page turn is one request. When it has
+        // not changed, this does nothing at all.
+        if (ev.data.spec) applySpecIfChanged(ev.data.spec);
+        const key = layoutKey(currentSpec || {});
         const wantMono = ev.data.mode === 0;   // 1-bit XTC preview (BW plane only)
-        // rebuild if spine, spec, OR loaded font changed since the last build
-        // (a custom-font swap changes glyphs/metrics but not the worker spec)
+        // rebuild if spine, LAYOUT, OR loaded font changed since the last build
+        // (a custom-font swap changes glyphs/metrics but not the worker spec;
+        //  pixel-only options like AA/dither/tone depth must not repaginate — §3)
         if (ev.data.spine !== currentSpine || key !== builtKey ||
             fontStamp !== builtFontStamp) {
+          COUNTERS.builds += 1;
           tick('rebuild');
           const n = api._ko_build_spine(ev.data.spine);
           tock('rebuild');
@@ -453,9 +572,11 @@ self.onmessage = async (ev) => {
         if (page >= currentPages) page = currentPages - 1;
         // Repeat navigation: the composed frame is a pure function of these five inputs, and
         // the cached copy is already out of wasm memory.
-        const frameKey = currentSpine + ':' + page + ':' + (wantMono ? 1 : 0) + ':' + builtKey + ':' + builtFontStamp;
+        const rk = renderKey(currentSpec || {});
+        const frameKey = bookGen + ':' + currentSpine + ':' + page + ':' + (wantMono ? 1 : 0) + ':' + rk + ':' + builtFontStamp;
         const cachedFrame = frameCacheGet(frameKey);
         if (cachedFrame) {
+          COUNTERS.cacheHits += 1;
           const reply = new Uint8ClampedArray(cachedFrame.data.length);
           reply.set(cachedFrame.data);
           post(id, true, { page, pages: currentPages, image: reply.buffer, mono: wantMono, cached: true },
@@ -464,6 +585,7 @@ self.onmessage = async (ev) => {
         }
 
         tick('renderPage');
+        COUNTERS.renders += 1;
         const rc = api._ko_render_page(page);
         tock('renderPage');
         if (rc !== 0) { post(id, false, { error: 'render failed' }); return; }
@@ -476,6 +598,17 @@ self.onmessage = async (ev) => {
         tock('compose');
         frameCachePut(frameKey, img);
         const tx = img.data.buffer;
+        COUNTERS.framesPosted += 1;
+        // §5: prefetch the next page so a sequential turn is a cache hit. Rendering is preceded by a
+        // render of the requested page on every cache miss, so speculative planes cannot be composed
+        // as the wrong page.
+        if (!warmRunning && page + 1 < currentPages) {
+          const nk = bookGen + ':' + currentSpine + ':' + (page + 1) + ':' + (wantMono ? 1 : 0) + ':' + rk + ':' + builtFontStamp;
+          if (!frameCache.has(nk) && api._ko_render_page(page + 1) === 0) {
+            frameCachePut(nk, wantMono ? composeMono() : composePage());
+            COUNTERS.prefetches += 1;
+          }
+        }
         post(id, true, { page, pages: currentPages, image: tx, mono: wantMono }, [tx]);
         break;
       }
@@ -551,6 +684,7 @@ self.onmessage = async (ev) => {
       case 'clearFont': {
         customFontBytes = null;
         fontStamp++;
+        appliedFont = null;          // §1: face selection must be re-sent
         api._ko_clear_custom_font();
         currentSpec = Object.assign(currentSpec || defaultSpec(), { font: 'ridibatang' });
         post(id, true, { font: 'ridibatang', fontStamp });
@@ -579,6 +713,7 @@ self.onmessage = async (ev) => {
           const res = await exportWholeBook({
             xtcz: !!ev.data.xtcz,
             cancelCheck: () => myTok < warmToken,   // a newer warm superseded us
+            cooloff: true,                          // §4: speculative work yields to the reader
           });
           if (myTok < warmToken) { post(id, true, { warm: 'superseded' }); break; }
           if (res.cancelled) { post(id, true, { warm: 'cancelled' }); break; }
@@ -663,7 +798,15 @@ self.onmessage = async (ev) => {
       }
 
       case 'stats': {
-        post(id, true, { times: cmdTimes });
+        post(id, true, {
+          times: cmdTimes,
+          counters: COUNTERS,
+          frameCache: { entries: frameCache.size, bytes: frameCacheBytes, budget: FRAME_CACHE_BUDGET },
+          engine: { spine: currentSpine, pages: currentPages, builtKey, fontStamp },
+          keys: { layout: currentSpec ? layoutKey(currentSpec) : null,
+                  render: currentSpec ? renderKey(currentSpec) : null },
+          warmRunning,
+        });
         break;
       }
 

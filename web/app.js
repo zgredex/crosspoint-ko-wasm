@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=34');
+    const w = new Worker(base + 'ko.worker.js?v=36');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -395,16 +395,28 @@
     }
   }
 
+  // §2: the spec only has to be pushed when it actually changed. Every spec push used to run
+  // applyFont() in the worker, which for a custom font re-malloc'ed and re-parsed the whole
+  // .epdfont — on every single page turn. Ordinary navigation is now one worker request.
+  let lastPushedSpecKey = null;
+  function currentSpecKey() {
+    try { return JSON.stringify(readSpec()); } catch (_) { return null; }
+  }
+
   async function refresh(keepPage = true, quiet = false) {
     if (!book) return;
     const tok = ++renderToken;
     viewingCover = false;
     if (!quiet) busy('미리보기 생성 중');   // scrub-path re-renders stay silent
     try {
-      // spec first (idempotent cheap), then render (worker rebuilds spine on
-      // change). The chosen export mode travels with the render so the preview
-      // is quantized exactly like the file the mode produces.
-      await pushSpec();
+      // push the spec only on change, then render (the worker rebuilds the spine when the LAYOUT
+      // changed). The chosen export mode travels with the render so the preview is quantized
+      // exactly like the file the mode produces.
+      const key = currentSpecKey();
+      if (key !== lastPushedSpecKey) {
+        await pushSpec();
+        lastPushedSpecKey = key;
+      }
       const spine = Math.min(state.spine, book.spineCount - 1);
       const page = keepPage ? state.page : 0;
       const r = await call('render', { spine, page, mode: state.mode });
@@ -662,8 +674,9 @@
       els.downloadBtn.disabled = exporting;
       els.exportStatus.textContent = '';
       invalidateWarm();           // warm bytes (if any) belong to a previous book
+      lastPushedSpecKey = null;   // §2: a fresh engine needs the spec once
       await refresh(false);
-      scheduleWarm(500);          // pre-convert the fresh book once idle
+      scheduleWarm(3000);          // pre-convert the fresh book once idle
     } catch (e) {
       reportError(e, 'EPUB 열기');
       idle();
@@ -777,7 +790,7 @@
   function scheduleWarm(delayMs) {
     if (!book || exporting) return;
     clearTimeout(warmSettleTimer);
-    warmSettleTimer = setTimeout(fireWarm, delayMs == null ? 700 : delayMs);
+    warmSettleTimer = setTimeout(fireWarm, delayMs == null ? 2000 : delayMs);
   }
   function invalidateWarm() {
     warmSpecKey = null;
@@ -904,7 +917,7 @@
                  (meta.inBrowser ? ', 브라우저에서 ' + meta.ms + ' ms 만에 변환 — ' +
                    (meta.ftVersion || 'FreeType') : '') + ')', false);
       invalidateWarm();
-      scheduleWarm(700);
+      scheduleWarm(2000);
       scheduleWeightLadder();   // warm neighbor weights for the first scrub
     } catch (e) {
       fontStatus('✗ ' + describeError(e, '글꼴 변환'), true);
@@ -1020,7 +1033,7 @@
     // EXPORTED PIXELS change, so the warmed file is stale either way.
     invalidateWarm();            // pagination or pixels changed → warm bytes stale
     requestRepaint(60);
-    scheduleWarm(800);
+    scheduleWarm(2000);
     savePrefs();
   }));
 
@@ -1073,7 +1086,7 @@
     el.addEventListener('input', () => { if (out) out.textContent = fmt(el.value); });
   });
   els.screenMargin.addEventListener('change', () => {
-    invalidateWarm(); requestRepaint(60); scheduleWarm(800);
+    invalidateWarm(); requestRepaint(60); scheduleWarm(2000);
   });
   // font sliders commit → hot re-conversion of the custom face. React to
   // 'input' too (mid-drag pauses re-render at that weight) — the 150 ms
@@ -1096,10 +1109,10 @@
     toggleFontPanel();
     if (els.fontPreset.value !== 'custom') {
       // preset swap re-paginates through the spec path
-      invalidateWarm(); requestRepaint(60); scheduleWarm(800);
+      invalidateWarm(); requestRepaint(60); scheduleWarm(2000);
     } else if (customFontLoaded) {
       // already have a runtime font → keep it active, hot-apply current knobs
-      invalidateWarm(); requestRepaint(60); scheduleWarm(800);
+      invalidateWarm(); requestRepaint(60); scheduleWarm(2000);
       const f = els.fontFile.files && els.fontFile.files[0];
       if (f && lastFontSig !== fontKnobSig()) scheduleFontConvert();
     } else {
@@ -1138,7 +1151,7 @@
     applyDefaults();
     invalidateWarm();
     refresh(true);
-    scheduleWarm(800);
+    scheduleWarm(2000);
   });
 
   // ---- output mode: 1-bit XTC vs 2-bit XTCH (drives preview + export) ----
@@ -1165,7 +1178,7 @@
     updateExportSummary();
     savePrefs();
     // re-render the current page so the preview shows the chosen mode
-    if (book) { invalidateWarm(); refresh(true); scheduleWarm(700); }
+    if (book) { invalidateWarm(); refresh(true); scheduleWarm(2000); }
   });
 
   // The AA switch, live in both modes:
@@ -1255,7 +1268,7 @@
       // rebuilds the current spine so the page stays in sync with the book
       refresh(true);
       invalidateWarm();
-      scheduleWarm(700);
+      scheduleWarm(2000);
     } catch (e) {
       els.exportStatus.textContent = '✗ ' + describeError(e, '내보내기');
       setStatus('✗ ' + describeError(e, '내보내기'), true);
@@ -1278,7 +1291,7 @@
   els.lz4Wrap.addEventListener('change', () => {
     // output container changes → warm bytes stale → pre-convert the new variant
     invalidateWarm();
-    if (book) scheduleWarm(700);
+    if (book) scheduleWarm(2000);
     updateExportSummary();
     savePrefs();
   });
