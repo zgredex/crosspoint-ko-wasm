@@ -274,7 +274,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '40';
+const FT_MODULE_VERSION = '41';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -344,6 +344,31 @@ function composePage() {
     if (api._ko_compose_rgba(0) !== 0) throw new Error('engine compose failed');
   });
   return _stage('compose.view', _frameFromEngine);
+}
+
+// §2 of the 1.5 audit: the size cap used to be checked AFTER _ko_export_spine() had rendered and
+// stored a whole spine, so one giant XHTML spine could allocate hundreds of MB before the check ran —
+// and Emscripten never returns linear memory, so the high-water mark stayed grown even after the abort.
+// Decide from pagination alone, before any encoded page exists. Small books get paginated twice; that
+// is deliberate, and measure before caching page counts by layout key.
+async function preflightWarmSize(mode, maxRawBytes, cancelCheck, cooloff) {
+  let pages = 0;
+  for (let s = 0; s < spineCount; s++) {
+    const n = api._ko_build_spine(s);
+    if (n < 0) throw new Error('warm preflight: spine ' + s + ' build failed');
+    invalidateSectionTracking();          // _ko_build_spine changes EngineDriver::section_
+    pages += n;
+    if (estimatedContainerBytes(mode, pages) > maxRawBytes) return { tooLarge: true, pages };
+    await yieldToLoop();
+    if (cancelCheck && cancelCheck()) return { cancelled: true, pages };
+    if (cooloff) {
+      while (Date.now() - lastInteractiveAt < INTERACTIVE_COOLOFF_MS) {
+        await new Promise((r) => setTimeout(r, INTERACTIVE_COOLOFF_MS));
+        if (cancelCheck && cancelCheck()) return { cancelled: true, pages };
+      }
+    }
+  }
+  return { tooLarge: false, pages };
 }
 
 // §2 + §5 of the 1.1 audit: speculation must never sit in front of the requested frame, and a
@@ -889,6 +914,11 @@ self.onmessage = async (ev) => {
           const warmDepth = selectedWarmMode === 0 ? 2 : 4;
           api._ko_set_image_tone_depth(warmDepth);
           if (currentSpec) currentSpec.imageToneDepth = warmDepth;
+          // §2 of the 1.5 audit: refuse an oversized book BEFORE allocating any page buffers
+          const pre = await preflightWarmSize(selectedWarmMode, WARM_RAW_LIMIT,
+                                              () => myTok < warmToken, true);
+          if (pre.cancelled) { post(id, true, { warm: 'cancelled' }); break; }
+          if (pre.tooLarge) { post(id, true, { warm: 'skipped-large', pages: pre.pages }); break; }
           const res = await exportWholeBook({
             mode: selectedWarmMode,
             xtcz: !!ev.data.xtcz,
@@ -955,6 +985,11 @@ self.onmessage = async (ev) => {
         // §1: from here to the finally, the engine state is frozen: any mutating command that arrives
         // in a yield window is rejected rather than silently changing what the file contains.
         foregroundExportRunning = true;
+        // §1 of the 1.5 audit: the try must begin HERE. It used to begin after the setup, so a throw
+        // from stopWarmBeforeMutation / applySpecIfChanged / the export-mode setup left the lock set
+        // forever — every later mutation then rejected for the life of the worker.
+        let res;
+        try {
         // §2: same fail-closed wait as any other mutation (it also drops the superseded warm bytes)
         await stopWarmBeforeMutation();
         // The tone depth must follow the MODE, not whatever spec happens to be
@@ -971,20 +1006,17 @@ self.onmessage = async (ev) => {
         api._ko_set_image_tone_depth(exportDepth);
         if (currentSpec) currentSpec.imageToneDepth = exportDepth;
         const opts = { xtcz: !!ev.data.xtcz };
-        let res;
-        try {
+          // exportWholeBook owns its own abort cleanup on every abnormal exit (cancel, spine
+          // failure, finish failure), so there is no catch here: one owner for cleanup.
           res = await exportWholeBook(opts, (spine, ofSpines, pages) => {
             self.postMessage({ progress: true, spine, ofSpines, pages });
           });
-        } catch (e) {
-          api._ko_export_abort();     // §3: release partial pages on failure too
-          throw e;
-        } finally {
-          foregroundExportRunning = false;
-        }
         // the export loop built+rendered every spine through the engine, so
         // per-spine engine state is undefined afterwards — force a rebuild on
         // the next engine render (keeps page flips after export safe)
+        } finally {
+          foregroundExportRunning = false;
+        }
         invalidateEngine();
         // hand the finished bytes to the app as a transferable for download
         const tx = takeTransferBuffer(res.file)     // §2: no full-file copy;
@@ -1004,6 +1036,7 @@ self.onmessage = async (ev) => {
           times: cmdTimes,
           counters: COUNTERS,
           frameCache: { entries: frameCache.size, bytes: frameCacheBytes, budget: FRAME_CACHE_BUDGET },
+          heapBytes: api ? api.HEAPU8.buffer.byteLength : 0,   // wasm linear memory high-water mark
           engine: { spine: currentSpine, pages: currentPages, builtKey, fontStamp },
           keys: { layout: currentSpec ? layoutKey(currentSpec) : null,
                   render: currentSpec ? renderKey(currentSpec) : null },

@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=40');
+    const w = new Worker(base + 'ko.worker.js?v=41');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -397,6 +397,7 @@
   // applyFont() in the worker, which for a custom font re-malloc'ed and re-parsed the whole
   // .epdfont — on every single page turn. Ordinary navigation is now one worker request.
   let lastPushedSpecKey = null;
+  let warmSkippedKey = null;      // outputKey of a book we decided is too large to warm (§3)
   function currentSpecKey() {
     try { return JSON.stringify(readSpec()); } catch (_) { return null; }
   }
@@ -662,6 +663,7 @@
       const canonicalTitle = normalizeDisplayText(
         stripExt(r.title) || stripExt(name) || '제목 없음'
       );
+      bookEpoch++;                 // §3: a new book invalidates any remembered warm key/skip
       book = { title: canonicalTitle, spineCount: r.spineCount, hrefs: r.hrefs };
       currentBookFile = pendingBookFile;   // §8: only a successful load promotes the File
       pendingBookFile = null;
@@ -763,10 +765,15 @@
     hangul: els.fontHangul.checked, intervals: els.fontIntervals.value.trim(),
     spacePx: els.fontSpacePx.value,
   });
+  // §3 of the 1.5 audit: the key must be self-contained. warmSpecKey is cleared on load, but a
+  // remembered SKIP has to survive book switches, so the book epoch is part of the key itself —
+  // otherwise a book A skip could suppress a legitimate warm for book B.
+  let bookEpoch = 0;
   function outputKey() {
     const s = readSpec();
     s._fontSig = s.font === 'custom' ? fontKnobSig() : '';
-    return JSON.stringify(s) + '|mode' + state.mode + '|xtcz' + (els.lz4Wrap.checked ? 1 : 0);
+    return JSON.stringify({ book: bookEpoch, spec: s, mode: state.mode,
+                            xtcz: els.lz4Wrap.checked ? 1 : 0 });
   }
 
   let lastRepaintKey = '';       // (reserved) outputKey of state on canvas
@@ -802,6 +809,9 @@
 
   function scheduleWarm(delayMs) {
     if (!book || exporting) return;
+    // §3: a book we already decided is too large must not be probed again on every settings change
+    const key = outputKey();
+    if (warmSpecKey === key || warmSkippedKey === key) return;
     clearTimeout(warmSettleTimer);
     warmSettleTimer = setTimeout(fireWarm, delayMs == null ? 2000 : delayMs);
   }
@@ -830,12 +840,15 @@
       if (tok !== warmVersion) return;    // settings changed mid-warm → stale
       if (r && r.warm === 'ready') {
         warmSpecKey = key;
+        warmSkippedKey = null;
         els.exportStatus.textContent = '✓ 미리 변환 완료 — 내보내면 바로 저장됩니다';
       }
       // busy → a previous warm still finishing; it will supersede itself, so
       // just re-schedule once it has had time to stop
       else if (r && r.warm === 'skipped-large') {
-        // §4: too big to hold speculatively — say so plainly instead of implying a cached file
+        // §3: remember the decision for this exact output state, or the next settings change (and the
+        // post-export reschedule) starts probing the oversized warm all over again
+        warmSkippedKey = key;
         els.exportStatus.textContent = '대용량 도서는 내보낼 때 변환됩니다';
       }
       else if (r && r.warm === 'busy') scheduleWarm(400);
