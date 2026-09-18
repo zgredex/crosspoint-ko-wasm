@@ -827,9 +827,40 @@ async function applySpecIfChanged(raw) {
 // only how much there was. Everything here is diagnostic and costs three performance.now() calls.
 let loadTiming = {};
 
+// What the engine did with images during the render it just performed. `decodes` is the number that
+// matters: the page is rendered three times (BW, then LSB, then MSB), so unless the grey passes stop
+// decoding, an image page decodes its image three times to produce one preview frame.
+// Spine labels, snapshotted ONCE per book, in the same tight loop that loads it.
+//
+// They used to be fetched on demand by the 'spineHrefs' command, reading the engine's live href
+// accessor later. That accessor returns pointers into the current metadata cache, and reading them after
+// a book replacement produced GARBAGE NONDETERMINISTICALLY — observed as "䏆" / U+070F U+0006 in a
+// label list, on BOTH the adopting and the copying load path, so it is not the owned mount. Five
+// consecutive loads of one book, and immediate-vs-delayed reads, all came back clean, so the trigger
+// needs an interleaving that a tight loop cannot have.
+//
+// The cost of the snapshot is real but small (measured 0.1 ms for 10 spines, 0.6 ms for 60), and it is
+// taken here rather than in the page's chapter-picker loop: building one <option> per spine is still
+// behind the first frame, which is where the UI cost was.
+let spineLabels = [];
+
+function readImagePerf() {
+  if (!api || !api._ko_image_decodes) return null;
+  try {
+    return {
+      decodes: api._ko_image_decodes(),
+      images: api._ko_image_count(),
+      readMs: +api._ko_image_perf(0).toFixed(2),
+      headerMs: +api._ko_image_perf(1).toFixed(2),
+      decodeMs: +api._ko_image_perf(2).toFixed(2),
+      drawMs: +api._ko_image_perf(3).toFixed(2),
+    };
+  } catch (_) { return null; }
+}
+
 // Per-frame breakdown. `buildMs` is the section layout that has to finish before ANY page exists, which
 // is exactly the number the progressive-layout work is meant to shrink.
-function renderTiming(t0, buildMs, renderMs, composeMs, cached) {
+function renderTiming(t0, buildMs, renderMs, composeMs, cached, imagePerf) {
   return {
     buildMs: +(buildMs || 0).toFixed(2),
     renderMs: +(renderMs || 0).toFixed(2),
@@ -838,6 +869,7 @@ function renderTiming(t0, buildMs, renderMs, composeMs, cached) {
     pagesAvailable: currentPages,
     sectionComplete: true,
     cached: !!cached,
+    image: imagePerf || undefined,
   };
 }
 
@@ -927,27 +959,43 @@ async function loadEngineBook(data, timing) {
     }
   }
 
-  const tRead = performance.now();
-  const buf = await blob.arrayBuffer();
-  timing.blobReadMs = performance.now() - tRead;
+  // The read and the heap allocation are independent, so start the read first and allocate while it is
+  // in flight. `wasmAllocMs` and `wasmMemcpyMs` are separate because they have different fixes: growth
+  // can overlap I/O, a memcpy cannot.
+  const readPromise = blob.arrayBuffer();
+  const tAlloc = performance.now();
+  const ptr = api._ko_epub_alloc ? api._ko_epub_alloc(blob.size) : api._malloc(blob.size);
+  timing.wasmAllocMs = performance.now() - tAlloc;
+  if (!ptr) {
+    await readPromise.catch(() => {});
+    throw new Error('EPUB allocation failed');
+  }
+  const tWait = performance.now();
+  const buf = await readPromise;
+  timing.blobWaitAfterAllocMs = performance.now() - tWait;
   const bytes = new Uint8Array(buf);
   const tCopy = performance.now();
-  const ptr = api._ko_epub_alloc ? api._ko_epub_alloc(bytes.length) : api._malloc(bytes.length);
   api.HEAPU8.set(bytes, ptr);
-  timing.wasmCopyMs = performance.now() - tCopy;
+  timing.wasmMemcpyMs = performance.now() - tCopy;
+  timing.blobReadMs = +(timing.wasmAllocMs + timing.blobWaitAfterAllocMs).toFixed(2);
+  timing.wasmCopyMs = timing.wasmMemcpyMs;
   if (api._ko_load_epub_owned) {
-    // Adopt: storage takes this buffer, so the book is not copied again in C++. Nothing to free here —
-    // on success storage owns it, and on failure the driver released the mounted blob for us.
+    // Adopt: storage takes this buffer, so the book is not copied again in C++.
+    //
+    // OWNERSHIP IS CONSUMED BY THE CALL, SUCCESS OR FAILURE. There is deliberately no fallback to
+    // ko_load_epub after this: the driver mounts the blob before it parses, so a failed parse has
+    // already dropped it — which frees this pointer. Re-entering the copying path would read from
+    // transferred memory, and the api._free() that path ends with would be a double free. A parse
+    // failure is also not something a copy would fix: the same bytes would fail identically.
     timing.path = 'read+adopt';
     const t = performance.now();
     const n = api._ko_load_epub_owned(ptr, bytes.length, '/book.epub');
     timing.engineLoadMs = performance.now() - t;
-    if (n >= 0) {
-      timing.totalLoadMs = performance.now() - t0;
-      return n;
-    }
-    timing.adoptFailed = true;
+    timing.totalLoadMs = performance.now() - t0;
+    return n;
   }
+  // The copying path exists only for a module whose API predates ko_load_epub_owned: here the buffer
+  // was never handed over, so it is still ours to free.
   timing.path = 'copy(Blob)';
   const t = performance.now();
   const n = api._ko_load_epub(ptr, bytes.length, '/book.epub');
@@ -1066,7 +1114,16 @@ self.onmessage = async (ev) => {
         // deadline above it); nothing to add here.
         // Spine labels are NOT sent here: one label per spine in front of the first page buys nothing,
         // and an omnibus has thousands. The page asks for them in batches once the first frame is up.
-        post(id, true, { spineCount, title, timing: loadTiming });
+        // Where the reference reader would open: its own text reference, not always spine 0. The page
+        // starts there; the container still holds every spine.
+        const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
+        const tLabels0 = performance.now();
+        spineLabels = [];
+        for (let s = 0; s < spineCount; s++) {
+          spineLabels.push(api.UTF8ToString(api._ko_get_spine_href(s)));
+        }
+        loadTiming.spineLabelsMs = +(performance.now() - tLabels0).toFixed(2);
+        post(id, true, { spineCount, title, startSpine, timing: loadTiming });
         break;
       }
 
@@ -1174,7 +1231,7 @@ self.onmessage = async (ev) => {
           const reply = new Uint8ClampedArray(cachedFrame.data.length);
           reply.set(cachedFrame.data);
           post(id, true, { page, pages: currentPages, image: reply.buffer, mono: wantMono, cached: true,
-                           timing: renderTiming(tRender0, 0, 0, 0, true),
+                           timing: renderTiming(tRender0, 0, 0, 0, true, null),
                            viewport: vpInfo ? vpInfo.viewport : null,
                            margins: vpInfo ? vpInfo.margins : null },
                [reply.buffer]);
@@ -1189,6 +1246,7 @@ self.onmessage = async (ev) => {
         const rc = api._ko_render_page(page);
         tock('renderPage');
         const renderMs = performance.now() - tRenderStart;
+        const imgPerf = readImagePerf();
         if (rc !== 0) { post(id, false, { error: 'render failed' }); return; }
         // No plane copies: the compose runs inside the engine and reads the engine's own
         // planes, so copying 3 x 48 KB out of wasm here was pure waste.
@@ -1210,7 +1268,7 @@ self.onmessage = async (ev) => {
                          // a giant spine still building knows its estimate, not its final count.
                          total: est.complete ? currentPages : Math.max(est.estimated || 0, currentPages),
                          sectionComplete: !!est.complete,
-                         timing: renderTiming(tRender0, buildMs, renderMs, composeMs, false),
+                         timing: renderTiming(tRender0, buildMs, renderMs, composeMs, false, imgPerf),
                          viewport: vpInfo ? vpInfo.viewport : null,
                          margins: vpInfo ? vpInfo.margins : null }, [tx]);
         if (continuation) continueSection(continuation.spine, continuation.gen, BUILD_CHUNK);
@@ -1396,15 +1454,11 @@ self.onmessage = async (ev) => {
 // the call site whether that conversion happens, and a silently-null path is exactly the kind of thing
 // that would produce a container with missing chapter names and no error.
       case 'spineHrefs': {
-        // Batched label fetch, so a huge spine list is built behind the visible page.
+        // Served from the snapshot taken during load, for the reason documented at `spineLabels`.
         const start = Math.max(0, ev.data.start | 0);
         const count = Math.max(1, ev.data.count | 0);
-        const end = Math.min(spineCount, start + count);
-        const hrefs = [];
-        for (let s = start; s < end; s++) {
-          hrefs.push(api.UTF8ToString(api._ko_get_spine_href(s)));
-        }
-        post(id, true, { start, hrefs });
+        const end = Math.min(spineLabels.length, start + count);
+        post(id, true, { start, hrefs: spineLabels.slice(start, end) });
         break;
       }
 

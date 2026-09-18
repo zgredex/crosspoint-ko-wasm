@@ -59,7 +59,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=76');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=84');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -219,7 +219,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=76');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=84');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -933,7 +933,14 @@
       // Labels are NOT built here: they now arrive in batches after the first frame (see below), so
       // the spine list cannot sit between the user and page 1.
       els.spineSel.innerHTML = '';
-      state = { spine: 0, page: 0, pages: 0, mode: state.mode };  // keep output mode
+      // Open where the REFERENCE reader opens. EpubReaderActivity::onEnter navigates to
+      // Epub::getSpineIndexForTextReference() on a first open when it is not 0 (it skips a cover or
+      // author page the EPUB designates as such), so starting at 0 made the port's first page and the
+      // device's first page potentially different spines. Books with no such reference report 0.
+      const startSpine = Number.isInteger(r.startSpine)
+        ? Math.max(0, Math.min(r.startSpine, r.spineCount - 1))
+        : 0;
+      state = { spine: startSpine, page: 0, pages: 0, mode: state.mode };  // keep output mode
       els.coverBtn.disabled = false;
       setAppState('loaded');
       const shownTitle = canonicalTitle;
@@ -1608,7 +1615,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=76');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=84');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };

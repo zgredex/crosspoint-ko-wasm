@@ -182,3 +182,60 @@ async function poolFontProbe(fontAPath, fontBPath) {
 }
 // poolFontProbe('__probeA.ttf', '__probeB.ttf');
 
+
+// ---------------------------------------------------------------------------
+// malformedProbe — hostile input on the owned-load path.
+//
+// ko_load_epub_owned CONSUMES the buffer it is given, success or failure: the driver mounts the blob
+// before parsing, so a failed parse drops it and frees the pointer. A fallback to the copying load after
+// that would read transferred memory, and its api._free() would be a double free. This probe drives that
+// exact sequence through the product's own load command and then proves the engine is still healthy.
+//
+// Run it with the fallback reinstated (see the comment in ko.worker.js) and it is how the bug was shown:
+// the malformed load either aborts the worker or leaves it corrupt, and the valid load after it fails.
+async function malformedProbe(goodBook) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const out = {};
+
+  const good = await (await fetch(goodBook || 'demo-png.epub')).arrayBuffer();
+  // Truncate INSIDE the ZIP: a valid signature, an unreadable central directory.
+  const broken = good.slice(0, Math.min(4096, good.byteLength));
+  out.malformed_bytes = broken.byteLength;
+
+  let rejected = false, detail = '';
+  try {
+    const r = await window.__call('load', { blob: new Blob([broken]) }, null, 60000);
+    detail = 'returned spineCount=' + r.spineCount;
+    rejected = !(r.spineCount >= 0);
+  } catch (e) {
+    rejected = true;
+    detail = 'threw: ' + (e && e.message);
+  }
+  out.malformed_rejected = rejected ? 'PASS — ' + detail
+                                    : 'FAIL — malformed EPUB was accepted (' + detail + ')';
+
+  // The engine must still work: same worker, same heap, after the failed owned load.
+  await sleep(200);
+  try {
+    const r = await window.__call('load', { blob: new Blob([good]) }, null, 120000);
+    out.engine_alive_after = r.spineCount > 0 ? 'PASS — ' + r.spineCount + ' spines'
+                                              : 'FAIL — ' + r.spineCount + ' spines';
+  } catch (e) {
+    out.engine_alive_after = 'FAIL — the worker did not survive the malformed load: ' + (e && e.message);
+  }
+
+  // And it must still render, which is what a corrupted heap would break first.
+  try {
+    const a = await window.__call('render', { spine: 0, page: 0 }, null, 60000);
+    out.render_after = a && a.image && a.image.byteLength > 0
+      ? 'PASS — ' + a.image.byteLength + ' bytes' : 'FAIL — no frame';
+  } catch (e) {
+    out.render_after = 'FAIL — ' + (e && e.message);
+  }
+
+  out.VERDICT = [out.malformed_rejected, out.engine_alive_after, out.render_after]
+    .every((v) => /^PASS/.test(v || '')) ? 'PASS — hostile input handled, engine intact'
+                                         : 'FAIL — see the fields';
+  return out;
+}
+// malformedProbe('demo-png.epub');

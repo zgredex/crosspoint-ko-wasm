@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "converters/ImagePerf.h"
 #include <cstring>
 #include <algorithm>
 #include <memory>
@@ -396,7 +397,15 @@ KO_EXPORT uint8_t* ko_epub_alloc(size_t size) {
 // book is replaced, so the caller must not. A 100 MB book used to be copied twice on the way in (JS
 // ArrayBuffer -> wasm, then wasm -> storage vector).
 KO_EXPORT int ko_load_epub_owned(uint8_t* data, size_t size, const char* virtualPath) {
-  if (!g_driver || !data || size == 0) return -1;
+  // The pointer is consumed by this call whenever it is usable at all, whatever the outcome: a caller
+  // must never read or free it afterwards. The only case where nothing is adopted is a null/empty
+  // buffer, and then there is nothing to leak either.
+  if (!data || size == 0) return -1;
+  if (!g_driver) {
+    std::free(data);          // consumed, just not by the storage
+    setError("no engine");
+    return -1;
+  }
   Storage.clearAll();
   const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
   if (!g_driver->loadEpubFromOwnedBlob(data, size, vp)) {
@@ -407,6 +416,15 @@ KO_EXPORT int ko_load_epub_owned(uint8_t* data, size_t size, const char* virtual
 }
 
 KO_EXPORT int ko_spine_count() { return g_driver ? g_driver->spineCount() : 0; }
+
+// The spine the REFERENCE reader opens at: EpubReaderActivity::onEnter, when opening a book for the
+// first time (currentSpineIndex == 0), navigates to Epub::getSpineIndexForTextReference() if it is not 0
+// — i.e. it skips a cover/author page that the EPUB explicitly designates as such. The browser preview
+// ignored this and always started at 0, so the port's first page and the device's first page could be
+// different spines. Export still contains every spine; only the initial position changes.
+KO_EXPORT int ko_text_reference_spine() {
+  return g_driver ? g_driver->textReferenceSpine() : 0;
+}
 
 KO_EXPORT void ko_get_title(char* buf, int bufLen) {
   if (!buf || bufLen <= 0) return;
@@ -516,8 +534,32 @@ KO_EXPORT int ko_spine_pages_estimated() {
   return g_driver ? g_driver->estimatedPages() : 0;
 }
 
+// Per-render image accounting: how many times an image was decoded for this one page, and where the
+// image time went. Reset here so the numbers always describe the LAST render — which is how "the cover
+// is decoded three times for one preview page" becomes a measurement instead of a claim.
+KO_EXPORT void ko_image_perf_reset() { ko::imagePerfReset(); }
+KO_EXPORT int ko_image_decodes() { return static_cast<int>(ko::imagePerf().decodes); }
+
+// Gate switch for the browser half of the image-once comparison: render three-pass instead of
+// image-once, so the same module can be measured both ways. Not a product setting.
+KO_EXPORT void ko_set_three_pass(int on) {
+  if (g_driver) g_driver->setThreePass(on != 0);
+}
+KO_EXPORT int ko_image_count() { return static_cast<int>(ko::imagePerf().images); }
+KO_EXPORT double ko_image_perf(int which) {
+  const ko::ImagePerf& p = ko::imagePerf();
+  switch (which) {
+    case 0: return p.readMs;
+    case 1: return p.headerMs;
+    case 2: return p.decodeMs;
+    case 3: return p.drawMs;
+    default: return 0.0;
+  }
+}
+
 KO_EXPORT int ko_render_page(int pageIndex) {
   if (!g_driver || g_currentSpine < 0) return -1;
+  ko::imagePerfReset();
   if (!g_driver->renderPage(pageIndex, g_spec, g_page)) {
     setError("page render failed");
     return -1;

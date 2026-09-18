@@ -125,7 +125,6 @@
     "lib/Epub/Epub/blocks/BlockStyle.h": "e7f4dbf465b49fb80dd1a2f3e28cf967d388a59a",
     "lib/Epub/Epub/blocks/TextBlock.cpp": "11ec34fd9ad32070a8e92c906df5fd47ebee269a",
     "lib/Epub/Epub/blocks/TextBlock.h": "cddb05f39cd580537999b67425e4381728fdf494",
-    "lib/Epub/Epub/converters/DirectPixelWriter.h": "c5f6cd4841a00991eb31f069270e71958886639c",
     "lib/Epub/Epub/converters/ImageDecoderFactory.cpp": "6c7cde26aacb9880e6e754fee64edae01fbbf628",
     "lib/Epub/Epub/converters/ImageDecoderFactory.h": "4a79774f949fe5c82cf3082765c5ed1e15df3712",
     "lib/Epub/Epub/converters/ImageDimsProbe.cpp": "8e205cb1f3f60bc362114b8e0606cf7300f7121b",
@@ -271,6 +270,28 @@
         "bool hasValidCache() const;"
       ]
     },
+    "lib/Epub/Epub/converters/DirectPixelWriter.h": {
+      "blob": "c5f6cd4841a00991eb31f069270e71958886639c",
+      "port_path": "vendor-lib/Epub/Epub/converters/DirectPixelWriter.h",
+      "divergence_kind": "amended",
+      "added_lines": 35,
+      "removed_lines": 9,
+      "changed_functions": [],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 0,
+      "port_function_count": 0,
+      "removed_line_sample": [
+        "void init(GfxRenderer& renderer) {",
+        "fb = renderer.getWriteTarget();",
+        "originY = renderer.getWriteOriginY();",
+        "clipRows = renderer.getWriteRows();",
+        "mode = renderer.getRenderMode();",
+        "displayWidthBytes = renderer.getDisplayWidthBytes();",
+        "const int phyW = renderer.getDisplayWidth();",
+        "const int phyH = renderer.getDisplayHeight();"
+      ]
+    },
     "lib/Epub/Epub/converters/DitherUtils.h": {
       "blob": "ec63a7684071560c72c59b0343d332de127c45b0",
       "port_path": "vendor-lib/Epub/Epub/converters/DitherUtils.h",
@@ -325,8 +346,8 @@
       "blob": "b6b3bd9734a5bb39206381c49c60320821bf3c76",
       "port_path": "vendor-lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp",
       "divergence_kind": "amended",
-      "added_lines": 151,
-      "removed_lines": 183,
+      "added_lines": 164,
+      "removed_lines": 184,
       "changed_functions": [
         "decodeToFramebuffer",
         "getDimensionsStatic",
@@ -361,7 +382,7 @@
       "blob": "8bb2067d1584bd3ae804983a6cfada6cadc27956",
       "port_path": "vendor-lib/Epub/Epub/converters/PngToFramebufferConverter.cpp",
       "divergence_kind": "amended",
-      "added_lines": 148,
+      "added_lines": 164,
       "removed_lines": 90,
       "changed_functions": [
         "decodeToFramebuffer",
@@ -525,8 +546,8 @@
     ]
   },
   "counts": {
-    "identical": 155,
-    "divergent": 12,
+    "identical": 154,
+    "divergent": 13,
     "missing_from_port": 1,
     "reference_engine_files": 168
   }

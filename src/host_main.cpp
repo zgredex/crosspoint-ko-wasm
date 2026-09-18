@@ -112,6 +112,7 @@ int main(int argc, char** argv) {
   bool useOwned = false;
   for (int i = 1; i < argc; i++) {
     if (std::string(argv[i]) == "--owned") useOwned = true;
+    if (std::string(argv[i]) == "--three-pass") driver.setThreePass(true);
   }
   bool loaded;
   if (useOwned) {

@@ -133,6 +133,67 @@ So improving it means one of:
 
 All three change image bytes or add a dependency, so this is a decision, not a patch.
 
+## Image-once: the biggest remaining first-page win
+
+The renderer already had the text-once optimization, but images had not received it. `renderPass()` ran
+three times — BW, GRAYSCALE_LSB, GRAYSCALE_MSB — and the gray passes *decode the image again*, because
+`DirectPixelWriter` re-runs the whole converter. Instrumented rather than assumed, one cover render:
+
+```
+decodes: 3   images: 3                      (the page rendered three times, one decode each)
+readMs 0.3 | headerMs 0.1 | decodeMs 28.4 | drawMs 20.1      renderMs 49.1
+```
+
+`DirectPixelWriter` only ever SETS gray plane bits (in GRAYSCALE_LSB/MSB it either sets the bit or
+returns, never clears), and the bits are a pure function of the dithered value it already computed:
+level 1 → both plane bits, level 2 → MSB only. So those bits are now captured during the BW pass
+(`captureLevelPhysical`, accumulate semantics, matching `orCapturedGrayInto`), and the two gray passes are
+composed from the capture instead of re-rendering the image.
+
+```
+                     before    after
+decodes                   3        1
+renderMs (cover)       49.1     16.5      (-66%)
+decodeMs               28.4      9.2
+drawMs                 20.1      7.3
+text spine renderMs     0.9      0.9      (unaffected: 0 decodes either way)
+first page (novel)     83.5     60.7
+```
+
+That is the audit's predicted 15–20 ms, and JPEG and PNG both go through `DirectPixelWriter`, so both are
+covered by one change.
+
+**Gate**: `scripts/verify/image_once_gate.py` — image-once vs three-pass, byte-identical containers on 6
+books × XTC/XTCH × 5 dither models (including the error-diffusion ones, whose state is per-image) × AA
+on/off = 120 cases. `--three-pass` (host) and `ko_set_three_pass()` (wasm) exist so one binary can render
+both ways, which is what makes the gate runnable without keeping a baseline binary. Proven to
+discriminate: with the capture removed but the gray passes still skipped, the gate reports the image books.
+
+AA-off is deliberately untouched: an AA-off page must carry no text greys, and its gray passes are the
+only path for images there. The reference build (`KO_ORACLE_BUILD`) never captures — the reference renderer
+has no capture API, and its plain three-pass behaviour is the control.
+
+## The earlier "decode is the bottleneck" claim was measured wrong
+
+Two errors, both now fixed:
+
+1. The timer labelled decode in `JpegToFramebufferConverter` began AFTER the `jpeg_read_scanlines` loop —
+   it measured `jpegDrawCallback`, i.e. DRAW. Replaced with `ImagePerf` (`vendor-lib/.../converters/
+   ImagePerf.h`): read / header / decode / draw, plus a decode counter, reset per render and reported to
+   the browser as `timing.image`.
+2. The hidden-image comparison (`--image-rendering 2`) subtracts the entire image cost — extraction, file
+   read, decode, scale, dither, writes — not the codec. It says "images cost 153 ms host-side", not "the
+   decoder costs 153 ms".
+
+With the parts separated, the cover is 58 % decode and 41 % draw per decode, and the conclusion that
+mattered was neither: the real defect was doing either of them three times.
+
+Note for future comparisons: the port's container differs from the `KO_ORACLE_BUILD` container on **JPEG**
+image pages and did so BEFORE image-once (checked with the pre-change driver restored), while PNG pages
+match. That is consistent with the gate's own design — layout manifests are compared byte-exactly against
+the reference, raster content perceptually — so the correct control for image work is the port's own
+pre-change build, not the oracle build.
+
 ## Knobs added for measuring
 
 * host `--mount-only` — isolate mount from parse (this is how the copy cost above was measured);

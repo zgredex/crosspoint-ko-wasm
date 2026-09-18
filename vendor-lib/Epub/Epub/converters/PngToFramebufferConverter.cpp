@@ -1,4 +1,5 @@
 #include "PngToFramebufferConverter.h"
+#include "ImagePerf.h"
 
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
@@ -344,6 +345,10 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
                                                     const RenderConfig& config) {
   LOG_DBG("PNG", "Decoding PNG: %s", imagePath.c_str());
 
+  auto& perf = ko::imagePerf();
+  perf.images += 1;
+  perf.decodes += 1;
+
   int rc = 0;
 
   // Use getMaxAllocHeap() (largest contiguous block) instead of getFreeHeap()
@@ -369,7 +374,9 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
     // Whole-file read, then a header-only libpng probe for the dimensions. Dimensions feed
   // pagination, so this must agree with PNGdec exactly - verified against the stage 1 gate.
   std::vector<uint8_t> file;
+  const double tRead = ko::perfNowMs();
   if (!readWholeFilePng(imagePath, file)) return false;
+  perf.readMs += ko::perfNowMs() - tRead;
 
   int pngW = 0;
   int pngH = 0;
@@ -472,6 +479,7 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
       LOG_ERR("PNG", "PNG decode failed: %s", imagePath.c_str());
     } else {
       PngMemReader rowReader{&file, 0};
+      const double tHeader = ko::perfNowMs();
       png_set_read_fn(pngRead, &rowReader, pngMemReadFn);
       png_read_info(pngRead, pngInfo);
 
@@ -491,7 +499,12 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
       const int passes = png_set_interlace_handling(pngRead);
       png_read_update_info(pngRead, pngInfo);
       const bool hasAlpha = (png_get_color_type(pngRead, pngInfo) & PNG_COLOR_MASK_ALPHA) != 0;
+      perf.headerMs += ko::perfNowMs() - tHeader;
 
+      // PNG interleaves inflate+unfilter with our per-row callback, so the split is the loop total
+      // minus the callback's own share: the remainder IS the codec. Measured, not assumed.
+      const double tLoop = ko::perfNowMs();
+      double drawSum = 0;
       std::vector<uint8_t> rowBuf(static_cast<size_t>(pngW) * (hasAlpha ? 2u : 1u));
       for (int pass = 0; pass < passes; pass++) {
         for (int y = 0; y < pngH; y++) {
@@ -505,9 +518,13 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
           draw.iHasAlpha = hasAlpha ? 1 : 0;
           draw.iPixelType = hasAlpha ? PNG_PIXEL_GRAY_ALPHA : PNG_PIXEL_GRAYSCALE;
           draw.pPalette = nullptr;
+          const double tRow = ko::perfNowMs();
           pngDrawCallback(&draw);
+          drawSum += ko::perfNowMs() - tRow;
         }
       }
+      perf.decodeMs += (ko::perfNowMs() - tLoop) - drawSum;
+      perf.drawMs += drawSum;
       png_read_end(pngRead, nullptr);
       png_destroy_read_struct(&pngRead, &pngInfo, nullptr);
       rc = 0;

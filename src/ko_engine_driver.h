@@ -250,6 +250,11 @@ class EngineDriver {
     return pageCount_;
   }
 
+  // Gate switch (see renderPage): render three-pass instead of image-once, so the two can be compared
+  // from one binary. Not a product setting.
+  void setThreePass(bool on) { threePass_ = on; }
+  bool threePass() const { return threePass_; }
+
   bool sectionBuildComplete() const { return section_ && section_->isBuildComplete(); }
   int availablePages() const { return section_ ? section_->pageCount : 0; }
   int estimatedPages() const { return section_ ? section_->estimatedTotalPages() : 0; }
@@ -345,6 +350,23 @@ class EngineDriver {
     // planes would carry text greys that an AA-off page must not have.
     const bool captureText = textOnce && aaOn;
 
+    // IMAGE-ONCE: the same capture now covers images too, so the gray passes have nothing left to draw
+    // and are composed from the capture alone. DirectPixelWriter records the two gray bits an image
+    // would set (level 1 -> both planes, level 2 -> MSB), which is exactly what its LSB/MSB passes did:
+    // in those modes it either sets the bit or returns, never clears. Text was already covered here.
+    //
+    // What this removes per page: a full image decode AND dither for each gray pass. Measured on the
+    // 549 KB JPEG cover, one preview render: 3 decodes, 28.4 ms of decode + 20.1 ms of draw for a 49.1 ms
+    // render. With both gray passes skipped that is ~33 ms of the 49 ms, and the page still decodes once.
+    //
+    // AA OFF stays on the unchanged three-pass path, and so does the reference build: an AA-off page must
+    // carry no text greys at all, and the reference renderer has no capture API. Both keep `textOnce`
+    // false or `aaOn` false, so captureWholeGray is false for them by construction.
+    // The gate switch: render the OLD way (capture text, still draw images in both gray passes) so the
+    // optimized path can be compared against it from one binary. Default off; --three-pass on the host,
+    // ko_set_three_pass() for the browser probe. Never exposed in the product UI.
+    const bool captureWholeGray = textOnce && aaOn && !threePass_;
+
     // The three calls below are the port's capture API. It does not exist in the
     // reference renderer, so the reference build simply does not make them — and
     // captureText is compile-time false there, so nothing is skipped that would
@@ -360,7 +382,8 @@ class EngineDriver {
 
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-    renderPass(textOnce ? true : !aaOn);
+    // Nothing to draw when the capture already holds both text's and images' contributions.
+    if (!captureWholeGray) renderPass(textOnce ? true : !aaOn);
 #ifndef KO_ORACLE_BUILD
     if (captureText) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), true);
 #endif
@@ -368,7 +391,7 @@ class EngineDriver {
 
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-    renderPass(textOnce ? true : !aaOn);
+    if (!captureWholeGray) renderPass(textOnce ? true : !aaOn);
 #ifndef KO_ORACLE_BUILD
     if (captureText) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), false);
 #endif
@@ -437,6 +460,7 @@ class EngineDriver {
   std::unique_ptr<Section> section_;
   std::string epubPath_;
   int pageCount_ = 0;
+  bool threePass_ = false;   // gate switch: render three-pass instead of image-once (see renderPage)
 };
 
 }  // namespace ko

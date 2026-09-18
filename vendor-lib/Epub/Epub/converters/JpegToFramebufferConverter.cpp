@@ -1,4 +1,5 @@
 #include "JpegToFramebufferConverter.h"
+#include "ImagePerf.h"
 
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
@@ -358,8 +359,14 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
 
+  auto& perf = ko::imagePerf();
+  perf.images += 1;
+  perf.decodes += 1;          // one decode per call: a page showing an image N times decodes it N times
+
+  const double tRead = ko::perfNowMs();
   std::vector<uint8_t> file;
   if (!readWholeFile(imagePath, file)) return false;
+  perf.readMs += ko::perfNowMs() - tRead;
 
   JpegErrorHandler err;
   jpeg_decompress_struct cinfo;
@@ -375,12 +382,14 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
 
   jpeg_create_decompress(&cinfo);
   created = true;
+  const double tHeader = ko::perfNowMs();
   jpeg_mem_src(&cinfo, file.data(), static_cast<unsigned long>(file.size()));
   if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
     jpeg_destroy_decompress(&cinfo);
     LOG_ERR("JPG", "Bad JPEG header: %s", imagePath.c_str());
     return false;
   }
+  perf.headerMs += ko::perfNowMs() - tHeader;
 
   const int srcWidth = static_cast<int>(cinfo.image_width);
   const int srcHeight = static_cast<int>(cinfo.image_height);
@@ -463,6 +472,9 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     return false;
   }
 
+  // THE CODEC'S OWN WORK, measured where it happens. The previous timer here was named decode but
+  // started after this loop, so it reported draw time under a decode label.
+  const double tDecode = ko::perfNowMs();
   std::vector<uint8_t> frame(static_cast<size_t>(decodedW) * static_cast<size_t>(decodedH));
   while (cinfo.output_scanline < cinfo.output_height) {
     JSAMPROW rows[1] = {frame.data() + static_cast<size_t>(cinfo.output_scanline) * decodedW};
@@ -471,9 +483,10 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   jpeg_finish_decompress(&cinfo);
   jpeg_destroy_decompress(&cinfo);
   created = false;
+  perf.decodeMs += ko::perfNowMs() - tDecode;
 
-  // Hand the whole frame to the unchanged band callback as one band.
-  const unsigned long decodeStart = millis();
+  // Hand the whole frame to the unchanged band callback as one band: scale + dither + writes.
+  const double tDraw = ko::perfNowMs();
   BandBlock draw{};
   draw.pUser = &ctx;
   draw.x = 0;
@@ -483,8 +496,8 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   draw.iHeight = decodedH;
   draw.pPixels = reinterpret_cast<uint16_t*>(frame.data());
   jpegDrawCallback(&draw);
-  const unsigned long decodeTime = millis() - decodeStart;
-  LOG_DBG("JPG", "JPEG decoding complete - render time: %lu ms", decodeTime);
+  perf.drawMs += ko::perfNowMs() - tDraw;
+  LOG_DBG("JPG", "JPEG complete - render time: %.2f ms", perf.drawMs);
 
   return true;
 }

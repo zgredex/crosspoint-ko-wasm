@@ -228,6 +228,16 @@ endif()
 include(ExternalProject)
 
 set(JPEG_TURBO_INSTALL ${CMAKE_BINARY_DIR}/libjpeg-install)
+# KO_JPEG_WASM_SIMD: let Clang autovectorize libjpeg-turbo's GENERIC C for wasm SIMD, while leaving
+# WITH_SIMD=OFF. Those are different things: WITH_SIMD=ON is libjpeg-turbo's own architecture-specific
+# handwritten assembly, which has no wasm implementation in this tree (simd/ ships arm, i386, mips,
+# mips64, nasm, powerpc, x86_64 — verified). -msimd128 keeps the identical generic C algorithms and only
+# permits the compiler to vectorize them, so it is worth an experiment: keep it only if the container
+# stays byte-identical AND the decode is measurably faster.
+# Host builds are deliberately excluded: the host is the byte-exact verification harness, and giving the
+# two toolchains different code generation is how verification becomes ambiguous.
+option(KO_JPEG_WASM_SIMD "Autovectorize libjpeg for wasm SIMD (-msimd128, WITH_SIMD stays OFF)" OFF)
+
 set(JPEG_TURBO_ARGS
     -DCMAKE_BUILD_TYPE=Release
     -DENABLE_SHARED=OFF
@@ -237,6 +247,19 @@ set(JPEG_TURBO_ARGS
     -DWITH_12BIT=OFF
     -DWITH_JAVA=OFF
     -DCMAKE_INSTALL_PREFIX=${JPEG_TURBO_INSTALL})
+# Passed EXPLICITLY in both cases. libjpeg's own build tree caches CMAKE_C_FLAGS_RELEASE, so omitting the
+# argument when the option is OFF would leave a previous ON value in place — and ExternalProject does not
+# re-run its configure step just because the argument list changed, so toggling this option needs the
+# stamps cleared too:
+#   rm -f build-wasm/libjpeg_turbo_ext-prefix/src/libjpeg_turbo_ext-stamp/libjpeg_turbo_ext-{configure,build,install,done}
+# Without that, flipping KO_JPEG_WASM_SIMD and rebuilding silently keeps the previous libjpeg.
+if(KO_JPEG_WASM_SIMD AND EMSCRIPTEN)
+  list(APPEND JPEG_TURBO_ARGS "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -msimd128")
+  message(STATUS "libjpeg-turbo: wasm SIMD autovectorization ON (WITH_SIMD stays OFF)")
+else()
+  list(APPEND JPEG_TURBO_ARGS "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG")
+  message(STATUS "libjpeg-turbo: wasm SIMD autovectorization OFF")
+endif()
 if(CMAKE_TOOLCHAIN_FILE)
   list(APPEND JPEG_TURBO_ARGS -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE})
 endif()

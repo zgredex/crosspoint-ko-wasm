@@ -35,17 +35,27 @@ struct DirectPixelWriter {
   // Row-precomputed: the Y-dependent portion of the physical coords
   int rowPhyXBase, rowPhyYBase;
 
-  void init(GfxRenderer& renderer) {
-    fb = renderer.getWriteTarget();
-    originY = renderer.getWriteOriginY();
-    clipRows = renderer.getWriteRows();
-    mode = renderer.getRenderMode();
-    displayWidthBytes = renderer.getDisplayWidthBytes();
+  void init(GfxRenderer& r) {
+    renderer = &r;
+    fb = r.getWriteTarget();
+    originY = r.getWriteOriginY();
+    clipRows = r.getWriteRows();
+    mode = r.getRenderMode();
+    displayWidthBytes = r.getDisplayWidthBytes();
+    // Evaluated per pass, after `mode` is known: only the BW pass can capture, because that is the one
+    // pass where a level capture is running (the gray passes are the ones being replaced).
+    //
+    // Compiled out of the REFERENCE build, like every other capture call in the port: the reference
+    // GfxRenderer has no capture API, and its behaviour — the plain three-pass render — is what the
+    // optimization is measured against.
+#ifndef KO_ORACLE_BUILD
+    captureGray = (mode == GfxRenderer::BW) && r.levelCaptureActive();
+#endif
 
-    const int phyW = renderer.getDisplayWidth();
-    const int phyH = renderer.getDisplayHeight();
+    const int phyW = r.getDisplayWidth();
+    const int phyH = r.getDisplayHeight();
 
-    switch (renderer.getOrientation()) {
+    switch (r.getOrientation()) {
       case GfxRenderer::Portrait:
         // phyX = y, phyY = (phyH-1) - x
         phyXBase = 0;
@@ -95,6 +105,14 @@ struct DirectPixelWriter {
   }
 
   // Call once per row before the column loop.
+  // Gray-level capture (port). An image contributes ONLY set bits to the two gray planes — in
+  // GRAYSCALE_LSB/MSB mode writePixel() either sets the bit or returns — so the two bits a gray pass
+  // would set are exactly what the dithered level already says. Recording them during the BW pass lets
+  // the gray passes skip this image entirely instead of decoding and dithering it a second and third
+  // time. `renderer` is borrowed for the duration of a pass; null means no capture.
+  const GfxRenderer* renderer = nullptr;
+  bool captureGray = false;
+
   // Pre-computes the Y-dependent portion so writePixel() only needs the X part.
   inline void beginRow(int logicalY) {
     rowPhyXBase = phyXBase + logicalY * phyXStepY;
@@ -174,6 +192,16 @@ struct DirectPixelWriter {
     // mode) and any out-of-frame row (full-frame mode) in one branch.
     const int sy = phyY - originY;
     if (static_cast<unsigned>(sy) >= static_cast<unsigned>(clipRows)) return;
+
+    // Record the gray bits this image would set in the LSB/MSB passes. Level 1 (dark) sets both plane
+    // bits, level 2 (light) only the MSB one; black (0) and white (3) set neither, which is why only
+    // those two values are captured. Accumulating (not assigning) matches the passes, which only ever
+    // OR set-bits into their plane.
+#ifndef KO_ORACLE_BUILD
+    if (captureGray && (pixelValue == 1 || pixelValue == 2)) {
+      renderer->captureLevelPhysical(phyX, phyY, pixelValue);
+    }
+#endif
 
     const uint16_t byteIndex = static_cast<uint16_t>(sy * displayWidthBytes + (phyX >> 3));
     const uint8_t bitMask = 1 << (7 - (phyX & 7));
