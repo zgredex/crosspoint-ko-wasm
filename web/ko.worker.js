@@ -368,6 +368,7 @@ function composePage() {
 // is deliberate, and measure before caching page counts by layout key.
 async function preflightWarmSize(mode, maxRawBytes, cancelCheck, cooloff) {
   let pages = 0;
+  const t0 = performance.now();
   for (let s = 0; s < spineCount; s++) {
     const n = api._ko_build_spine(s);
     if (n < 0) throw new Error('warm preflight: spine ' + s + ' build failed');
@@ -383,6 +384,7 @@ async function preflightWarmSize(mode, maxRawBytes, cancelCheck, cooloff) {
       }
     }
   }
+  preflightTimes = { ms: +(performance.now() - t0).toFixed(1), pages, spines: spineCount };
   return { tooLarge: false, pages };
 }
 
@@ -618,9 +620,15 @@ async function exportWholeBook(opts, onProgress) {
   tock('exportBegin');
   if (spines < 0) throw new Error('export_begin failed');
   let total = 0;
+  // Per-spine timing. Export is one engine doing every spine in order, so the only way to know
+  // whether a spine pool is worth its complexity is to see the distribution: if 60 spines all cost
+  // the same, N workers scale; if two spines are 80% of the work, they do not.
+  const spineTimes = [];
   for (let s = 0; s < spines; s++) {
     tick('exportSpine');
+    const tSpine = performance.now();
     const n = api._ko_export_spine(s);
+    spineTimes.push({ spine: s, pages: n, ms: +(performance.now() - tSpine).toFixed(1) });
     tock('exportSpine');
     if (n < 0) {
       // abnormal exit: release the pages accumulated so far, then propagate
@@ -680,8 +688,14 @@ async function exportWholeBook(opts, onProgress) {
   }
   const out = new Uint8Array(api.HEAPU8.buffer.slice(ptr, ptr + size));
   api._ko_xtch_release();
+  LAST_EXPORT.spines = spineTimes;
+  LAST_EXPORT.preflight = preflightTimes;
   return { file: out, pages, bytes: out.byteLength, spines, xtcz, rawBytes: rawBytes || 0 };
 }
+
+// Timing from the most recent export and preflight, for the `stats` command. Diagnostic only.
+const LAST_EXPORT = { spines: [], preflight: null };
+let preflightTimes = null;
 
 // init runs once; every handler awaits it before touching the api
 const initPromise = init();
@@ -1230,6 +1244,7 @@ self.onmessage = async (ev) => {
 
       case 'stats': {
         post(id, true, {
+          lastExport: LAST_EXPORT,
           times: cmdTimes,
           counters: COUNTERS,
           frameCache: { entries: frameCache.size, bytes: frameCacheBytes, budget: FRAME_CACHE_BUDGET },

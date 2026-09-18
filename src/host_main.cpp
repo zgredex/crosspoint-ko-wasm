@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>   // std::sort, std::max_element (spine distribution)
+#include <numeric>     // std::accumulate
 #include <chrono>
 #include <memory>
 #include <string>
@@ -222,7 +224,10 @@ int main(int argc, char** argv) {
   std::vector<ko::ManifestPage> manifestPages;
   const bool dumpPlanes = !planesDir.empty();
   if (dumpPlanes) mkdir(planesDir.c_str(), 0755);
+  std::vector<double> spineMs;
+  std::vector<int> spinePages;
   for (int spine = 0; spine < spineCount; spine++) {
+    const auto tSpine0 = Clock::now();
     auto t0 = Clock::now();
     const int n = driver.buildSection(spine, spec);
     tBuild += msSince(t0);
@@ -259,6 +264,37 @@ int main(int argc, char** argv) {
       ch.endPage = static_cast<uint16_t>(chapterStart + n - 1);
       chapters.push_back(ch);
       chapterStart += n;
+    }
+    spineMs.push_back(msSince(tSpine0));
+    spinePages.push_back(n);
+  }
+  // Spine distribution. Export walks spines in order on one engine, so this is the shape a spine pool
+  // would have to schedule around: even spines scale linearly with workers, a long tail does not.
+  if (!spineMs.empty()) {
+    std::vector<double> sorted = spineMs;
+    std::sort(sorted.begin(), sorted.end());
+    const auto pick = [&sorted](double q) {
+      return sorted[std::min(sorted.size() - 1, static_cast<size_t>(q * sorted.size()))];
+    };
+    const double sum = std::accumulate(spineMs.begin(), spineMs.end(), 0.0);
+    size_t heaviest = std::max_element(spineMs.begin(), spineMs.end()) - spineMs.begin();
+    // Attainable speedup with N workers is sum / makespan, and makespan is at least the heaviest
+    // single spine however many workers you add — so a long tail caps the whole thing. (An earlier
+    // version printed sum/(sum/8), which is 8.00 by algebra and told nobody anything.)
+    const auto speedup = [&](int n) {
+      const double makespan = std::max(sum / n, sorted.back());
+      return sum / makespan;
+    };
+    fprintf(stderr,
+            "SPINES   %zu spines | min %.1f p50 %.1f p90 %.1f max %.1f ms | sum %.1f | "
+            "heaviest spine %zu is %.0f%% of spine time | ceiling %.2fx (4w) %.2fx (8w) %.2fx (16w)\n",
+            spineMs.size(), sorted.front(), pick(0.5), pick(0.9), sorted.back(), sum,
+            heaviest, 100.0 * spineMs[heaviest] / sum, speedup(4), speedup(8), speedup(16));
+    if (const char* dump = std::getenv("KO_SPINE_DUMP")) {
+      if (std::string(dump) == "1") {
+        for (size_t i = 0; i < spineMs.size(); i++)
+          fprintf(stderr, "SPINE %zu %d pages %.1f ms\n", i, spinePages[i], spineMs[i]);
+      }
     }
   }
   fprintf(stderr, "rendered %d pages; finalizing container\n", totalPages);
