@@ -44,6 +44,8 @@
   Cache-Control: public, max-age=31536000, immutable
 /ft_wasm.*.wasm
   Cache-Control: public, max-age=31536000, immutable
+/ko_build_info.*.js
+  Cache-Control: public, max-age=31536000, immutable
 
 # Externalized reader faces (EPD2). These are the reason this file exists at all now: .epd2 is an
 # unknown extension, Pages serves it as application/octet-stream, and Cloudflare's default compression
