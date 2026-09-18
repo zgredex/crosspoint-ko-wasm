@@ -56,12 +56,12 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=21');
+    const w = new Worker(base + 'ko.worker.js?v=22');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
       if (m && m.progress && els.exportStatus) {
-        els.exportStatus.textContent = '스파인 ' + m.spine + '/' + m.ofSpines + ' 내보내는 중 ' +
+        els.exportStatus.textContent = '생성 중 ' + m.spine + '/' + m.ofSpines + ' ' +
           '(' + m.pages + '쪽 완료)…';
         return;
       }
@@ -71,7 +71,7 @@
       clearTimeout(p.timer);
       if (m.fatal) {
         // engine aborted (OOM etc.) — respawn, then reject this call
-        setStatus('⚠ 엔진 중단 (' + (m.error || '') + ') — 자동 재시작…', true);
+        setStatus('⚠ 엔진이 중단되어 자동으로 다시 시작합니다…', true);
         p.reject(new Error(m.error || '엔진 중단'));
         respawn();
         return;
@@ -80,7 +80,7 @@
     };
     w.onerror = (e) => {
       e.preventDefault();
-      setStatus('⚠ 엔진 워커 충돌 (' + (e.message || '알 수 없음') + ') — 자동 재시작…', true);
+      setStatus('⚠ 엔진 워커가 충돌해 자동으로 다시 시작합니다…', true);
       respawn();
     };
     w.onmessageerror = () => {
@@ -128,6 +128,41 @@
     });
   }
   window.__call = call;   // debug hook (stats etc.)
+
+  // ---- Korean, actionable error copy (item 8) ------------------------------
+  // The raw WASM/JS message is never shown to the user; it goes to the console and onto the
+  // element's title so a bug report can still quote it.
+  function describeError(e, what) {
+    const raw = String((e && e.message) || e || '');
+    const m = raw.toLowerCase();
+    if (/encrypt|drm|rights|obfuscat|password/.test(m))
+      return 'DRM이 걸린 EPUB으로 보입니다. DRM이 없는 파일로 다시 시도해 주세요.';
+    // 'Epub::load failed' is the engine's catch-all for a container it cannot parse: in
+    // practice that is a corrupt download or a DRM-wrapped file, so say both.
+    if (/zip|central directory|end of central|not a zip|invalid epub|corrupt|truncat|epub::load|load failed|failed to open/.test(m))
+      return 'EPUB 파일을 열 수 없습니다. 파일이 손상되었거나 DRM이 적용되어 있는지 확인해 주세요.';
+    if (/spine|no content|empty book|no pages/.test(m))
+      return '이 EPUB에서 본문을 찾을 수 없습니다. 다른 파일로 시도해 주세요.';
+    if (/font|freetype|glyph|epdfont|face/.test(m))
+      return '글꼴 변환에 실패했습니다. 다른 TTF/OTF 파일로 시도해 주세요.';
+    if (/memory|oom|allocation|out of bounds|grow/.test(m))
+      return '메모리가 부족합니다. 더 작은 EPUB으로 시도하거나 브라우저 탭을 정리해 주세요.';
+    if (/image|jpeg|png|decode|bitmap/.test(m))
+      return '이미지를 처리할 수 없습니다. 지원하지 않는 이미지 형식일 수 있습니다.';
+    if (/css|html|xml|parse|xhtml/.test(m))
+      return 'EPUB 내부의 HTML/CSS를 해석할 수 없습니다. 파일이 손상되었을 수 있습니다.';
+    if (/export|writer|plane|container/.test(m))
+      return '기기 파일을 만드는 중 문제가 발생했습니다. 설정을 기본값으로 되돌린 뒤 다시 시도해 주세요.';
+    return (what ? what + ' 중 문제가 발생했습니다.' : '변환 중 문제가 발생했습니다.') +
+           ' 잠시 후 다시 시도해 주세요.';
+  }
+
+  function reportError(e, what) {
+    console.error(what || 'xtcko', e);
+    const msg = describeError(e, what);
+    setStatus(msg, true);
+    if (els.status) els.status.title = String((e && e.message) || e || '');
+  }
 
   function setStatus(msg, isErr) {
     els.status.textContent = msg;
@@ -269,7 +304,7 @@
       drawCoverFitted(img);          // letterbox into the fixed 480×800 screen
       setStatus(book.title + ' — cover (표지)');
     } catch (e) {
-      setStatus('표지 오류: ' + e.message, true);
+      reportError(e, '표지 렌더링');
       viewingCover = false;
     } finally {
       idle();
@@ -325,7 +360,7 @@
     if (!book) return;
     const tok = ++renderToken;
     viewingCover = false;
-    if (!quiet) busy('렌더링');   // scrub-path re-renders stay silent
+    if (!quiet) busy('미리보기 생성 중');   // scrub-path re-renders stay silent
     try {
       // spec first (idempotent cheap), then render (worker rebuilds spine on
       // change). The chosen export mode travels with the render so the preview
@@ -348,7 +383,7 @@
       setStatus(book.title + ' — ' + (r.page + 1) + '/' + r.pages + '쪽' +
                 (r.mono ? ' · 1-bit 미리보기' : ''));
     } catch (e) {
-      if (tok === renderToken) setStatus('렌더 오류: ' + e.message, true);
+      if (tok === renderToken) reportError(e, '페이지 렌더링');
     } finally {
       if (tok === renderToken) idle();
     }
@@ -565,26 +600,52 @@
       state = { spine: 0, page: 0, pages: 0, mode: state.mode };  // keep output mode
       els.openBtn.disabled = false;
       els.coverBtn.disabled = false;
+      document.body.classList.remove('no-book');   // ②/③ become available
       els.downloadBtn.disabled = exporting;
       els.exportStatus.textContent = '';
       invalidateWarm();           // warm bytes (if any) belong to a previous book
       await refresh(false);
       scheduleWarm(500);          // pre-convert the fresh book once idle
     } catch (e) {
-      setStatus('불러오기 오류: ' + e.message, true);
+      reportError(e, 'EPUB 열기');
       idle();
     }
   }
 
   // ---- events ----
-  els.file.addEventListener('change', () => {
-    const f = els.file.files && els.file.files[0];
+  function startLoad(f) {
     if (!f) return;
+    if (!/\.epub$/i.test(f.name || '') && f.type !== 'application/epub+zip') {
+      setStatus('EPUB 파일만 열 수 있습니다.', true);
+      return;
+    }
     // reflect the chosen file on the picker label (native "no file chosen" text
     // belongs to the hidden input — the label is what the user sees)
     const lab = document.querySelector('label[for=epubFile]');
     if (lab) lab.textContent = f.name;
     f.arrayBuffer().then((buf) => loadBook(buf, f.name));
+  }
+
+  els.file.addEventListener('change', () => {
+    startLoad(els.file.files && els.file.files[0]);
+  });
+
+  // Drag & drop is a first-class desktop path: drop anywhere on the page.
+  const dropZone = document.getElementById('dropZone');
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  ['dragenter', 'dragover'].forEach((ev) => document.addEventListener(ev, (e) => {
+    stop(e);
+    if (dropZone) dropZone.classList.add('drag');
+  }));
+  ['dragleave', 'dragend'].forEach((ev) => document.addEventListener(ev, (e) => {
+    stop(e);
+    if (e.relatedTarget === null && dropZone) dropZone.classList.remove('drag');
+  }));
+  document.addEventListener('drop', (e) => {
+    stop(e);
+    if (dropZone) dropZone.classList.remove('drag');
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    startLoad(f);
   });
 
   els.openBtn.addEventListener('click', () => els.file.click());
@@ -663,7 +724,7 @@
       if (tok !== warmVersion) return;    // settings changed mid-warm → stale
       if (r && r.warm === 'ready') {
         warmSpecKey = key;
-        els.exportStatus.textContent = '✓ 책 전체 사전 변환 완료 — 내보내기는 즉시';
+        els.exportStatus.textContent = '✓ 미리 변환 완료 — 내보내면 바로 저장됩니다';
       }
       // busy → a previous warm still finishing; it will supersede itself, so
       // just re-schedule once it has had time to stop
@@ -747,7 +808,7 @@
     if (want === lastFontSig) return;           // already applied exactly this
     fontConverting = true;
     const tok = ++fontConvertToken;
-    fontStatus('변환 중… ' + (f.name || ''), false);
+    fontStatus('글꼴 변환 중… ' + (f.name || ''), false);
     try {
       const meta = await convertFont(f);
       // superseded while converting → drop; a later run will use newer knobs
@@ -770,7 +831,7 @@
       scheduleWarm(700);
       scheduleWeightLadder();   // warm neighbor weights for the first scrub
     } catch (e) {
-      fontStatus('✗ ' + e.message, true);
+      fontStatus('✗ ' + describeError(e, '글꼴 변환'), true);
     } finally {
       fontConverting = false;
     }
@@ -815,6 +876,58 @@
     refresh(false);
   });
 
+  // ---- remembered preferences (item 22) ------------------------------------
+  // Settings, never the book. A chosen custom font cannot be restored (the file is not kept),
+  // so that one preset falls back to the built-in face on load.
+  const PREFS_KEY = 'xtcko.prefs.v1';
+  const PREFS_IDS = ['lineCompression', 'paragraphAlignment', 'paragraphIndent',
+                     'extraParagraphSpacing', 'characterWrap', 'hyphenation', 'embeddedStyle',
+                     'textAa', 'imageRendering', 'imageDither', 'screenMargin', 'fontPreset',
+                     'fontSize', 'fontWeight', 'fontSpacePx', 'fontHangul', 'fontIntervals',
+                     'lz4Wrap', 'exportName'];
+
+  function savePrefs() {
+    try {
+      const o = {};
+      for (const id of PREFS_IDS) {
+        const el = els[id] || document.getElementById(id);
+        if (!el) continue;
+        o[id] = el.type === 'checkbox' ? el.checked : el.value;
+      }
+      o.zoom = els.zoom ? els.zoom.value : '100';
+      o.mode = state && state.mode === 0 ? 0 : 1;
+      localStorage.setItem(PREFS_KEY, JSON.stringify(o));
+    } catch (e) { /* private mode / quota: preferences are a convenience */ }
+  }
+
+  function loadPrefs() {
+    let o = null;
+    try { o = JSON.parse(localStorage.getItem(PREFS_KEY) || 'null'); } catch (e) { o = null; }
+    if (!o || typeof o !== 'object') return false;
+    for (const id of PREFS_IDS) {
+      const el = els[id] || document.getElementById(id);
+      if (!el || !(id in o)) continue;
+      if (el.type === 'checkbox') el.checked = !!o[id]; else el.value = o[id];
+    }
+    if (o.fontPreset === 'custom') {          // the .epdfont itself is not remembered
+      const p = els.fontPreset; if (p) p.value = 'ridibatang';
+    }
+    if (els.zoom && o.zoom) els.zoom.value = o.zoom;
+    if (state) {                       // the seg buttons are driven by state.mode
+      state.mode = o.mode === 0 ? 0 : 1;
+      syncExportSeg();
+      syncAaToMode();
+    }
+    // sliders show their value in an <output>: refresh those after restoring
+    if (els.screenMarginOut) els.screenMarginOut.textContent = els.screenMargin.value;
+    if (els.zoomOut) els.zoomOut.textContent = els.zoom.value + '%';
+    return true;
+  }
+
+  function clearPrefs() {
+    try { localStorage.removeItem(PREFS_KEY); } catch (e) { /* ignore */ }
+  }
+
   // ---- typography / page knobs: rAF-coalesced visible-page repaint ----
   const KNOB_IDS = [
     'lineCompression', 'paragraphAlignment', 'paragraphIndent',
@@ -827,6 +940,7 @@
     invalidateWarm();            // pagination or pixels changed → warm bytes stale
     requestRepaint(60);
     scheduleWarm(800);
+    savePrefs();
   }));
 
   // ---- controls that are inert in the current state are not shown -------------
@@ -846,6 +960,9 @@
   function syncDependentControls() {
     const hLab = document.getElementById('hyphenationLab');
     if (hLab) hLab.classList.toggle('hidden', els.characterWrap.checked);
+    // ...and say so: a setting that silently has no effect looks broken.
+    const note = document.getElementById('wrapNote');
+    if (note) note.classList.toggle('hidden', !els.characterWrap.checked);
     const tuning = document.getElementById('fontTuning');
     if (tuning) {
       const hasFile = !!(els.fontFile.files && els.fontFile.files[0]);
@@ -925,8 +1042,10 @@
     els.zoomOut.textContent = els.zoom.value + '%';
     updateZoomCss();
   });
+  els.zoom.addEventListener('change', savePrefs);
   window.addEventListener('resize', () => updateZoomCss());
   els.resetBtn.addEventListener('click', () => {
+    clearPrefs();                // 되돌리기 means forget the remembered preferences too
     applyDefaults();
     invalidateWarm();
     refresh(true);
@@ -950,6 +1069,7 @@
     state.mode = Number(seg.dataset.value);
     syncExportSeg();
     syncAaToMode();
+    savePrefs();
     // re-render the current page so the preview shows the chosen mode
     if (book) { invalidateWarm(); refresh(true); scheduleWarm(700); }
   });
@@ -1004,7 +1124,7 @@
         warmSpecKey = null;   // bytes handed over; next warm refills
         refresh(true);        // engine was invalidated by the warm pass
       } catch (e) {
-        els.exportStatus.textContent = '✗ 사전 변환본 불러오기 실패: ' + e.message;
+        els.exportStatus.textContent = '✗ 미리 변환본을 불러오지 못했습니다. 미리보기를 한 번 넘긴 뒤 다시 시도해 주세요.';
       } finally {
         exporting = false;
         els.downloadBtn.disabled = !book;
@@ -1013,11 +1133,11 @@
     }
     exporting = true;
     els.downloadBtn.disabled = true;
-    busy('내보내는 중 (책 전체)');
+    busy((mode === 0 ? 'XTC' : 'XTCH') + ' 생성 중 (책 전체)');
     const depthLabel = mode === 0 ? 'XTC 1-bit' : 'XTCH 2-bit';
-    setStatus('책 전체를 ' + depthLabel + (xtcz ? ' + LZ4 (.xtcz)' : '') + '로 내보내는 중' +
+    setStatus('책 전체를 ' + depthLabel + (xtcz ? ' + LZ4 (.xtcz)' : '') + '로 생성 중' +
               ' — 현재 설정으로 모든 페이지를 다시 렌더링합니다');
-    els.exportStatus.textContent = '내보내는 중…';
+    els.exportStatus.textContent = '생성 중…';
     try {
       // Push the spec first: the export must use exactly the switch positions on
       // screen (in 1-bit the AA switch decides the blue-noise dither), and a knob
@@ -1037,7 +1157,7 @@
       invalidateWarm();
       scheduleWarm(700);
     } catch (e) {
-      els.exportStatus.textContent = '✗ 내보내기 실패: ' + e.message;
+      els.exportStatus.textContent = '✗ ' + describeError(e, '내보내기');
     } finally {
       exporting = false;
       els.downloadBtn.disabled = !book;
@@ -1058,6 +1178,7 @@
     // output container changes → warm bytes stale → pre-convert the new variant
     invalidateWarm();
     if (book) scheduleWarm(700);
+    savePrefs();
   });
   syncExportSeg();   // reflect initial mode (XTCH 2-bit) on the toggle
   syncAaToMode();    // enable AA (2-bit default mode)
@@ -1071,6 +1192,10 @@
   });
 
   // ---- boot ----
+  // Restore remembered preferences before the engine sees a spec, so the first render already
+  // uses the user's settings. Nothing about a book is ever stored.
+  const restored = loadPrefs();
+  if (restored) syncDependentControls();
   hasFontBackend();   // one probe: is the server-side converter deployed here?
   worker = spawnWorker();
   bootEngine().catch((e) => {

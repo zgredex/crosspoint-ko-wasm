@@ -36,9 +36,11 @@
     [0x2200, 0x22FF], [0x2190, 0x21FF],
   ];
   var KOREAN_INTERVALS = [
-    [0xAC00, 0xD7AF], [0x1100, 0x11FF], [0x3130, 0x318F], [0x3000, 0x303F],
+    // U+AC00-U+D7A3 is the 11,172 assigned modern syllables; D7A4-D7AF is unassigned
+    // padding inside the block, so it is not requested.
+    [0xAC00, 0xD7A3], [0x1100, 0x11FF], [0x3130, 0x318F], [0x3000, 0x303F],
   ];
-  var HANGUL_FULL = [0xAC00, 0xD7AF];
+  var HANGUL_FULL = [0xAC00, 0xD7A3];
 
   function mergeIntervals(list) {
     var sorted = list.slice().sort(function (a, b) { return a[0] - b[0]; });
