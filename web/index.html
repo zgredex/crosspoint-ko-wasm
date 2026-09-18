@@ -203,7 +203,7 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
         </select>
       </label>
 
-      <label class="ctrl" title="Dither model for IMAGE pixels only (photos, covers, illustrations) — text is never touched by this control; that is what Text anti-aliasing is for. The model is applied at whichever tone depth the export uses: 2-bit XTCH keeps 4 tones, 1-bit XTC gets 2 (one pass from the source image, not a second dither of an already-dithered page). Tone anchors are the firmware's own panel model — white 210 / light grey 80 / dark grey 30 / black 15 — so a dithered patch reproduces the average reflectance of the grey it replaces. Ordered: blue-noise (default, 64x64), bayer (4x4). Error diffusion: Floyd-Steinberg, Atkinson, Jarvis-Judice-Ninke, Stucki, Burkes, and Zhou-Fang (per-intensity kernels + threshold modulation; deterministic here, the reference uses Math.random()). ko-fork hash is the firmware's OWN quantizer, kept verbatim: at 2-bit it assumes the four levels are evenly spaced, which they are not, so its mids read much darker (a luma-170 patch renders at 80); at 1-bit it is the firmware's quantize1bit, which keeps solids solid and measured the least speckle of any model. None = hard threshold (least speckle, least faithful: 1.26% local tone error on a grey-heavy page vs 0.68% for blue noise; Atkinson 1.10% with even less speckle).">
+      <label class="ctrl" title="Dither model for IMAGE pixels only (photos, covers, illustrations) — text is never touched by this control; that is what Text anti-aliasing is for. The model is applied at whichever tone depth the export uses: 2-bit XTCH keeps 4 tones, 1-bit XTC gets 2 (one pass from the source image, not a second dither of an already-dithered page). Tone anchors are the firmware's own panel model — white 210 / light grey 80 / dark grey 30 / black 15 — so a dithered patch reproduces the average reflectance of the grey it replaces, and the preview paints those four levels at their real relative reflectances (normalised to fill the screen range), so what you judge on screen is the tone the panel will show. Ordered: blue-noise (default, 64x64), bayer (4x4). Error diffusion: Floyd-Steinberg, Atkinson, Jarvis-Judice-Ninke, Stucki, Burkes, and Zhou-Fang (per-intensity kernels + threshold modulation; deterministic here, the reference uses Math.random()). ko-fork hash is the firmware's OWN quantizer, kept verbatim: at 2-bit it assumes the four levels are evenly spaced, which they are not, so its mids read much darker (a luma-170 patch renders at 80); at 1-bit it is the firmware's quantize1bit, which keeps solids solid and measured the least speckle of any model. None = hard threshold (least speckle, least faithful: 1.26% local tone error on a grey-heavy page vs 0.68% for blue noise; Atkinson 1.10% with even less speckle).">
         <span>Image dither <i>이미지 디더링</i></span>
         <select id="imageDither">
           <option value="2" selected>Blue noise (default)</option>
@@ -267,6 +267,6 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
   </aside>
 </main>
 
-<script src="app.js?v=17"></script>
+<script src="app.js?v=18"></script>
 </body>
 </html>

@@ -124,6 +124,52 @@ which is what the firmware does and why it is so clean.
 * **wasm == native.** The browser's export of `demo-images.epub` with defaults: 1,345,804 B,
   14 pages, payload sha `52672f84f2f7` — identical to the host binary's (same size, pages, sha).
 
+## Preview fidelity: how it looks on a PC vs what the panel does
+
+The preview and the file are separate concerns, and only the file has to be device-correct. The
+page stores four levels; the preview paints them, and *that mapping* is what made everything read
+"super bright" on a monitor. It is now a tone-true display transform:
+
+| level | panel reflectance | preview grey (now) | preview grey (before) |
+|---|---|---|---|
+| white | 210 | 255 | 255 |
+| light grey | 80 | **156** | 205 |
+| dark grey | 30 | **78** | 128 |
+| black | 15 | 0 | 0 |
+
+The greys are `sRGB_encode((R - 15) / 195)`, i.e. the panel's own relative reflectances, sRGB-
+encoded so that a monitor's *linear light* reproduces them. The extremes are normalised onto the
+screen's full range on purpose: how dim the panel's paper is, and that its black is a dark grey,
+are properties of the panel, not of the file - and normalising is what keeps the preview legible
+on a backlit screen while staying tone-exact. The old palette was not: it painted the "dark grey"
+state at 4.3x the panel's luminance and the "light grey" at 2.6x.
+
+**Why this is the right test.** The eye integrates *light*, not display codes, so a faithful
+preview must match the panel in linear luminance. `scripts/verify/preview_fidelity.py` scores a
+page straight from its level histogram - no source image needed, because the page's own level mix
+*is* the device's tone:
+
+| exported page | panel truth | preview (now) | preview (before) |
+|---|---|---|---|
+| blue-noise, 4 tones | 130.2 | 130.2 (-0.0) | 139.3 (+9.1) |
+| floyd-steinberg, 4 tones | 130.5 | 130.4 (-0.0) | 139.4 (+9.0) |
+| ko-hash, 4 tones | 133.5 | 133.4 (-0.0) | 144.4 (+10.9) |
+| blue-noise, 2 tones | 199.6 | 199.6 (+0.0) | 199.6 (+0.0) |
+
+Per *level* the old gap was much larger than the page average suggests - a "dark grey" patch read
+57 instead of 30, a "light grey" patch 134 instead of 80; the page average only shows +9 because
+half of it is white, which both palettes render exactly. Under the new palette the error is
+rounding (<=0.1 reflectance units), so the preview can be trusted to judge tone.
+
+Two things this deliberately does **not** change: the exported bytes (the transform is preview-
+only - page payloads are hash-identical before and after), and the 1-bit preview, which was
+already faithful because 1-bit uses the panel's two extremes, and those are normalised in every
+palette. Text also looks the same, since ink and paper are the extremes in both palettes.
+
+If you want to see the panel's *physical* contrast instead (its paper is dimmer than a lit screen
+and its black is a dark grey - 234/152/96/69 on a monitor), that is a third palette and a one-line
+change; it reads flat and hazy on purpose, which is why it is not the default.
+
 ## Where it lives
 
 | piece | change |

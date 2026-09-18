@@ -581,7 +581,22 @@ KO_EXPORT int ko_compose_rgba(int mono) {
   if (g_rgbaOut.size() != 480u * 800u) g_rgbaOut.assign(480u * 800u, 0);
   uint32_t* out = g_rgbaOut.data();
 
-  static constexpr uint32_t kGray32[4] = {0xFFFFFFFFu, 0xFF808080u, 0xFFCDCDCDu, 0xFF000000u};
+  // Preview palette: the four page levels at the PANEL's own relative reflectances (white 210,
+  // light grey 80, dark grey 30, black 15 - the same anchors xtch_writer.h derives the 92%/67%
+  // ink densities from), sRGB-encoded so a monitor's LINEAR light reproduces them:
+  //   v=0 white      (210-15)/195 = 1.000 -> 255
+  //   v=1 dark grey  ( 30-15)/195 = 0.077 ->  78
+  //   v=2 light grey ( 80-15)/195 = 0.333 -> 156
+  //   v=3 black      ( 15-15)/195 = 0.000 ->   0
+  // The extremes are normalised onto the screen's full range deliberately: how dim the panel's
+  // paper is, and that its black is a dark grey, are properties of the panel - not of this file -
+  // and normalising is what makes the preview legible on a bright monitor while staying
+  // tone-exact. A dithered patch then integrates (the eye averages light, not display codes) to
+  // the reflectance the device shows. The previous palette {0,128,205,255} lifted dark grey 4.3x
+  // and light grey 2.6x, so every grey patch read brighter than the panel, and mid-greys looked
+  // washed out; do not restore it. Verify with scripts/verify/preview_fidelity.py.
+  static constexpr uint32_t kGray32[4] = {0xFFFFFFFFu, 0xFF4E4E4Eu, 0xFF9C9C9Cu, 0xFF000000u};
+  // 1-bit: the panel's two extremes (210 and 15), already faithful under the same normalisation.
   static constexpr uint32_t kMono32[2] = {0xFF000000u, 0xFFFFFFFFu};  // indexed by plane bit
   static constexpr uint8_t kLevelByMask[4] = {3, 2, 1, 1};
   const int colBytes = 100;  // physical row width in bytes
