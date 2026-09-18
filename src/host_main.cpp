@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "ko_engine_driver.h"
+#include "external_font_loader.h"   // §7 gate: register KoPub from an EPD2 blob
 #include "xtch_writer.h"
 
 // Phase profiling: where does whole-book conversion actually spend its time?
@@ -102,6 +103,41 @@ int main(int argc, char** argv) {
     }
     else if (flag == "--no-text-aa") spec.textAntiAliasing = 0;
     else if (flag == "--text-aa") spec.textAntiAliasing = 1;
+    else if (flag == "--font" && i + 1 < argc) {
+      const std::string name = argv[++i];
+      if (name == "kopub") spec.fontId = KOPUB_14_FONT_ID;
+      else if (name == "ridibatang") spec.fontId = RIDIBATANG_14_FONT_ID;
+      else { fprintf(stderr, "unknown font '%s' (kopub|ridibatang)\n", name.c_str()); return 2; }
+    } else if (flag == "--kopub-external" && i + 1 < argc) {
+      // §7 acceptance gate: register KoPub from a lossless EPD2 blob through the SAME parser the wasm
+      // uses, instead of the embedded arrays. Any difference in the emitted pages is a parity failure.
+      // Function-local statics on purpose: EpdFont/EpdFontFamily only point into the bundle, so it must
+      // outlive the whole render pass.
+      const std::string blobPath = argv[++i];
+      FILE* bf = fopen(blobPath.c_str(), "rb");
+      if (!bf) { fprintf(stderr, "cannot open %s\n", blobPath.c_str()); return 2; }
+      fseek(bf, 0, SEEK_END);
+      const long bsz = ftell(bf);
+      fseek(bf, 0, SEEK_SET);
+      static std::vector<uint8_t> blobBytes;
+      blobBytes.resize(static_cast<size_t>(bsz));
+      if (fread(blobBytes.data(), 1, blobBytes.size(), bf) != blobBytes.size()) { fclose(bf); return 2; }
+      fclose(bf);
+      static std::unique_ptr<ko::ExternalBuiltinFont> extBundle;
+      std::string err;
+      if (!ko::parseExternalFont(blobBytes.data(), blobBytes.size(), extBundle, err)) {
+        fprintf(stderr, "EPD2 parse failed: %s\n", err.c_str());
+        return 2;
+      }
+      static std::unique_ptr<EpdFont> extFont;
+      static std::unique_ptr<EpdFontFamily> extFamily;
+      extFont = std::make_unique<EpdFont>(&extBundle->data);
+      extFamily = std::make_unique<EpdFontFamily>(extFont.get());
+      renderer.insertFont(KOPUB_14_FONT_ID, extFamily.get());
+      fprintf(stderr, "KoPub registered from blob %s (%zu bytes, glyphs %zu, kern %zu cells)\n",
+              blobPath.c_str(), blobBytes.size(), extBundle->glyphs.size(),
+              extBundle->kernMatrix.size());
+    }
   }
   writer.setTextAa(spec.textAntiAliasing != 0);
 
