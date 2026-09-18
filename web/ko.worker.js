@@ -245,6 +245,16 @@ let lastInteractiveAt = 0;
 function markInteractive() { lastInteractiveAt = Date.now(); }
 const INTERACTIVE_COOLOFF_MS = 120;
 
+// §4 of the 1.4 audit: a 2,000-page XTCH is ~195 MB. Pre-rendering that speculatively and keeping it
+// in the JS heap is a bad mobile trade, so a background warm stops once the RAW projection (the writer
+// accumulates uncompressed pages even for XTZ4) passes this budget. A user-requested export is never
+// capped.
+const WARM_RAW_LIMIT = 64 * 1024 * 1024;
+function estimatedContainerBytes(mode, pages) {
+  const pageBytes = (mode === 0) ? (22 + 48000) : (22 + 96000);
+  return pages * pageBytes;
+}
+
 // A macrotask hop that is NOT clamped: browsers clamp nested setTimeout(0) to ~4 ms, which would add
 // seconds to a whole-book pass. postMessage to our own port yields just as effectively at ~0.1 ms,
 // so a page-turn message can be serviced after every single spine.
@@ -264,7 +274,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '39';
+const FT_MODULE_VERSION = '40';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -344,6 +354,15 @@ function composePage() {
 // frame the user is waiting for. Every guard is re-checked when the task actually runs: if a warm
 // started, the book changed, the spine/page state moved on, or the render key or font stamp changed,
 // a frame rendered now would belong to different state — so it is dropped instead of cached.
+// §2 of the 1.4 audit: an export result is built with an exact ArrayBuffer.slice(), so its buffer is
+// already exactly the payload and can be transferred as-is. Re-slicing it before post() copied the
+// whole output a second time — harmless at 674 KB, hundreds of MB on a large export. The fallback only
+// exists for a future caller that hands over a subview.
+function takeTransferBuffer(u8) {
+  if (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength) return u8.buffer;
+  return u8.slice().buffer;
+}
+
 function schedulePrefetch(spine, page, pages, mono, rk, fStamp, gen) {
   setTimeout(() => {
     if (warmRunning) return;                       // the engine is walking spines
@@ -425,6 +444,10 @@ async function exportWholeBook(opts, onProgress) {
       throw new Error('export spine ' + s + ' failed');
     }
     total += n;
+    if (opts.maxRawBytes && estimatedContainerBytes(opts.mode, total) > opts.maxRawBytes) {
+      const c = cancelCurrentExport(total);     // §4: releases the pages accumulated so far
+      return { cancelled: true, reason: 'too-large', pages: c.pages };
+    }
     // §1: _ko_export_spine() just rebuilt the C++ section_ for THIS spine. Never let JS claim an
     // interactive spine is still built across this point.
     invalidateSectionTracking();
@@ -629,6 +652,9 @@ self.onmessage = async (ev) => {
 
       case 'spec': {
         if (foregroundExportRunning) { post(id, false, { error: 'settings locked during export' }); break; }
+        // §3 of the 1.4 audit: the worker owns this invariant, not the caller. window.__call is
+        // exposed for debugging, so a raw spec during a warm must not change g_spec between spines.
+        await stopWarmBeforeMutation();
         tick('spec');
         markInteractive();
         // margins: viewable area + screenMargin on all four sides (no UI reserve)
@@ -667,13 +693,16 @@ self.onmessage = async (ev) => {
         // settings change is one request too. When it has not changed, this does nothing at all.
         let vpInfo = null;
         if (ev.data.spec) {
+          const incomingSpec = Object.assign(defaultSpec(), ev.data.spec);
+          const changesSpec = renderKey(incomingSpec) !== renderKey(currentSpec || {});
           // §1: a render carrying a CHANGED spec mutates engine state, so it is refused during a
           // foreground export. Navigation with an unchanged (or absent) spec stays fully allowed.
-          if (foregroundExportRunning &&
-              renderKey(currentSpec || {}) !== renderKey(Object.assign(defaultSpec(), ev.data.spec))) {
+          if (changesSpec && foregroundExportRunning) {
             post(id, false, { error: 'settings locked during export' });
             break;
           }
+          // §3: and it must not change g_spec underneath a running warm either
+          if (changesSpec) await stopWarmBeforeMutation();
           if (applySpecIfChanged(ev.data.spec)) vpInfo = viewportInfo(currentSpec);
         }
         const key = layoutKey(currentSpec || {});
@@ -795,6 +824,7 @@ self.onmessage = async (ev) => {
 
       case 'loadFont': {
         if (foregroundExportRunning) { post(id, false, { error: 'font locked during export' }); break; }
+        await stopWarmBeforeMutation();
         // ev.data.epdfont: ArrayBuffer, ev.data.name: string
         tick('loadFont');
         customFontBytes = new Uint8Array(ev.data.epdfont);
@@ -816,6 +846,7 @@ self.onmessage = async (ev) => {
 
       case 'clearFont': {
         if (foregroundExportRunning) { post(id, false, { error: 'font locked during export' }); break; }
+        await stopWarmBeforeMutation();
         customFontBytes = null;
         fontStamp++;
         clearFrameCache();    // §6: frames keyed by the old stamp can never hit again
@@ -848,24 +879,34 @@ self.onmessage = async (ev) => {
           // §3 of the 1.3 audit: the warm carries the spec it is producing, so it does not depend on
           // a preview render having already applied the same settings.
           if (ev.data.spec) applySpecIfChanged(ev.data.spec);
-          const warmMode = ev.data.mode === 0 ? 0 : 1;
-          api._ko_export_set_mode(warmMode);
+          // §1 of the 1.4 audit: this local used to be named warmMode, shadowing the module-level
+          // metadata variable — the assignment further down then threw "Assignment to constant
+          // variable" AFTER the whole book was rendered, so the warm never reported ready.
+          const selectedWarmMode = ev.data.mode === 0 ? 0 : 1;
+          api._ko_export_set_mode(selectedWarmMode);
           // the tone depth must follow the MODE (a 1-bit page packs 2 tones); the warm previously
           // inherited whatever the spec said, so a 1-bit warm could pack 4-level pages into one plane
-          const warmDepth = warmMode === 0 ? 2 : 4;
+          const warmDepth = selectedWarmMode === 0 ? 2 : 4;
           api._ko_set_image_tone_depth(warmDepth);
           if (currentSpec) currentSpec.imageToneDepth = warmDepth;
           const res = await exportWholeBook({
+            mode: selectedWarmMode,
             xtcz: !!ev.data.xtcz,
             cancelCheck: () => myTok < warmToken,   // a newer warm superseded us
             cooloff: true,                          // §4: speculative work yields to the reader
+            maxRawBytes: WARM_RAW_LIMIT,            // §4: never speculate a ~200 MB file
           });
           if (myTok < warmToken) { post(id, true, { warm: 'superseded' }); break; }
-          if (res.cancelled) { post(id, true, { warm: 'cancelled' }); break; }
+          if (res.cancelled) {
+            post(id, true, res.reason === 'too-large'
+              ? { warm: 'skipped-large', pages: res.pages }
+              : { warm: 'cancelled' });
+            break;
+          }
           warmBytes = res.file;
           warmPages = res.pages;
           warmRaw = res.rawBytes || 0;
-          warmMode = ev.data.mode === 0 ? 0 : 1;
+          warmMode = selectedWarmMode;      // module-level metadata
           warmXtcz = !!ev.data.xtcz;
           tock('warm');
           invalidateEngine();
@@ -889,8 +930,7 @@ self.onmessage = async (ev) => {
 
       case 'fetchWarm': {
         if (!warmBytes) { post(id, false, { error: 'no warm bytes' }); break; }
-        const tx = warmBytes.buffer.slice(warmBytes.byteOffset,
-                                          warmBytes.byteOffset + warmBytes.byteLength);
+        const tx = takeTransferBuffer(warmBytes)   // §2: no full-file copy;
         const meta = { pages: warmPages, mode: warmMode, xtcz: warmXtcz, rawBytes: warmRaw };
         warmBytes = null;   // hand over once
         post(id, true, Object.assign({ file: tx }, meta), [tx]);
@@ -947,8 +987,7 @@ self.onmessage = async (ev) => {
         // the next engine render (keeps page flips after export safe)
         invalidateEngine();
         // hand the finished bytes to the app as a transferable for download
-        const tx = res.file.buffer.slice(res.file.byteOffset,
-                                         res.file.byteOffset + res.file.byteLength);
+        const tx = takeTransferBuffer(res.file)     // §2: no full-file copy;
         post(id, true, { file: tx, mode: ev.data.mode === 0 ? 0 : 1,
                          pages: res.pages, spines: res.spines,
                          xtcz: res.xtcz, rawBytes: res.rawBytes }, [tx]);

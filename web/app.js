@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=39');
+    const w = new Worker(base + 'ko.worker.js?v=40');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -834,6 +834,10 @@
       }
       // busy → a previous warm still finishing; it will supersede itself, so
       // just re-schedule once it has had time to stop
+      else if (r && r.warm === 'skipped-large') {
+        // §4: too big to hold speculatively — say so plainly instead of implying a cached file
+        els.exportStatus.textContent = '대용량 도서는 내보낼 때 변환됩니다';
+      }
       else if (r && r.warm === 'busy') scheduleWarm(400);
     } catch (_) { /* engine busy/restarting — try again later */ scheduleWarm(1500); }
     finally { warmKeyAtFire = null; }
