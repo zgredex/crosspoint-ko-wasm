@@ -63,6 +63,52 @@ Blue noise and Zhou–Fang are the most faithful to the 4-level page; Atkinson i
 least faithful of the dithered options, which is what a threshold costs. ko-fork hash is kept
 as a comparison point only — it is visibly the worst on solid black.
 
+## The ko-fork hash entry is the firmware's own, and it reads dark by design
+
+This one is not from the converter - it is the KO fork's own image quantizer, copied verbatim:
+
+* `quantizeNoise` (`lib/GfxRenderer/BitmapHelpers.cpp:71` upstream) -> `koForkHashDither`, the
+  2-bit path. Per pixel it hashes (x,y) and uses the top 8 bits as a random threshold, scaling
+  the luma by 3 so the decision points sit at **even thirds: 85 and 170**.
+* `quantize1bit` (same file) -> `koForkHashDither1Bit`, the 1-bit path: the same hash byte, but
+  the threshold is `128 + (threshold - 128) / 2`, i.e. it spans 64..192 instead of 0..255.
+
+**Why the 2-bit mode looks darker than everything else.** Even thirds are the correct decision
+points for *evenly spaced* output luminances, i.e. `{0, 85, 170, 255}` - the fork's nominal
+palette. The panel's four states are `{15, 30, 80, 210}`: the two greys sit near the dark end, so
+the correct edges are near `{30, 50, 140}` (which is exactly what `quantizeSimple`, and this
+port's dither tables, use). With the edges at 85/170, every tone from 85 upward mixes in the next
+*darker* state far too often. Measured mean reflectance of a flat patch
+(`scripts/verify/ko_hash_tone.py`):
+
+| source luma | ko-hash renders | error | blue-noise renders | error |
+|---|---|---|---|---|
+| 60 | 25.6 | **-34** | 60.1 | +0.1 |
+| 100 | 39.1 | **-61** | 99.8 | -0.2 |
+| 128 | 55.5 | **-73** | 128.2 | +0.2 |
+| 170 | 80.5 | **-90** | 169.9 | -0.1 |
+| 200 | 126.9 | **-73** | 199.8 | -0.2 |
+| 230 | 171.9 | **-58** | 210.0 | -20 |
+
+Mean |error| over all 256 source tones: **54.0** for ko-hash vs **4.6** for blue noise (25.7 for
+a hard threshold). Only pure white and the darkest band come out right. That is the whole
+"darker than the others" effect, and it is inherent to the algorithm - so this mode is kept as a
+fidelity/comparison point, labelled as such in the UI, not offered as a quality choice.
+
+**The 1-bit path now uses the fork's rule too.** The first cut jittered the sample by +/-127 and
+thresholded, which is *not* what the firmware does: it turned 6.6% of pure-black pixels white.
+Measured on the grey-heavy page, old rule -> fork rule:
+
+| 2-tone ko-hash | tone error | ink | pepper/1k | black-level error |
+|---|---|---|---|---|
+| +/-127 jitter (port invention) | 1.37% | 8.10% | 7.1 | 5.75% |
+| `quantize1bit` (the firmware's) | **0.72%** | 8.32% | **2.1** | **0.87%** |
+| blue-noise, for reference | 0.68% | 8.16% | 5.1 | 0.67% |
+
+So at 2 tones the fork's rule is within 0.04% of blue noise on tone with **the least speckle of
+any model**, and solids stay solid. It clips below luma 64 and above 192 to solid black/white,
+which is what the firmware does and why it is so clean.
+
 ## Behaviour invariants (measured)
 
 * **Text is untouched.** `web/demo.epub` (2034 pages): blue-noise vs Floyd–Steinberg differ on

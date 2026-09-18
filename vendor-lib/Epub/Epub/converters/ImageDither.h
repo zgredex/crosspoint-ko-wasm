@@ -44,6 +44,18 @@ inline ImageDitherOptions& imageDitherOptionsRef() {
 inline void setImageDitherOptions(const ImageDitherOptions& o) { imageDitherOptionsRef() = o; }
 inline const ImageDitherOptions& imageDitherOptions() { return imageDitherOptionsRef(); }
 
+// The fork's own 1-bit noise dither, verbatim from BitmapHelpers.cpp:quantize1bit:
+//   adjustedThreshold = 128 + (threshold - 128) / 2      (integer division -> range 64..192)
+//   gray >= adjustedThreshold ? white : black
+// `threshold` is the same hash byte as koForkHashDither. ditherNoise01() returns exactly
+// hash/2^32, so threshold = ditherNoise01(x,y) * 256 is bit-exact (both are powers of two),
+// which keeps this function free of a second copy of the hash.
+inline uint8_t koForkHashDither1Bit(int gray, int x, int y) {
+  const int threshold = static_cast<int>(ditherNoise01(x, y) * 256.0f);
+  const int adjustedThreshold = 128 + ((threshold - 128) / 2);
+  return (gray >= adjustedThreshold) ? 3 : 0;
+}
+
 inline bool isErrorDiffusionMode(DitherMode m) {
   switch (m) {
     case DitherMode::FS:
@@ -89,11 +101,11 @@ class ImageDitherer {
 
       case DitherMode::KO_HASH:
         if (opt_.toneDepth >= 4) return koForkHashDither(gray, x, y);
-        // 2-tone reading of the same hash noise: jitter the sample by +/-127 and threshold.
-        return (static_cast<int>(gray) + static_cast<int>(ditherNoise01(x, y) * 255.0f) - 127 >=
-                static_cast<int>(midTwoTone()))
-                   ? 3
-                   : 0;
+        // 2 tones: the fork's OWN 1-bit rule (BitmapHelpers.cpp:quantize1bit), not an
+        // invention of this port. Same hash, but the noise is halved around 128, so the
+        // effective threshold spans 64..192: solids stay solid. A full-range +/-127 jitter
+        // would turn 6.6% of pure-black pixels white, which the firmware never does.
+        return koForkHashDither1Bit(gray, x, y);
 
       case DitherMode::ZHOU_FANG:
         if (opt_.toneDepth >= 4) return ed_.applyZhouFang(gray, lx, ly, levels, 4);
