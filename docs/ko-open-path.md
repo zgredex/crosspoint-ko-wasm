@@ -97,13 +97,22 @@ not reproduce.
 
 ## The cover image is the biggest remaining cost, and it is decoder-bound
 
-`demo.epub`'s first spine is `cover.jpg` (549 KB). Profile of that one page, host, min of 3:
+`demo.epub`'s first spine is `cover.jpg` (549 KB). In the browser the cover render is **44.3 ms**
+(uncached, min of 3, spec alternated to defeat the frame cache) — about half of that book's 83.5 ms first
+page, and 72× the layout work of a text spine (0.6 ms). With the image hidden the same page renders in
+**0.1 ms**, so the entire cost is the image; the dither is a small share of it.
+
+The split was measured on the host, which is ~4× slower on this page than wasm for reasons not
+investigated (both are `-O3`; only the proportions are used here):
 
 ```
 cover, blue-noise dither   185.10 ms
 cover, no dither           171.50 ms      -> dither share        13.6 ms   (7 %)
 cover, image hidden         18.40 ms      -> decode+scale+write 153.1 ms   (83 %)
 ```
+
+Host absolute numbers and browser absolute numbers are NOT interchangeable; the browser's 44.3 ms is the
+one that describes the product.
 
 The per-pixel callback is already lean (precomputed orientation transform, branchless interior, bilinear
 in fixed point), so the 153 ms is libjpeg-turbo's own decode.
