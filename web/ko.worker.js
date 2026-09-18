@@ -7,9 +7,17 @@
 // Replies {id, ok, ...}. ImageData buffers are transferable copies.
 /* eslint-env worker */
 // §26: generated artifacts are content-addressed (name.<hash8>.ext). The manifest is imported
-// under this worker's own ?v= cache-bust, so it is always as fresh as the worker. If it is missing
-// (e.g. serving web/ without build_dist.sh), the plain names below still work as before.
-importScripts('assets.js' + self.location.search);
+// under this worker's own ?v= cache-bust, so it is always as fresh as the worker.
+//
+// The import MUST be guarded: assets.js only exists in dist/ (fingerprint_assets.py writes it), so
+// when web/ is served directly — `python3 server.py`, which is the documented dev path — a bare
+// importScripts() throws here and kills the worker before any of the plain-name fallbacks below can
+// run. On failure __ASSETS stays undefined and every asset() call degrades to the plain name.
+try {
+  importScripts('assets.js' + self.location.search);
+} catch (_) {
+  self.__ASSETS = {};
+}
 const ASSETS = self.__ASSETS || {};
 const asset = (name) => ASSETS[name] || name;
 
@@ -163,7 +171,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '32';
+const FT_MODULE_VERSION = '33';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {

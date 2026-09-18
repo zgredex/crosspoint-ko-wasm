@@ -21,12 +21,6 @@ body {
   display: flex;
   flex-direction: column;
 }
-
-/* ---- header ---- */
-h1 .dim { color: var(--dim); font-weight: 400; font-size: 13px; margin-left: 8px; }
-/* brand tagline: second line under XTCKO, dim and small */
-h1 .tagline { display: block; color: var(--dim); font-weight: 400;
-  font-size: 11.5px; margin: 2px 0 0 0; letter-spacing: 0.01em; }
 /* step markers for the ①선택 → ②미리보기/조판 → ③내보내기 flow */
 .step { color: var(--dim); font-weight: 400; margin-right: 2px; }
 .status {
@@ -69,7 +63,7 @@ h1 .tagline { display: block; color: var(--dim); font-weight: 400;
 details.help { margin: 2px 0 6px; }
 details.help > summary {
   cursor: pointer; list-style: none; display: inline-flex; align-items: center;
-  justify-content: center; width: 18px; height: 18px; border-radius: 50%;
+  justify-content: center; width: 26px; height: 26px; border-radius: 50%;
   border: 1px solid var(--border); color: var(--dim); font-size: 12px; line-height: 1;
 }
 details.help > summary:hover { border-color: var(--dim); color: var(--ink); }
@@ -78,11 +72,8 @@ details.help > p { margin: 4px 0 8px; }
 .dropActions { margin: 0; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
 .privacy { margin: 10px 0 0; font-size: 12.5px; color: var(--ok, #7ec699); }
 .dropMeta { margin: 4px 0 0; font-size: 12px; color: var(--dim); }
-body:not(.no-book) #emptyState { display: none; }
-/* the second and third steps cannot act before a book is loaded: hide, don't disable */
-body.no-book #controls, body.no-book #exportPanel { display: none; }
-/* keep #canvasScroll (the flex box that centres the placeholder); hide only its contents */
-body.no-book #canvasWrap, body.no-book #pager { display: none; }
+.pickedFile { margin: 10px 0 0; font-size: 12.5px; color: var(--dim);
+              max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 
 /* ---- folded advanced sections (items 3, 11, 15) ---- */
 details.adv { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; }
@@ -92,11 +83,8 @@ details.adv > summary {
 details.adv > summary::before { content: "▸ "; }
 details.adv[open] > summary::before { content: "▾ "; }
 details.adv > summary:hover { color: var(--ink); }
-details.adv[open] > summary { margin-bottom: 6px; }
-
-/* ---- Korean web typography (item 18): no one-syllable orphan lines ---- */
-h1, h2, .hint, .privacy, .dropTitle, .dropMeta, #emptyState,
-.ctrl > span, details.adv > summary, .card p {
+details.adv[open] > summary { margin-bottom: 6px; }/* ---- Korean web typography (item 18): no one-syllable orphan lines ---- */
+h1, h2, .hint, .privacy, .dropTitle, .dropMeta, .ctrl > span, details.adv > summary, .card p{
   word-break: keep-all;
   overflow-wrap: anywhere;
 }
@@ -266,7 +254,7 @@ summary:focus-visible, [tabindex]:focus-visible {
 
 /* buttons that live in a horizontal row (header, segmented rows) lose the
    full-width + top-margin behaviour of column buttons */
-#fileRow .btn, .fileCtrl .btn { width: auto; margin-top: 0; }
+.fileCtrl .btn { width: auto; margin-top: 0; }
 .btn.small { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
 
 /* native file inputs: visually hidden, activated via their <label> */
@@ -292,8 +280,6 @@ summary:focus-visible, [tabindex]:focus-visible {
   justify-content: flex-end;
   flex: 1;
 }
-.segBtn:hover:not(.active) { border-color: var(--dim); color: var(--ink); }
-.segBtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* select kept for state but never shown (segmented buttons drive it) */
 .visHidden { display: none; }
@@ -454,9 +440,6 @@ summary:focus-visible, [tabindex]:focus-visible {
 #exportSub { margin: -4px 0 8px; }
 /* output-mode toggle: vertical full-width segments, same family as presets */
 .exportSeg { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 10px; }
-.exportSeg .segBtn { text-align: center; padding: 7px 10px; }
-.exportSeg .segBtn i { font-style: normal; color: var(--dim); font-size: 11px; margin-left: 5px; }
-.exportSeg .segBtn.active i { color: #bcd8ff; }
 #exportCard .ctrl { gap: 8px; }
 #downloadBtn { margin-top: 6px; }
 .exportStatus {
@@ -506,8 +489,8 @@ body[data-app-state="loaded"] #importScreen { display: none; }
   padding: 26px 24px; text-align: center;
   box-shadow: 0 12px 32px rgba(0, 0, 0, .18);
 }
-#importCard h2 { font-size: 20px; margin: 0 0 6px; text-transform: none;
-                 letter-spacing: 0; color: var(--ink); }
+#importCard h1 { font-size: 20px; margin: 0 0 6px; text-transform: none;
+                 letter-spacing: 0; color: var(--ink); font-weight: 700; }
 #importCard .sub { margin: 0 0 18px; color: var(--dim); font-size: 13.5px; }
 #importCard #dropZone { min-width: 0; }
 
@@ -545,20 +528,23 @@ body[data-app-state="empty"] #workspace { display: none; }
 
 /* ---- one sidebar: settings then export, scrolls on its own ----------- */
 #sidebar {
-  display: flex; flex-direction: column; gap: 12px;
+  display: flex; flex-direction: column;
   width: auto; min-width: 0; max-width: none;
-  overflow-y: auto; overscroll-behavior: contain;
-  padding: 14px 14px 0; background: var(--panel);
+  overflow: hidden;                    /* .sidebarScroll scrolls, the sidebar does not */
+  padding: 0; background: var(--panel);
   border-left: 1px solid var(--border);
 }
-#sidebar > * { flex: 0 0 auto; }
-
-/* ---- §9 sticky export actions: the final action never scrolls away --- */
-.export-actions {
-  position: sticky; bottom: 0;
-  display: flex; flex-direction: column; gap: 8px;
-  padding: 10px 0 12px; margin-top: 4px;
-  background: linear-gradient(180deg, rgba(44, 49, 59, 0), var(--panel2) 26%);
+.sidebarScroll {
+  flex: 1 1 auto; min-height: 0; min-width: 0;
+  overflow-y: auto; overscroll-behavior: contain;
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 14px 14px 12px;
+}
+.sidebarFooter {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px;
+  padding: 10px 14px 12px; background: var(--panel);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -10px 22px rgba(0, 0, 0, .24);
 }
 .exportSummary { margin: 0; font-size: 12.5px; color: var(--dim); }
 .srOnly { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -571,25 +557,32 @@ body[data-app-state="empty"] #workspace { display: none; }
   #previewPane { min-height: calc(100vh - var(--appbar-h)); }
   #sidebar {
     position: fixed; top: var(--appbar-h); right: 0; bottom: 0;
-    width: min(360px, 85vw); z-index: 40; padding-bottom: 0;
+    width: min(360px, 85vw); z-index: 40;
     transform: translateX(102%); transition: transform .18s ease;
     box-shadow: -14px 0 34px rgba(0, 0, 0, .38);
   }
   body.drawer-open #sidebar { transform: none; }
-  .drawerBackdrop { position: fixed; inset: var(--appbar-h) 0 0 0; z-index: 35;
-                    background: rgba(0, 0, 0, .45); border: 0; }
+  .drawerBackdrop { position: fixed; inset: 0; z-index: 35;
+                    background: rgba(0, 0, 0, .5); border: 0; }
   body:not(.drawer-open) .drawerBackdrop { display: none; }
-  .export-actions { position: static; background: none; }
   .btn, .fileBtn, .chapter select, .ctrl select, .ctrl input[type=range] { min-height: 34px; }
-  .privacy, .dropMeta, .hint { font-size: 13px; }
-}
+  .privacy, .dropMeta, .hint { font-size: 13px; }}
 
 /* ---- mobile (<760 px): preview first, settings behind the drawer ---- */
 @media (max-width: 760px) {
   /* single row keeps the bar <= 72 px; the title truncates instead of wrapping to a second row */
-  #appbar { grid-template-columns: auto minmax(0, 1fr) minmax(0, auto) auto; padding: 5px 12px; }
+  /* §9: status leaves the grid so the title keeps the width — XTCKO | title… | 변경 */
+  #appbar { grid-template-columns: auto minmax(0, 1fr) auto; padding: 5px 12px; }
   #appbar .brandSub { display: none; }
   .bookTitle { grid-column: auto; font-size: 13px; }
+  #appbar #status {
+    position: fixed; left: 12px; right: 12px; bottom: 12px; top: auto; z-index: 60;
+    margin: 0; padding: 10px 12px; text-align: left; white-space: normal;
+    max-width: none; overflow: visible; text-overflow: clip; font-size: 12.5px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 12px 28px rgba(0, 0, 0, .45);
+  }
+  body:not(.status-active) #appbar #status { display: none; }
   #importScreen { padding: 16px; }
   #previewPane { min-height: calc(100vh - var(--appbar-h) - 6px); }
   #pager.preview-toolbar { justify-content: space-between; }
@@ -600,16 +593,14 @@ body[data-app-state="empty"] #workspace { display: none; }
   #pager.preview-toolbar button, #pager.preview-toolbar select,
   #pager.preview-toolbar input[type=range], #appbar button, #sidebar button, #sidebar select,
   #sidebar input[type=range], #importScreen .fileBtn, .fileBtn { min-height: 40px; }
-  details.help > summary { width: 28px; height: 28px; }   /* WCAG 2.5.8 target size */
   .ctrl.check { padding: 10px 0; }
   .ctrl input[type=checkbox] { width: 20px; height: 20px; }
-  #sidebar { width: min(360px, 92vw); }
-}
+  #sidebar { width: min(360px, 92vw); }}
 
 @media (max-width: 480px) {
   #importCard, #dropZone { min-width: 0; width: 100%; }
   #importCard { padding: 18px 14px; }
-  #importCard h2 { font-size: 17px; }
+  #importCard h1 { font-size: 17px; }
   #appbar .brandSub { display: none; }
   .tbField .tbLabel { display: none; }
   .scaleCtrl input[type=range] { width: 52px; }
@@ -617,5 +608,4 @@ body[data-app-state="empty"] #workspace { display: none; }
   #pageInfo { min-width: 54px; }
   #pager #pageStatus { display: none; }   /* the toolbar counter already shows the position */
   .ctrl { flex-wrap: wrap; }
-  .ctrl.stacked input[type=text] { width: 100%; }
-}
+  .ctrl.stacked input[type=text] { width: 100%; }}

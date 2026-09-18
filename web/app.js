@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=32');
+    const w = new Worker(base + 'ko.worker.js?v=33');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -186,6 +186,9 @@
     }
   }
 
+  // §9: below 760 px #status is a toast, so a success message should not sit there forever and
+  // eat the bottom of a phone screen. On desktop the class toggles nothing and the line persists.
+  var statusTimer = 0;
   function setStatus(msg, isErr) {
     // A polite region for progress, assertive for failures (item 4). Toggling aria-live is the
     // supported way to raise severity on one region without double-announcing the message.
@@ -194,6 +197,11 @@
     // long titles truncate in the header — hover reveals the full message
     els.status.title = (msg || '').replace(/\s+/g, ' ').trim();
     els.status.className = 'status' + (isErr ? ' err' : ' ok');
+    document.body.classList.add('status-active');
+    clearTimeout(statusTimer);
+    if (!isErr) {
+      statusTimer = setTimeout(() => document.body.classList.remove('status-active'), 4000);
+    }
   }
 
   async function bootEngine() {
@@ -651,12 +659,22 @@
       setStatus('EPUB 파일만 열 수 있습니다.', true);
       return;
     }
-    // reflect the chosen file on the picker label (native "no file chosen" text
-    // belongs to the hidden input — the label is what the user sees)
-    const lab = document.querySelector('label[for=epubFile]');
-    if (lab) lab.textContent = normalizeDisplayText(f.name);
+    // §4: the button label stays "EPUB 파일 선택". It used to be replaced by the filename, which
+    // turned the primary action into a multi-line block for a long Korean name — and left it that
+    // way permanently if parsing then failed. The name goes in its own one-line ellipsized field.
+    const picked = document.getElementById('pickedFile');
+    if (picked) {
+      picked.textContent = '선택됨: ' + normalizeDisplayText(f.name);
+      picked.hidden = false;
+      picked.title = normalizeDisplayText(f.name);
+    }
     f.arrayBuffer().then((buf) => loadBook(buf, f.name));
   }
+
+  // §3: the picker does not fire change when the same path is chosen again (e.g. the user
+  // replaced the EPUB on disk and reopened it), so clear the input as the dialog opens. Clearing
+  // the value does not touch the currently loaded book, and cancelling still changes nothing.
+  els.file.addEventListener('click', () => { els.file.value = ''; });
 
   els.file.addEventListener('change', () => {
     startLoad(els.file.files && els.file.files[0]);
@@ -1240,27 +1258,72 @@
   drawerBackdrop.hidden = true;
   document.body.appendChild(drawerBackdrop);
 
-  function setDrawer(open) {
-    const isOpen = document.body.classList.toggle('drawer-open', !!open);
+  // §7: below 1150 px this is visually modal — a dark backdrop blocks the preview, focus is moved
+  // inside and Escape closes it — so it is now semantically modal too: role=dialog + aria-modal,
+  // the background is inert, and Tab is contained. Before this a keyboard user could tab behind the
+  // visible panel. §5: opened from 내보내기 it focuses the export action, not the first setting.
+  // §6: focus returns to whichever control opened it, not always to 설정.
+  const drawerOverlay = () => window.matchMedia('(max-width: 1150px)').matches;
+  const drawerFocusables = () => Array.from(els.sidebar.querySelectorAll(
+    'button:not([disabled]), select:not([disabled]), input:not([disabled]), summary, [href]'
+  )).filter((el) => el.offsetParent !== null);
+  let drawerReturnFocus = null;
+
+  function setDrawer(open, opener, focusTarget) {
+    const isOpen = !!open;
+    document.body.classList.toggle('drawer-open', isOpen);
     els.drawerToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
     drawerBackdrop.hidden = !isOpen;
+    const appbar = document.getElementById('appbar');
+    const preview = document.getElementById('previewPane');
     if (isOpen) {
-      const first = els.sidebar.querySelector('select, input, button, summary');
-      if (first) first.focus({ preventScroll: true });
+      if (opener) drawerReturnFocus = opener;
+      if (drawerOverlay()) {
+        els.sidebar.setAttribute('role', 'dialog');
+        els.sidebar.setAttribute('aria-modal', 'true');
+        if (appbar) appbar.setAttribute('inert', '');
+        if (preview) preview.setAttribute('inert', '');
+      }
+      const target = focusTarget || drawerFocusables()[0];
+      if (target) target.focus({ preventScroll: true });
+    } else {
+      els.sidebar.removeAttribute('role');
+      els.sidebar.removeAttribute('aria-modal');
+      if (appbar) appbar.removeAttribute('inert');
+      if (preview) preview.removeAttribute('inert');
+      // remove inert before restoring focus, or the opener cannot take it
+      const back = drawerReturnFocus || els.drawerToggle;
+      drawerReturnFocus = null;
+      back.focus({ preventScroll: true });
     }
   }
-  els.drawerToggle.addEventListener('click', () => setDrawer(!document.body.classList.contains('drawer-open')));
-  drawerBackdrop.addEventListener('click', () => { setDrawer(false); els.drawerToggle.focus(); });
+
+  els.drawerToggle.addEventListener('click', (e) =>
+    setDrawer(!document.body.classList.contains('drawer-open'), e.currentTarget));
+  drawerBackdrop.addEventListener('click', () => setDrawer(false));
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && document.body.classList.contains('drawer-open')) {
+    if (!document.body.classList.contains('drawer-open')) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
       setDrawer(false);
-      els.drawerToggle.focus();
+      return;
+    }
+    if (e.key === 'Tab' && drawerOverlay()) {          // contain focus inside the open drawer
+      const f = drawerFocusables();
+      if (!f.length) return;
+      const first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     }
   });
-  els.exportJump.addEventListener('click', () => {
-    setDrawer(true);
-    const card = document.getElementById('exportPanel');
-    if (card && card.scrollIntoView) card.scrollIntoView({ block: 'end' });
+  els.exportJump.addEventListener('click', (e) => {
+    // the user asked for export: put focus on the export action itself
+    setDrawer(true, e.currentTarget, els.downloadBtn && !els.downloadBtn.disabled ? els.downloadBtn : null);
   });
 
   // ---- boot ----
@@ -1273,8 +1336,12 @@
   hasFontBackend();   // one probe: is the server-side converter deployed here?
   worker = spawnWorker();
   // The engine init is deferred to an idle slot so the picker paints without waiting on the
-  // ~7 MB wasm. Safe: ko.worker.js awaits its own initPromise before handling any command, so
-  // early calls simply queue, and the ?epub= dev path below awaits this same promise.
+  // §10: be precise about what this defers. spawnWorker() already ran, and ko.worker.js starts
+  // its own init() as soon as it is constructed — so the ~7 MB wasm fetch/instantiate begins
+  // immediately, in the background, and this callback only delays the readiness probe (the ping
+  // that populates the status line). That is deliberate: the worker's network fetch does not block
+  // the importer, and warming the engine early is worth it. It is NOT a startup
+  // optimisation, and it is not claimed as one.
   const bootEngineWhenIdle = () => new Promise((done) => {
     const start = () => { bootEngine().catch((e) => reportError(e, '엔진 시작')).then(done); };
     if (window.requestIdleCallback) requestIdleCallback(start, { timeout: 1500 });
