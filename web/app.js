@@ -59,7 +59,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=61');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=64');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -164,6 +164,9 @@
     run: (mode, xtcz, engines) => pooledExportBook(mode === 0 ? 0 : 1, !!xtcz, null, engines),
     size: () => poolSize(book ? book.spineCount : 1),
     engines: () => poolEngines.length,
+    kill: () => killPool(),
+    identity: (engines) => poolIdentity(engines || poolSize(book ? book.spineCount : 1)),
+    fontGeneration: () => (customFontAsset ? customFontAsset.generation : 0),
   };
 
   // ---- the export engine ------------------------------------------------------
@@ -196,7 +199,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=61');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=64');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -784,6 +787,12 @@
     // and kept nothing, so the export engine could be told font:"custom" while owning no such font.
     const retained = meta._bytes.slice(0);
     customFontAsset = { name: meta.name, bytes: retained, generation: ++customFontGeneration };
+
+    // Every pooled engine is holding the PREVIOUS face. Destroying the pool is cheaper and easier to
+    // reason about than broadcasting a font to N speculative engines: the next pooled export rebuilds
+    // them and restores the current asset, which is the path that is already verified. The export
+    // engine keeps its hot-sync, because it exists for the download path and is one engine, not N.
+    killPool();
 
     const previewBytes = retained.slice(0);
     const r = await call('loadFont', { epdfont: previewBytes, name: meta.name }, [previewBytes]);
@@ -1492,6 +1501,18 @@
   let poolEngines = [];            // [{ call, kill, loaded, busy }]
   let poolKey = null;              // book identity the current pool was built for
 
+  // What a pool is a FUNCTION OF. An engine holds two pieces of state from outside the per-call spec:
+  // the book (load) and the font bytes (loadFont). Everything else — margins, line compression, image
+  // handling, tone depth, output mode — arrives with each encodeSpine call and is applied by the
+  // worker, so it cannot make one pool stale relative to another. The font generation must be part of
+  // the identity because a converted .epdfont is regenerated whenever the face, size or weight changes:
+  // without it, a pool built before a regeneration kept exporting with the previous face while every
+  // other engine had the new one — the same class of silent divergence as the split export worker,
+  // just spread across N speculative engines.
+  function poolIdentity(engineCount) {
+    return [bookEpoch, customFontAsset ? customFontAsset.generation : 0, engineCount].join(':');
+  }
+
   function poolSize(spineCount) {
     const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
     // One engine fewer than the machine has, so the reader's own engine and the compositor keep a
@@ -1506,7 +1527,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=61');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=64');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };
@@ -1558,7 +1579,7 @@
     // explicitly requested size is honoured even at 1, because measuring the pool against itself
     // (its own overhead, with no parallelism) is how the scaling numbers below stay honest.
     if (!forceEngines && want < 2) return [];
-    const key = bookEpoch + ':' + want;
+    const key = poolIdentity(want);
     if (poolKey === key && poolEngines.length === want) return poolEngines;
     killPool();
     const engines = [];

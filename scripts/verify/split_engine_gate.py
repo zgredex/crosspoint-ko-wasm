@@ -136,6 +136,18 @@ def main():
             fails.append(f'{why}: found {needle!r}')
 
     print()
+    print('-- a reused pool must not hold a previous font (finding 1) --')
+    # The pool key has to cover everything an engine keeps as state across calls: the book and the font
+    # bytes. Book identity alone let a regenerated face keep exporting the old one.
+    in_function(app, 'poolIdentity', 'customFontAsset ? customFontAsset.generation : 0',
+                'the pool identity includes the font generation')
+    in_function(app, 'ensurePool', 'poolIdentity(want)', 'ensurePool keys on that identity')
+    in_function(app, 'applyCustomFont', 'killPool()', 'a new canonical face destroys the pool')
+    # and it must be destroyed rather than hot-synced: N speculative engines are cheaper to rebuild
+    in_function(app, 'spawnPoolEngine', 'customFontAsset.bytes.slice(0)',
+                'a rebuilt pool restores the current font')
+
+    print()
     print("-- the export engine must not race the reader's first page --")
     in_function(app, 'loadBook', 'requestIdleCallback(prepExport', 'engine preparation waits for idle time')
 

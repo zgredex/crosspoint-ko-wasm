@@ -101,3 +101,84 @@ async function splitEngineProbe() {
   return out;
 }
 splitEngineProbe();
+
+// ---------------------------------------------------------------------------------------------
+// Finding 1: a reused pool must not keep exporting a previous custom face.
+//
+// The pool's engines hold the book AND the font bytes; everything else arrives per call. So the
+// identity of a pool has to include the font generation, and a new canonical face must destroy the
+// pool. Measured before the fix: after regenerating the font, ensurePool() matched on
+// (bookEpoch, engineCount) alone and returned the OLD engines, which still had the old .epdfont
+// loaded — a successful export with the previous face.
+//
+// Page counts are NOT the discriminator here: on an image-heavy book both faces paginate identically
+// (that is how the split-engine bug survived its first test). The check is the byte hash.
+async function poolFontProbe(fontAPath, fontBPath) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const sha = async (ab) => {
+    const b = new Uint8Array(ab), m = b.slice();
+    for (let i = 296; i < 304; i++) m[i] = 0;
+    const d = await crypto.subtle.digest('SHA-256', m);
+    return [...new Uint8Array(d)].map((x) => x.toString(16).padStart(2, '0')).join('').slice(0, 24);
+  };
+  const setFont = async (path) => {
+    const buf = await (await fetch(path)).arrayBuffer();
+    const dt = new DataTransfer();
+    dt.items.add(new File([buf], path, { type: 'font/ttf' }));
+    const radio = [...document.querySelectorAll('input[type=radio]')]
+      .find((r) => /사용자|custom/i.test(r.closest('label')?.textContent || ''));
+    if (radio) { radio.checked = true; radio.dispatchEvent(new Event('change', { bubbles: true })); }
+    const input = document.getElementById('fontFile');
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    for (let i = 0; i < 30; i++) {
+      await sleep(1000);
+      if (/활성/.test(document.getElementById('fontConvStatus')?.textContent || '')) break;
+    }
+    // one more tick so the conversion's applyCustomFont has run and the pool is gone
+    await sleep(500);
+    return window.__pool.fontGeneration();
+  };
+
+  const out = {};
+  out.generationStart = window.__pool.fontGeneration();
+
+  // A
+  out.genA = await setFont(fontAPath);
+  const a = await window.__pool.run(1, false, 4);
+  out.A = { sha: await sha(a.file), pages: a.pages };
+
+  // KoPub, for the "custom != built-in" limb
+  const k = await window.__export.call('exportBook', { spec: { font: 'kopub' }, mode: 1, xtcz: false }, null, 120000);
+  out.kopub = { sha: await sha(k.file), pages: k.pages };
+  out.A_differs_from_kopub = out.A.sha !== out.kopub.sha ? 'PASS' : 'FAIL — custom A exported as KoPub';
+
+  // B, regenerated through the app's own path
+  const genBeforeB = window.__pool.fontGeneration();
+  out.genB = await setFont(fontBPath);
+  out.generation_advanced = out.genB > genBeforeB ? 'PASS (' + genBeforeB + ' -> ' + out.genB + ')'
+                                                  : 'FAIL — generation did not advance';
+  out.pool_destroyed_on_new_font = window.__pool.engines() === 0
+    ? 'PASS' : 'FAIL — ' + window.__pool.engines() + ' engines survived the new face';
+
+  const b = await window.__pool.run(1, false, 4);
+  out.B = { sha: await sha(b.file), pages: b.pages };
+  out.B_differs_from_A = out.B.sha !== out.A.sha
+    ? 'PASS' : 'FAIL — B exported the bytes of A (stale pool: ' + out.B.sha + ')';
+  out.B_differs_from_kopub = out.B.sha !== out.kopub.sha ? 'PASS' : 'FAIL';
+
+  // destroy/rebuild: B before the rebuild must equal B after it
+  window.__pool.kill();
+  await sleep(300);
+  const b2 = await window.__pool.run(1, false, 4);
+  const shaB2 = await sha(b2.file);
+  out.B_stable_across_rebuild = shaB2 === out.B.sha
+    ? 'PASS — ' + shaB2 : 'FAIL — before ' + out.B.sha + ' vs after ' + shaB2;
+
+  out.VERDICT = [out.generation_advanced, out.pool_destroyed_on_new_font, out.A_differs_from_kopub,
+                 out.B_differs_from_A, out.B_differs_from_kopub, out.B_stable_across_rebuild]
+    .every((v) => /^PASS/.test(v || '')) ? 'PASS — pool font identity verified' : 'FAIL — see the fields';
+  return out;
+}
+// poolFontProbe('__probeA.ttf', '__probeB.ttf');
+

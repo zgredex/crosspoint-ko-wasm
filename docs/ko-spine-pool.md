@@ -75,3 +75,52 @@ the pool as the default with `hw - 1` engines would make small books *slower* th
 Process a pooled export in two phases, and if the record copy becomes the bottleneck, the fix is a
 spine-range pipeline between workers and the assembler — not a faster writer, since the writer is ~2%
 of the work.
+
+## Finding 1: a reused pool could hold a previous custom face
+
+The pool key was `bookEpoch:engineCount`. An engine keeps two things as state across calls — the book
+(`load`) and the font bytes (`loadFont`); everything else arrives with each `encodeSpine` call. Leaving
+the font out of the key meant this sequence reused a stale pool:
+
+```
+build a 4-engine pool while font generation 1 is canonical
+regenerate the font (face / size / weight change) -> generation 2
+preview and the export engine get generation 2
+pool is untouched, its engines still hold generation 1
+pooledExportBook() -> ensurePool() matches on (bookEpoch, 4) -> REUSES it
+-> a successful export with the previous face
+```
+
+Fixed by making the pool's identity what it always should have been — everything an engine holds as
+state — and by destroying rather than hot-syncing:
+
+```js
+function poolIdentity(engineCount) {
+  return [bookEpoch, customFontAsset ? customFontAsset.generation : 0, engineCount].join(':');
+}
+```
+
+`applyCustomFont()` now calls `killPool()`. Broadcasting a regenerated face into N speculative engines
+is more code and more state to reason about than rebuilding them on the next export, which already
+restores the current asset through the verified path. The single export engine keeps its hot-sync: it
+serves the download path and is one engine, not N.
+
+### Measured, with the fix and without it
+
+`web/demo-images.epub`, pool of 4. A = Courier New, B = Times New Roman, both regenerated through the
+app's own UI path:
+
+| | fixed | original code |
+|---|---|---|
+| generation advances on the new face | 1 → 2 | 1 → 2 |
+| engines still alive after the new face | **0** (pool destroyed) | **4** (stale pool) |
+| export with B | `93729a2eb590afadc79c8efa` | `087fedac07e8cd896901e6a5` = **A's bytes** |
+| export with B after kill + rebuild | `93729a2eb590afadc79c8efa` (same) | n/a |
+| B differs from KoPub | yes (`8e3eb3910d2c7953`) | — |
+
+**Every row had 13 pages.** A page-count assertion — the first thing the original split-engine test
+tried — passes on the broken build. The byte hash is the only check here that discriminates.
+
+The regression lives in `scripts/verify/split_engine_probe.js` (`poolFontProbe`) and was run against
+both builds: it passes with the fix and reports `B == A (stale pool reproduced)` without it. The static
+half (`scripts/verify/split_engine_gate.py`) fails by name on both removed lines.
