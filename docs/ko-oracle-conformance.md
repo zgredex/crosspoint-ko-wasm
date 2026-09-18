@@ -146,25 +146,54 @@ clock, and the web app writes the book's **real TOC chapter names** where the ho
 `Chapter N`. Neither changes a pixel; both are visible if you `cmp` the two files, which is
 why they are written down instead of being left for someone to rediscover.
 
-## 5. Image pages — the one place pixels legitimately differ
+## 5. Image pages — where pixels legitimately differ
 
-The 71 differing pages are exactly the pages that carry an image, and the reason is a device
-policy the port deliberately does not have:
+Image pixels are exempt from the gate, and the attribution took two attempts. Writing down
+the wrong first answer here would be worse than writing nothing, so here is the measurement:
+
+**JPEG (`demo-images.epub`, 13 pages).** 9 pages differ, and the 9 are exactly the image
+pages. Two separable residues, visible in the ink counts:
+
+- *page 2, plane 1*: ink **18,508 vs 18,508** — the same amount of ink, 1,914 bytes in a
+  different place. Same density, different pattern ⇒ a different **dither implementation**
+  (upstream `applyBayerDither4Level` vs the port's ordered/blue-noise models,
+  `docs/ko-image-dither-models.md`).
+- *page 3, plane 1*: ink **54,700 vs 53,092** — a different amount of ink ⇒ a different
+  **decoded gray level**, i.e. the decoder itself (upstream JPEGDEC vs libjpeg-turbo; two
+  integer IDCTs are not required to agree).
+
+Switching the port to Bayer (`--image-dither 1`) does **not** remove the difference, which is
+how the decoder was separated from the dither rather than assumed. The oracle log contains
+**zero** refusals on this book, so device policy explains none of it.
+
+**PNG (`demo-png.epub`, 13 pages).** Byte-identical, every plane — and the reason matters
+more than the result: the reference build *substitutes the port's* PNG converter (PNGdec has
+no host implementation), so both sides run the same code. That proves the port is
+deterministic and its PNG path is stable; it is **not** evidence that the reference's PNGdec
+path agrees. Stated as the limitation it is.
+
+**The reference refuses oversized images (`web/demo.epub`).** Every image in that book exceeds
+the device budget:
 
 ```
 [ERR][IMG] Image too large (1795x2657 = 4769315 pixels JPEG), max supported: 3145728 pixels
 [ERR][IMG] Failed to decode image: /.crosspoint/epub_.../img_0_0.jpg
 ```
 
-The reference refuses oversized images (RAM policy for the ESP32-C3) and draws its
-placeholder rectangle — the oracle pages carry exactly 2,294 ink bits, which is that
-placeholder, on every refused page. The port renders the image. See
-`docs/ko-jpeg-libjpeg-port.md` for the decoder replacement, and `docs/ko-png-libpng-port.md`
-for PNG.
+The reference draws its placeholder (exactly 2,294 ink bits on every refused page) and the port
+renders the image. See `docs/ko-jpeg-libjpeg-port.md` and `docs/ko-png-libpng-port.md`.
 
 So the gate asserts **layout** on image pages and exempts **pixels** there, and it enforces a
-zero-tolerance rule that makes the exemption narrow: if a page without an image differs, the
-gate fails. The exemption is a policy difference, not a licence.
+zero-tolerance rule that keeps the exemption narrow: if a page without an image differs, the
+gate fails — on every fixture, whether or not the reference refused anything. Refusal is a
+reason to print, never a precondition for looking; a gate that only compared pixels when a
+refusal happened to be present would fail image books on the wrong grounds.
+
+| fixture | pages | differing | all differing pages carry an image |
+|---|---|---|---|
+| `demo-images.epub` | 13 | 9 | yes (0 refusals) |
+| `demo-png.epub` | 13 | 0 | — (byte-identical; see the substitution caveat) |
+| `web/demo.epub` | 1,690 | 71 | yes (8 refusals) |
 
 ## 6. Reference geometry, and why the export now carries a status-bar reservation
 
@@ -235,7 +264,11 @@ relocated, not re-derived).
 
 Stated rather than glossed:
 
-- **Pixels on image pages** (§5) — reference refusals and a different JPEG/PNG implementation.
+- **Pixels on image pages** (§5) — two causes: the port's own decode+dither path, and the
+  reference's refusal of oversized images. Layout is asserted there; pixels are not.
+- **Fixture list is not exhaustive**: one generated Korean prose book per layout feature and
+  three real books. Books that trip CJK edge cases not present here are exactly what the
+  `ko-*.epub` fixtures were built to make cheap to extend.
 - **Orientation** — the firmware's four orientation modes remain parked; the export is
   portrait only.
 - **Reference-internal state the host cannot reproduce**: PXC pixel cache behaviour

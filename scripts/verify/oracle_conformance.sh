@@ -86,7 +86,10 @@ note "oracle  $(shasum -a 256 "$ORACLE_BIN" | cut -c1-16)"
 
 FIXTURES="$FIXTURES_OVERRIDE"
 if [ -z "$FIXTURES" ]; then
-  FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub web/demo.epub"
+  # Text fixtures first (their contract is total), then the image-bearing books: those are
+  # where layout has to agree across image blocks and page breaks, and where the pixel
+  # exemption is exercised rather than assumed.
+  FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub web/demo-images.epub web/demo-png.epub web/demo.epub"
   [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub"
 fi
 
@@ -168,21 +171,23 @@ for fx in $FIXTURES; do
     continue
   fi
 
-  # Planes. The port renders images the reference refuses (device RAM policy), so pages the
-  # reference logged a refusal for are reported instead of asserted.
+  # Planes. Pixels on pages that carry an image are exempt (the port's decode+dither path is
+  # deliberately its own); everything else must match. The rule is applied whenever the
+  # containers differ, whether or not the reference refused an image — refusal is a REASON to
+  # print, never a precondition for looking. Without this, an image book whose pixels differ
+  # for the dither/decoder reason alone would be rejected for lack of a refusal, which is a
+  # gate failing on the wrong grounds.
   refused=$(grep -c "Image too large" "$WORK/$name.oracle.log" || true)
   if cmp -s "$WORK/$name.port.xtch" "$WORK/$name.oracle.xtch"; then
     ok "$name: containers byte-identical (all planes, all pages)"
-  elif [ "$refused" -gt 0 ]; then
+  else
     summary=$(python3 scripts/verify/container_diff.py "$WORK/$name.oracle.xtch" "$WORK/$name.port.xtch" 2>&1)
     echo "$summary" | head -4 | sed 's/^/     /'
-    # Recount with a zero-tolerance rule for text pages: the differing pages must all be
-    # pages that carry an image, and the reference must have refused one of its images.
-    # Indices here are GLOBAL container page numbers, taken in the same order the manifest
-    # was recorded, so a text page cannot hide behind a per-spine page number that happens
-    # to be reused by an image page in another chapter. The alignment itself is asserted:
-    # if the manifest and the containers disagree on how many pages exist, the comparison
-    # is meaningless and says so instead of passing.
+    # Indices are GLOBAL container page numbers, in the same order the manifest was recorded,
+    # so a text page cannot hide behind a per-spine page number that happens to be reused by an
+    # image page in another chapter. The alignment itself is asserted: if the manifest and the
+    # containers disagree on how many pages exist, the comparison is meaningless and says so
+    # instead of passing.
     python3 - "$WORK/$name.port.json" "$WORK/$name.oracle.xtch" "$WORK/$name.port.xtch" <<'PY'
 import json, sys
 sys.path.insert(0, 'scripts/verify')
@@ -211,13 +216,10 @@ sys.exit(0)
 PY
     dup=$?
     if [ "$dup" -eq 0 ]; then
-      ok "$name: every text page byte-identical; $(grep -c 'Image too large' "$WORK/$name.oracle.log") reference image refusal(s) explained"
+      ok "$name: every text page byte-identical; ${refused} reference image refusal(s), image pixels exempt"
     else
       bad "$name: a page WITHOUT an image differs — that is a pixel divergence, not policy"
     fi
-  else
-    bad "$name: containers differ with no reference image refusal to explain it"
-    python3 scripts/verify/container_diff.py "$WORK/$name.oracle.xtch" "$WORK/$name.port.xtch" 2>&1 | head -8 | sed 's/^/     /'
   fi
 done
 

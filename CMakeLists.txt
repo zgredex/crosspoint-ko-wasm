@@ -173,10 +173,15 @@ set(STUB_SOURCES
 #
 # Consequences for the gate, stated instead of glossed:
 #   * text is compared byte-for-byte (planes included);
-#   * JPEG images are compared the same way, decoder and all;
-#   * PNG images are compared on LAYOUT only — two different PNG decoders agree on
-#     dimensions and pixels, but that is a claim, not a measurement, so it is not
-#     gated as one.
+#   * LAYOUT (page count, line breaks, word x, image rects, visible-text offsets) is compared
+#     for every page on every fixture;
+#   * PIXELS on pages that carry an image are exempt, for two measured reasons: the dither
+#     implementation differs (upstream applyBayerDither4Level vs the port's models —
+#     docs/ko-image-dither-models.md) and the JPEG decode differs (JPEGDEC vs libjpeg-turbo).
+#     demo-images.epub separates them: one page has equal ink in a different pattern, another
+#     has a different ink count. 0 refusals there, so device policy explains none of it.
+#   * the exemption is NARROW: a page with no image that differs fails the gate, on every
+#     fixture, whether or not the reference refused anything.
 if(KO_ENGINE_ROOT)
   set(_port_vl ${CMAKE_CURRENT_SOURCE_DIR}/vendor-lib)
   set(_substitutions
