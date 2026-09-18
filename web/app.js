@@ -59,7 +59,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=65');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=66');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -166,7 +166,10 @@
   // built, whether pooled bytes equal serial bytes) is not visible from the page otherwise.
   window.__pool = {
     run: (mode, xtcz, engines) => pooledExportBook(mode === 0 ? 0 : 1, !!xtcz, null, engines),
-    size: () => poolSize(book ? book.spineCount : 1),
+    // The size the PRODUCT would choose for a foreground export, not the automatic maximum: reporting
+    // the maximum here made the hook disagree with the app and read as a bug in the sizing policy.
+    size: () => chooseForegroundPoolSize(),
+    sizeIfUnbounded: () => poolSize(book ? book.spineCount : 1),
     engines: () => poolEngines.length,
     kill: () => killPool(),
     identity: (engines) => poolIdentity(engines || poolSize(book ? book.spineCount : 1)),
@@ -203,7 +206,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=65');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=66');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -1540,7 +1543,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=65');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=66');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };
