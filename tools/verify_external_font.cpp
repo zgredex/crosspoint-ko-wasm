@@ -105,7 +105,9 @@ int main(int argc, char** argv) {
     // value written as a rule; RIDIBatang's U+AC00 is 444, equally fractional, and the constant was
     // the only reason that face could not be verified at all.
     check(g.advanceX == orig.glyph[uac00].advanceX, "U+AC00 advanceX equals the embedded value");
-    check(g.advanceX % 16 != 0, "U+AC00 advanceX is fractional (not a whole pixel count)");
+    // No fractional requirement: 12.4 fixed point represents whole-pixel advances exactly too, and
+    // the UI face legitimately has them (288 = 18 px). Equality with the embedded face is the
+    // property that matters; "fractional" was a stand-in that only held for the reader faces.
   }
 
   // ---- bitmap ----

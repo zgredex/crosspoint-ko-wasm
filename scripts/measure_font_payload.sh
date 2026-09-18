@@ -52,6 +52,5 @@ build_variant() {
 
 build_variant no-kopub      -DKO_EMBED_KOPUB=OFF
 build_variant no-ridi       -DKO_EMBED_RIDI=OFF
-build_variant no-pretendard -DKO_EMBED_PRETENDARD=OFF
-build_variant core          -DKO_EMBED_RIDI=OFF -DKO_EMBED_KOPUB=OFF -DKO_EMBED_PRETENDARD=OFF
+build_variant core          -DKO_EMBED_RIDI=OFF -DKO_EMBED_KOPUB=OFF
 echo "--- done; the build-perf-* directories and their artifacts are disposable ---"

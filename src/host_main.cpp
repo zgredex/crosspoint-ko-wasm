@@ -54,22 +54,26 @@ int main(int argc, char** argv) {
   GfxRenderer renderer(display);
   renderer.begin();
 
-  // Fonts: KO typography build = Pretendard 10 (UI) + KoPub Batang 14 (reader,
-  // reference default — CrossPointSettings::getReaderFontId()), RIDIBatang 14 kept
-  // as the XTCKO extra face the web UI can select.
-  EpdFont pretendard10(&pretendard_10_regular);
-  EpdFontFamily uiFamily(&pretendard10);
+  // Fonts: the READER faces only. KoPub Batang 14 is the reference default
+  // (CrossPointSettings::getReaderFontId()); RIDIBatang 14 is the XTCKO extra face the web UI can
+  // select.
+  //
+  // Pretendard 10 used to be registered here under the UI font ids, mirroring the device's
+  // main.cpp. It is NOT needed to render a page and has been removed:
+  //   * `setFallbackFont(UI_FONT_ID)` in the reference is a FONT-ID-level fallback — consulted only
+  //     when a requested font id is not registered (GfxRenderer::getEffectiveFontId). KoPub is
+  //     always registered, so it never fires for a page render.
+  //   * the only GLYPH-level fallback in the reference is
+  //     `setGlyphFallback(SYSTEM_FONT_ID, UI_FONT_ID)` (main.cpp:162), which backs an SD-card
+  //     system font. That is a device path, not a reading path.
+  // So a codepoint KoPub lacks is drawn as nothing on the device too — see
+  // docs/ko-font-payload-measurement.md for the codepoint census behind that claim.
   EpdFont kopub14(&kopub_14_regular);
   EpdFontFamily kopubFamily(&kopub14);
   EpdFont ridibatang14(&ridibatang_14_regular);
   EpdFontFamily ridibatangFamily(&ridibatang14);
-  renderer.insertFont(UI_FONT_ID, &uiFamily);
-  renderer.insertFont(UI_10_FONT_ID, &uiFamily);
-  renderer.insertFont(UI_12_FONT_ID, &uiFamily);
-  renderer.insertFont(SMALL_FONT_ID, &uiFamily);
   renderer.insertFont(KOPUB_14_FONT_ID, &kopubFamily);
   renderer.insertFont(RIDIBATANG_14_FONT_ID, &ridibatangFamily);
-  renderer.setFallbackFont(UI_FONT_ID);
 
   ko::EngineDriver driver(renderer, display);
   auto tLoad0 = Clock::now();

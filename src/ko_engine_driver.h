@@ -35,17 +35,11 @@
 #ifndef KO_EMBED_KOPUB
 #define KO_EMBED_KOPUB 1
 #endif
-#ifndef KO_EMBED_PRETENDARD
-#define KO_EMBED_PRETENDARD 1
-#endif
 #ifndef KO_EMBED_RIDI
 #define KO_EMBED_RIDI 1
 #endif
 #if KO_EMBED_KOPUB
 #include <builtinFonts/kopub_14_regular.h>
-#endif
-#if KO_EMBED_PRETENDARD
-#include <builtinFonts/pretendard_10_regular.h>
 #endif
 #if KO_EMBED_RIDI
 #include <builtinFonts/ridibatang_14_regular.h>

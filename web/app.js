@@ -213,6 +213,25 @@
   async function bootEngine() {
     const r = await call('ping', {}, [], 15000);
     setStatus('엔진 ' + r.version + ' 준비됨 — EPUB을 불러오세요');
+    // Cold-boot accounting, on the page's own timeline. `navToEngineReady` is the number that
+    // matters for "is this fast enough to start": everything else here exists to say WHERE the
+    // time went (network vs compile) so an optimisation can be aimed instead of guessed.
+    try {
+      const b = await call('bootstats', {}, [], 5000);
+      const navStartWall = Date.now() - performance.now();
+      const stats = {
+        ...b,
+        navigationStartWall: navStartWall,
+        navToEngineReady: b.engineReadyWall ? b.engineReadyWall - navStartWall : null,
+        domContentLoaded: performance.getEntriesByType('navigation')[0]
+          ? performance.getEntriesByType('navigation')[0].domContentLoadedEventEnd : null,
+      };
+      window.__koBootStats = stats;
+      if (window.console && console.table && stats.phases) {
+        console.table({ ...stats.phases, navToEngineReady: stats.navToEngineReady });
+        if (stats.resource) console.table(stats.resource);
+      }
+    } catch (e) { /* diagnostics must never break boot */ }
   }
 
   // ---- spec snapshot ----
@@ -1454,18 +1473,14 @@
   // if in-browser conversion fails — doing it at boot meant a pointless POST to /api/convert-font on
   // every visit to discover that the Python dev endpoint is not deployed.
   worker = spawnWorker();
-  // The engine init is deferred to an idle slot so the picker paints without waiting on the
-  // §10: be precise about what this defers. spawnWorker() already ran, and ko.worker.js starts
-  // its own init() as soon as it is constructed — so the ~7 MB wasm fetch/instantiate begins
-  // immediately, in the background, and this callback only delays the readiness probe (the ping
-  // that populates the status line). That is deliberate: the worker's network fetch does not block
-  // the importer, and warming the engine early is worth it. It is NOT a startup
-  // optimisation, and it is not claimed as one.
-  const bootEngineWhenIdle = () => new Promise((done) => {
-    const start = () => { bootEngine().catch((e) => reportError(e, '엔진 시작')).then(done); };
-    if (window.requestIdleCallback) requestIdleCallback(start, { timeout: 1500 });
-    else setTimeout(start, 120);
-  });
+  // Readiness probe, immediate. This used to run behind
+  // `requestIdleCallback(start, { timeout: 1500 })`, which deferred ONLY the ping that fills the
+  // status line — the worker (and therefore the wasm fetch/compile) starts at the line above, and
+  // ko.worker.js runs init() as soon as it is constructed. So the idle gate never delayed boot; it
+  // delayed TELLING the user the engine was up, for up to 1.5 s, which is a UI that lies about its
+  // own state. Removed for that reason. Boot time is unaffected, and this is not a boot
+  // optimisation — the measured phases come from the worker's `bootstats`, not from here.
+  const bootEngineWhenIdle = () => bootEngine().catch((e) => reportError(e, '엔진 시작'));
   bootEngineWhenIdle().then(() => {
     // convenience: /?epub=path triggers fetch+load (for local dev/test)
     const q = new URLSearchParams(location.search);

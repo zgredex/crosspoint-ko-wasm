@@ -121,6 +121,23 @@ def chapter(title, paras, style_extra=''):
 '''
 
 
+# Characters that are rendered by the demo corpus but are NOT in KoPub Batang 14's 3,328 intervals.
+# Derived by counting the codepoints in the layout manifests against the font's interval table
+# (see docs/ko-font-payload-measurement.md). They are here so the claim "no fallback font is drawn
+# while reading" has a fixture that would falsify it: render this with and without any candidate
+# fallback registered and compare page payloads.
+SYMBOLS = [
+    ('기호 검사', [
+        '기호 ★ ＝ │ ＋ ＿ ‐ Π ψ ⓒ ä ・ ï 기호',
+        '기호 ★ ＝ │ ＋ ＿ ‐ Π ψ ⓒ ä ・ ï 기호',
+        '가나다라 마바사 ★ 아자차카 타파하',
+        '기호 ★ ＝ │ ＋ ＿ ‐ Π ψ ⓒ ä ・ ï 기호',
+        '가나다라 마바사 Π 아자차카 ψ 타파하',
+        '기호 ★ ＝ │ ＋ ＿ ‐ Π ψ ⓒ ä ・ ï 기호',
+    ]),
+]
+
+
 def write_epub(path, title, chapters, indent_paragraph=False):
     items, spine = [], []
     for i, (t, paras) in enumerate(chapters):
@@ -178,6 +195,7 @@ def main():
     made.append(write_epub(os.path.join(OUT, 'ko-text.epub'), 'XTCKO conformance — Korean text', PROSE))
     made.append(write_epub(os.path.join(OUT, 'ko-ruby.epub'), 'XTCKO conformance — Korean ruby', RUBY))
     made.append(write_epub(os.path.join(OUT, 'ko-mixed.epub'), 'XTCKO conformance — mixed runs', MIXED))
+    made.append(write_epub(os.path.join(OUT, 'ko-symbols.epub'), 'XTCKO conformance — uncovered codepoints', SYMBOLS))
     for p in made:
         print(f'{p}  {os.path.getsize(p)} bytes')
     return 0

@@ -18,10 +18,16 @@ import sys
 
 GENERATED = ['ko_xtch_wasm.js', 'ko_xtch_wasm.wasm', 'ft_wasm.js', 'ft_wasm.wasm']
 
+# Optional: externalized built-in faces. Present only when a build ships a face as data instead of
+# compiling it in, so their absence is not an error — but when present they MUST be fingerprinted,
+# because the worker resolves them through the same manifest the engine uses.
+OPTIONAL_GENERATED = ['kopub_14.epd2', 'ridibatang_14.epd2']
+
 
 def main():
     dist = sys.argv[1] if len(sys.argv) > 1 else 'dist'
     mapping = {}
+    # required artifacts: the site is broken without these, so their absence is fatal
     for name in GENERATED:
         path = os.path.join(dist, name)
         if not os.path.exists(path):
@@ -32,6 +38,20 @@ def main():
         os.replace(path, os.path.join(dist, hashed))
         mapping[name] = hashed
         print('  %-22s -> %s' % (name, hashed))
+
+    # optional artifacts: externalized built-in faces, present only when a build ships a face as
+    # data. Fingerprinted when present, silently skipped when not — a build that embeds every face
+    # legitimately has none, and that must not be an error.
+    for name in OPTIONAL_GENERATED:
+        path = os.path.join(dist, name)
+        if not os.path.exists(path):
+            continue
+        h = hashlib.sha256(open(path, 'rb').read()).hexdigest()[:8]
+        stem, ext = os.path.splitext(name)
+        hashed = '%s.%s%s' % (stem, h, ext)
+        os.replace(path, os.path.join(dist, hashed))
+        mapping[name] = hashed
+        print('  %-22s -> %s  (external face)' % (name, hashed))
 
     # the manifest is a 1-line script so a worker can importScripts it synchronously
     with open(os.path.join(dist, 'assets.js'), 'w') as fh:

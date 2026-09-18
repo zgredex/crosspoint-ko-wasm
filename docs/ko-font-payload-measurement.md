@@ -55,7 +55,48 @@ reader sees** and RIDIBatang is the optional alternative. That flips both rows:
 |---|---:|---|
 | KoPub Batang | 830,470 | **keep embedded** — it is the default face; externalizing it adds a fetch to every first book |
 | RIDIBatang | 267,999 | **the candidate to externalize** — optional, and most readers never select it |
-| Pretendard | 100,977 | keep embedded — the UI fallback, and cheap |
+| Pretendard | 100,977 | **deleted** — it is never drawn when reading a page (see below) |
+
+### Pretendard is not drawn when reading — deleted
+
+This file previously said "keep Pretendard embedded — the UI fallback". That was wrong twice: it is
+not needed to render a page, and it is now removed from the build entirely.
+
+The mechanism, from the pinned reference:
+
+- `src/main.cpp:350` calls `renderer.setFallbackFont(UI_FONT_ID)`. That is a **font-ID-level**
+  fallback: `GfxRenderer::getEffectiveFontId` consults it only when the *requested font id* is not
+  registered. KoPub is always registered, so it never fires for a page render.
+- The only **glyph-level** fallback anywhere is `src/main.cpp:162`,
+  `setGlyphFallback(SYSTEM_FONT_ID, UI_FONT_ID)` — it backs an SD-card **system font** so codepoints
+  that font lacks still draw. That is a device UI path, not a reading path.
+- Therefore a codepoint KoPub lacks is drawn as *nothing* on the device, and the same here.
+
+Counted over the rendered corpus (the manifests for `demo.epub`'s 1,690 pages plus the fixtures —
+1,296 distinct codepoints against KoPub's 3,328 intervals) there are indeed 12 codepoints KoPub does
+not cover:
+
+```
+★  ＝  │  ＋  ＿  ‐  Π  ψ  ⓒ  ä  ・  ï
+```
+
+They are **not** drawn by a fallback — that was an inference from coverage, and coverage is not
+mechanism. The experiment settles it: `oracle/fixtures/ko-symbols.epub` is generated to contain
+exactly those 12 codepoints, and rendering the 1,690-page book with the Pretendard binary and with
+the Pretendard-free binary gives
+
+```
+layout manifests : IDENTICAL
+container        : 1 byte differs out of 162,310,292 — byte 297, createTime (wall clock)
+container_diff   : IDENTICAL: 1690 pages, every plane byte-equal
+```
+
+One wall-clock second, and no pixel anywhere. Deleting it removes ~101 KB brotli (331,752 bytes of
+generated header) from every cold start and makes a request for a nonexistent font id fail instead
+of resolving to a face that has no business rendering a page.
+
+`ko-symbols.epub` stays in the gate's fixture list as the regression test: if any fallback is ever
+consulted while reading, this is the fixture that will show it.
 
 The arithmetic that kills the old plan, with the EPD2 blobs measured rather than assumed:
 

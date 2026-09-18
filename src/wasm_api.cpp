@@ -67,8 +67,6 @@ static ExternalFace* externalFaceFor(int fontId) {
   return nullptr;
 }
 
-static EpdFont* g_pretendard = nullptr;
-static EpdFontFamily* g_uiFamily = nullptr;
 static EpdFont* g_kopub = nullptr;
 static EpdFontFamily* g_kopubFamily = nullptr;
 static EpdFont* g_ridibatang = nullptr;
@@ -112,10 +110,6 @@ KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
     g_renderer->begin();
     g_driver = new ko::EngineDriver(*g_renderer, *g_display);
 
-#if KO_EMBED_PRETENDARD
-    g_pretendard = new EpdFont(&pretendard_10_regular);
-    g_uiFamily = new EpdFontFamily(g_pretendard);
-#endif
 #if KO_EMBED_KOPUB
     g_kopub = new EpdFont(&kopub_14_regular);
     g_kopubFamily = new EpdFontFamily(g_kopub);
@@ -127,13 +121,6 @@ KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
     // Registration must be guarded exactly like construction. It was not: with KO_EMBED_KOPUB=OFF the
     // family pointer was never assigned, yet the (unconditional) insertFont registered a null family —
     // so every measurement build except the baseline registered nulls for the disabled faces.
-#if KO_EMBED_PRETENDARD
-    g_renderer->insertFont(UI_FONT_ID, g_uiFamily);
-    g_renderer->insertFont(UI_10_FONT_ID, g_uiFamily);
-    g_renderer->insertFont(UI_12_FONT_ID, g_uiFamily);
-    g_renderer->insertFont(SMALL_FONT_ID, g_uiFamily);
-    g_renderer->setFallbackFont(UI_FONT_ID);
-#endif
 #if KO_EMBED_KOPUB
     g_renderer->insertFont(KOPUB_14_FONT_ID, g_kopubFamily);
 #endif
@@ -163,10 +150,6 @@ KO_EXPORT void ko_close() {
   delete g_driver; g_driver = nullptr;
   delete g_renderer; g_renderer = nullptr;
   delete g_display; g_display = nullptr;
-#if KO_EMBED_PRETENDARD
-  delete g_uiFamily; g_uiFamily = nullptr;
-  delete g_pretendard; g_pretendard = nullptr;
-#endif
 #if KO_EMBED_KOPUB
   delete g_kopubFamily; g_kopubFamily = nullptr;
   delete g_kopub; g_kopub = nullptr;

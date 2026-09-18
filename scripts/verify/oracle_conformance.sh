@@ -106,9 +106,14 @@ LOCAL_ONLY_FIXTURES="web/demo.epub"
 if [ -z "$FIXTURES" ]; then
   # Text fixtures first (their contract is total), then the image-bearing books: those are
   # where layout has to agree across image blocks and page breaks, and where the pixel
-  # exemption is exercised rather than assumed.
-  FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub web/demo-images.epub web/demo-png.epub web/demo.epub"
-  [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub"
+  # comparison is the interesting one. ko-symbols carries the codepoints KoPub does not cover, so it
+  # is the fixture that would expose any fallback face being drawn during page rendering.
+  # NOTE: appended in TWO assignments on purpose. A quoted string continued on the next line is not a
+  # continuation — it is a second command, and the first line silently wins, which is how a "full"
+  # gate run compared three fixtures and reported PASS for six.
+  FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub"
+  FIXTURES="$FIXTURES oracle/fixtures/ko-symbols.epub web/demo-images.epub web/demo-png.epub web/demo.epub"
+  [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-symbols.epub"
 fi
 
 # --- 3. sensitivity control ---------------------------------------------------
