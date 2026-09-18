@@ -21,3 +21,7 @@ dist/
 
 # macOS
 .DS_Store
+
+# EPD2 blobs are DERIVED (build/export_external_font). A build that externalizes a face stages the
+# blob into dist/ at package time; git tracks the generator, not 5 MB of output.
+*.epd2
