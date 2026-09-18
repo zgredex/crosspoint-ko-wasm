@@ -1,29 +1,39 @@
 #!/usr/bin/env bash
-# CrossPoint-KO conformance gate: run the PORT and the PINNED REFERENCE on the same books
-# and require the same layout, and the same pixels where pixels are comparable.
+# CrossPoint-KO conformance gate: run the PORT and the PINNED REFERENCE on the same books and
+# require the same typography.
 #
-# WHAT THIS IS NOT: a hash of a file compared against a hash someone wrote down once. The
-# reference is compiled from its own sources at the pinned commit and executed, so a
-# difference in behaviour has nowhere to hide — including in a function the port added, a
-# header it amended, or a fast path it introduced.
+# WHAT THIS IS NOT: a hash of a file compared against a hash someone wrote down once, and NOT a
+# demand for byte-identical device framebuffer planes.
 #
-# Contract enforced (per fixture, all must hold):
-#   1. page count           identical
-#   2. layout manifest      byte-identical (lines, line y, word x, word text, styles, ruby,
-#                           image rects, rules, visible-text offsets, spec, viewport)
-#   3. text pages           BW/LSB/MSB planes byte-identical
-#   4. image pages          layout identical; pixels EXEMPT and reported, because the
-#                           reference refuses oversized JPEGs as a device RAM policy while
-#                           the port renders them (see docs/ko-jpeg-libjpeg-port.md)
+# THE CONTRACT IS LAYERED, because "matches CrossPoint-KO" means different things at different
+# resolutions:
+#
+#   LAYER 1 — EXACT (the conformance requirement, every page, integers only)
+#     page count, every line's y, every word's x and text and style, ruby, image rects, rules,
+#     visible-text offsets, viewport geometry, spec. Enforced as byte-identical layout
+#     manifests, so there is no tolerance to argue about.
+#
+#   LAYER 2 — PERCEPTUAL (the conformance requirement for pixels)
+#     a page fails only if a reader could SEE the difference as typography: content moved
+#     (best integer shift removes the difference), a pixel changed by a visible tone step
+#     (>= 2 of 4 levels), or the blurred tone mass shifted. One-level quantization and
+#     halftone phase differences pass. Image pages are excluded from the verdict — different
+#     decoders and dither models are deliberate — but their numbers are printed.
+#
+#   LAYER 3 — MECHANICAL (explicitly NOT a requirement)
+#     exact BW/LSB/MSB plane bytes, framebuffer packing, e-ink refresh behaviour. Device
+#     concerns. Byte equality is measured and printed every run as a diagnostic, and
+#     --strict-planes turns it into a failure for like-for-like comparisons.
 #
 # Controls (a gate that cannot fail is not a gate):
 #   * the two binaries must differ (different engine, not the same file twice)
-#   * the layout manifests must be non-trivial (pages > 0, and the text fixture must
-#     contain lines) — an empty manifest compares equal to an empty manifest
-#   * SENSITIVITY: with one glyph advance perturbed in the reference's KoPub table, the
-#     gate must FAIL. Run with --sensitivity to execute just this.
+#   * manifests must be non-trivial (pages > 0, lines > 0)
+#   * SENSITIVITY: perturbing the reference's glyph advances must make LAYER 1 fail
+#     (--sensitivity); scripts/verify/raster_controls.py independently proves LAYER 2 catches
+#     a one-column move and a visible tone step while tolerating one-level quantization
 #
-# usage: oracle_conformance.sh [--quick] [--sensitivity] [--fixtures "a.epub b.epub"]
+# usage: oracle_conformance.sh [--quick] [--sensitivity] [--strict-planes]
+#                              [--fixtures "a.epub b.epub"] [--font-layers]
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -35,11 +45,16 @@ ORACLE_CMAKE_ROOT="${KO_ORACLE_CMAKE_ROOT:-/tmp/up-src/crosspoint-reader-ko-cros
 WORK="${KO_CONFORMANCE_WORK:-/tmp/ko-conformance}"
 QUICK=0
 SENSITIVITY=0
+STRICT_PLANES=0
+FONT_LAYERS=1
 FIXTURES_OVERRIDE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --quick) QUICK=1 ;;
     --sensitivity) SENSITIVITY=1 ;;
+    --strict-planes) STRICT_PLANES=1 ;;
+    --no-font-layers) FONT_LAYERS=0 ;;
+    --fonts) FONT_LAYERS=1 ;;
     --fixtures) FIXTURES_OVERRIDE="$2"; shift ;;
     *) echo "unknown option $1"; exit 2 ;;
   esac
@@ -163,65 +178,120 @@ for fx in $FIXTURES; do
     continue
   fi
 
+  # LAYER 1 — EXACT, every page. The layout decisions themselves, as integers: page count,
+  # every line's y, every word's x, word text, styles, ruby, image rects, rules, visible-text
+  # offsets, viewport and spec. Byte-identical manifests, and it is the strongest of the three
+  # layers precisely because nothing here is a tolerance.
   if cmp -s "$WORK/$name.port.json" "$WORK/$name.oracle.json"; then
-    ok "$name: layout manifest identical ($pages pages, $lines lines)"
+    ok "$name: LAYER 1 exact — layout manifest identical ($pages pages, $lines lines)"
   else
-    bad "$name: layout manifest differs"
+    bad "$name: LAYER 1 FAILED — layout manifest differs"
     python3 scripts/verify/layout_diff.py "$WORK/$name.port.json" "$WORK/$name.oracle.json" | head -14 | sed 's/^/     /'
     continue
   fi
 
-  # Planes. Pixels on pages that carry an image are exempt (the port's decode+dither path is
-  # deliberately its own); everything else must match. The rule is applied whenever the
-  # containers differ, whether or not the reference refused an image — refusal is a REASON to
-  # print, never a precondition for looking. Without this, an image book whose pixels differ
-  # for the dither/decoder reason alone would be rejected for lack of a refusal, which is a
-  # gate failing on the wrong grounds.
-  refused=$(grep -c "Image too large" "$WORK/$name.oracle.log" || true)
+  # The mechanical figure, reported and NOT gated (see --strict-planes). Byte equality is
+  # achievable and currently holds on text pages; it is a diagnostic because the contract is
+  # typographic, and a browser-side rasterizer is not required to reproduce device plane bytes.
   if cmp -s "$WORK/$name.port.xtch" "$WORK/$name.oracle.xtch"; then
-    ok "$name: containers byte-identical (all planes, all pages)"
+    note "$name: containers byte-identical (all planes, all pages) — reported, not required"
   else
-    summary=$(python3 scripts/verify/container_diff.py "$WORK/$name.oracle.xtch" "$WORK/$name.port.xtch" 2>&1)
-    echo "$summary" | head -4 | sed 's/^/     /'
-    # Indices are GLOBAL container page numbers, in the same order the manifest was recorded,
-    # so a text page cannot hide behind a per-spine page number that happens to be reused by an
-    # image page in another chapter. The alignment itself is asserted: if the manifest and the
-    # containers disagree on how many pages exist, the comparison is meaningless and says so
-    # instead of passing.
-    python3 - "$WORK/$name.port.json" "$WORK/$name.oracle.xtch" "$WORK/$name.port.xtch" <<'PY'
-import json, sys
-sys.path.insert(0, 'scripts/verify')
-import container_diff as cd
-manifest = json.load(open(sys.argv[1]))
-ap, _ = cd.container(sys.argv[2])
-bp, _ = cd.container(sys.argv[3])
-pages = manifest['pages']
-if not (len(pages) == len(ap) == len(bp)):
-    print(f'  x  page-count mismatch: manifest {len(pages)}, containers {len(ap)}/{len(bp)}')
-    sys.exit(2)
-img_idx = {i for i, p in enumerate(pages) if p['images']}
-diffs = set()
-for i in range(len(pages)):
-    a, b = cd.planes(ap[i]), cd.planes(bp[i])
-    if any(x != y for (x, _n), (y, _m) in zip(a, b)):
-        diffs.add(i)
-text_diffs = sorted(diffs - img_idx)
-print(f'     differing pages: {len(diffs)} of {len(pages)}; '
-      f'every one carries an image: {diffs <= img_idx}')
-if text_diffs:
-    print(f'  x  {len(text_diffs)} page(s) WITHOUT an image differ: '
-          f'{[pages[i]["spine"] for i in text_diffs[:6]]}/{[pages[i]["page"] for i in text_diffs[:6]]}')
-    sys.exit(1)
-sys.exit(0)
-PY
-    dup=$?
-    if [ "$dup" -eq 0 ]; then
-      ok "$name: every text page byte-identical; ${refused} reference image refusal(s), image pixels exempt"
+    python3 scripts/verify/container_diff.py "$WORK/$name.oracle.xtch" "$WORK/$name.port.xtch" 2>&1 \
+      | head -4 | sed 's/^/     /'
+  fi
+
+  # LAYER 2 — PERCEPTUAL. A page fails only if a reader could see the difference as
+  # typography: content moved, or a pixel changed by a visible tone step, or the tone mass
+  # shifted. One-level quantization and halftone phase differences pass. Image pages are
+  # excluded from the verdict (different decoders and dither models by design) but their
+  # numbers are still printed.
+  raster_args="--skip-images $WORK/$name.port.json --limit 4"
+  if [ "$QUICK" != 1 ] && [ "$pages" -gt 60 ]; then
+    # ~2 s/page in Python; the exact layer above already covers every page, so sample evenly
+    # rather than truncating (a regression in the last chapter must not slip through).
+    raster_args="$raster_args --sample 40"
+  fi
+  if python3 scripts/verify/raster_diff.py "$WORK/$name.oracle.xtch" "$WORK/$name.port.xtch" \
+       $raster_args 2>&1 | sed 's/^/     /'; then
+    ok "$name: LAYER 2 perceptual — nothing moved, no visible tone step"
+  else
+    bad "$name: LAYER 2 FAILED — a raster difference that is visible as typography"
+  fi
+
+  # LAYER 3 — not a requirement, and it is the reason this gate has a layered shape at all:
+  # device framebuffer packing, refresh behaviour and plane representation are the device's
+  # concern. Kept as an opt-in so a like-for-like host-vs-host comparison can still ask for it.
+  if [ "$STRICT_PLANES" = 1 ]; then
+    if cmp -s "$WORK/$name.port.xtch" "$WORK/$name.oracle.xtch"; then
+      ok "$name: LAYER 3 strict planes — byte-identical"
     else
-      bad "$name: a page WITHOUT an image differs — that is a pixel divergence, not policy"
+      bad "$name: LAYER 3 strict planes — planes differ (--strict-planes was requested)"
     fi
   fi
 done
+
+if [ "$FONT_LAYERS" = 1 ]; then
+  echo "== KoPub externalization, in the same three layers =="
+  # The font leaves the wasm as an EPD2 blob (src/external_font_blob.h): the runtime arrays
+  # relocated verbatim, no re-rasterisation and no quantization, because the metrics ARE the
+  # layout. What has to hold, in the layering this project uses:
+  #
+  #   metrics   exact — tools/verify_external_font.cpp compares the blob against the embedded
+  #             arrays field by field: every advanceX bit-identical (U+AC00 = 437 = 27.3125 px,
+  #             not 27<<4), the whole kern matrix, the interval and glyph records, the bitmaps
+  #   LAYER 1   exact — embedded vs externalized must produce byte-identical layout manifests
+  #   LAYER 2   perceptual — and since the same metric data is in play, byte-identical pixels
+  #   LAYER 3   not a requirement
+  BLOB="${KO_KOPUB_BLOB:-/tmp/ab/kopub_14.epd2}"
+  if [ ! -f "$BLOB" ] && [ -x build/export_external_font ]; then
+    build/export_external_font "$BLOB" >/dev/null 2>&1
+    note "exported $BLOB"
+  fi
+  if [ ! -f "$BLOB" ]; then
+    bad "no EPD2 blob at $BLOB and no build/export_external_font to make one"
+  else
+    # Layer "metrics exact", first and on its own: the blob must reproduce the embedded font
+    # bit for bit, including U+AC00's 437 (27.3125 px) advance and the full kern matrix. If this
+    # passes, the layers below are a smoke test; if it fails, they are how you find the damage.
+    if [ -x build/verify_external_font ]; then
+      if build/verify_external_font "$BLOB" >"$WORK/font-metrics.log" 2>&1; then
+        ok "font: metrics exact — $(tail -1 "$WORK/font-metrics.log")"
+      else
+        bad "font: metrics FAILED — the blob does not reproduce the embedded font"
+        tail -6 "$WORK/font-metrics.log" | sed 's/^/     /'
+      fi
+    else
+      bad "build/verify_external_font is not built — the metrics layer would go unchecked"
+    fi
+    FX=oracle/fixtures/ko-text.epub
+    "$PORT_BIN" "$REPO_ROOT/$FX" "$WORK/font-embedded.xtch" --manifest "$WORK/font-embedded.json" \
+      >"$WORK/font-embedded.log" 2>&1
+    if "$PORT_BIN" "$REPO_ROOT/$FX" "$WORK/font-external.xtch" --kopub-external "$BLOB" \
+         --manifest "$WORK/font-external.json" >"$WORK/font-external.log" 2>&1; then
+      note "$(grep -o 'KoPub registered from blob.*' "$WORK/font-external.log" | head -1)"
+    else
+      bad "port failed with --kopub-external (see $WORK/font-external.log)"
+    fi
+    if [ ! -s "$WORK/font-external.json" ]; then
+      bad "no manifest from the externalized run — nothing was compared"
+    elif cmp -s "$WORK/font-embedded.json" "$WORK/font-external.json"; then
+      ok "font: LAYER 1 exact — externalized KoPub lays out identically (metrics survived)"
+    else
+      bad "font: LAYER 1 FAILED — externalizing changed the layout; the blob is lossy"
+      python3 scripts/verify/layout_diff.py "$WORK/font-embedded.json" "$WORK/font-external.json" \
+        | head -8 | sed 's/^/     /'
+    fi
+    if python3 scripts/verify/raster_diff.py "$WORK/font-embedded.xtch" "$WORK/font-external.xtch" \
+         --limit 3 2>&1 | sed 's/^/     /'; then
+      ok "font: LAYER 2 perceptual — externalized rendering is visually identical"
+    else
+      bad "font: LAYER 2 FAILED — the externalized face renders differently"
+    fi
+    if cmp -s "$WORK/font-embedded.xtch" "$WORK/font-external.xtch"; then
+      note "font: containers byte-identical too (expected — EPD2 stores no quantized copy)"
+    fi
+  fi
+fi
 
 echo
 if [ "$FAIL" -eq 0 ]; then

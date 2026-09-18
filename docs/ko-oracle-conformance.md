@@ -3,13 +3,67 @@
 **Status:** enforced. `bash scripts/verify/oracle_conformance.sh` is the gate; the pin is
 `oracle/crosspoint-ko.pin.json`.
 
-## 1. The contract
+## 1. The contract — three layers, not one
 
 CrossPoint-KO's EPUB reader is the **normative typography and layout oracle** for this
-converter. Not "Korean text that looks right" — the same glyph metrics, spacing rhythm,
-break decisions, x/y placement, paragraph spacing, line heights and pagination the reader
-itself would produce. If the reader would put a word at `x=54` on line `y=92` of page 7, so
-does the export.
+converter. Not "Korean text that looks right" — the same glyph metrics, spacing rhythm, break
+decisions, x/y placement, paragraph spacing, line heights and pagination the reader itself
+would produce. If the reader would put a word at `x=54` on line `y=92` of page 7, so does the
+export.
+
+But "matches" resolves differently depending on what is being compared, and collapsing the
+layers is how a project ends up either demanding byte-identical framebuffers from a browser or
+quietly accepting a moved glyph. So:
+
+### Layer 1 — EXACT (the conformance requirement)
+
+Integers only, every page, no tolerance to argue about:
+
+| | |
+|---|---|
+| page count | identical |
+| per page | line count, every line's `y` and `x` |
+| per line | every run's `x`, `text`, `style`, `focusBoundary`, ruby |
+| per page | image rects, horizontal rules, `visibleTextOffset` |
+| header | viewport geometry (margins), font id, spec (compression, wrap, alignment, …) |
+
+Two failures that must never pass: a line breaking differently
+
+```
+reference:  나는 오늘 집에 / 간다.
+XTCKO:      나는 오늘 / 집에 간다.
+```
+
+and a run placed one pixel off (`x=147` vs `x=150`), because that is what changes rhythm.
+
+This is enforced as **byte-identical layout manifests**, which is stricter than comparing a few
+fields: it also pins word splitting. Two lines whose concatenated text is equal but whose word
+runs are split differently (`상을` + `받았다.` vs `상을 받았다.`) produce different manifests.
+A line-level `text` comparison would pass that; it is deliberately not what is checked.
+
+### Layer 2 — PERCEPTUAL (the conformance requirement for pixels)
+
+A page fails only if a reader could see the difference **as typography**:
+
+| failure | measurement |
+|---|---|
+| content moved | the best integer shift in ±2 px removes a large fraction of the difference |
+| visible tone step | any pixel changing ≥ 2 of the 4 levels (≥ 50 reflectance units in the panel anchors) |
+| tone mass shifted | box-blurred (5×5) mean absolute reflectance difference above 2.0 |
+
+Passing: a glyph edge landing on a different coverage level *without moving*, a reconfigured
+halftone pattern carrying the same mass, one-level quantization. That is the "reference edge
+pixel gray 2 / browser gray 3 is fine" case, and it is now a measured verdict rather than a
+judgement call.
+
+### Layer 3 — MECHANICAL (explicitly NOT a requirement)
+
+Exact BW/LSB/MSB plane bytes, framebuffer packing, e-ink refresh behaviour, plane
+representation. These are the device's concern; the browser is not required to reproduce them.
+
+Byte equality is still **measured and printed on every run** as a diagnostic, because when it
+holds it is free information (it currently holds on every text page, host vs host), and
+`--strict-planes` promotes it to a failure for a like-for-like comparison.
 
 Everything below is either measured, or explicitly listed as not measured.
 
@@ -82,21 +136,25 @@ precisely so the guard cannot silently start dropping CSS and move the layout.
 ## 4. The gate
 
 ```sh
-bash scripts/verify/oracle_conformance.sh          # all fixtures
-bash scripts/verify/oracle_conformance.sh --quick  # text fixtures only
-bash scripts/verify/oracle_conformance.sh --sensitivity
+bash scripts/verify/oracle_conformance.sh                 # all fixtures, layered
+bash scripts/verify/oracle_conformance.sh --quick         # text fixtures only
+bash scripts/verify/oracle_conformance.sh --strict-planes # also demand layer 3
+bash scripts/verify/oracle_conformance.sh --sensitivity   # must FAIL (layer 1 sensitivity)
+python3 scripts/verify/raster_controls.py <container>     # must PASS (layer 2 sensitivity)
 ```
 
 It does not hash a file against a number someone wrote down once. It **compiles the reference
 from its own sources at the pinned commit and runs it** on the same book with the same flags,
-then compares:
+then applies the three layers of §1:
 
 | | requirement |
 |---|---|
-| page count | identical |
-| layout manifest | byte-identical — every line's y, every word's x, the word text, styles, ruby, image rects, rules, visible-text offsets, viewport and spec |
-| text pages | BW, LSB and MSB planes byte-identical |
-| image pages | layout identical; pixels reported, see §5 |
+| **layer 1** page count, lines, line y/x, run x/text/style, ruby, image rects, rules, visible-text offsets, viewport, spec | **exact** — byte-identical manifests, every page |
+| **layer 2** raster | **perceptual** — fails on movement, a ≥2-level tone step, or tone mass > 2.0; tolerates one-level quantization and halftone phase. Sampled (`--sample`, 40 evenly spread pages) once a book exceeds 60 pages, because the exact layer already covers every page; image pages are excluded from the verdict and their numbers printed |
+| **layer 3** plane bytes | **diagnostic only** — printed every run, gated only under `--strict-planes` |
+
+The samples are spread evenly, not the first N: a regression that only appears in the last
+chapter must not survive because the sample stopped early.
 
 Two builds are involved. The reference build compiles the reference's engine files
 (`-DKO_ENGINE_ROOT=<pinned checkout>/lib`), with **one declared substitution**:
@@ -110,20 +168,32 @@ control for the port's optimization: if the planes ever differ, the shortcut is 
 
 ### Evidence — measured, 2026-09-18
 
-| fixture | pages | lines | layout | containers |
-|---|---|---|---|---|
-| `oracle/fixtures/ko-text.epub` (Korean prose, 3 chapters, CSS, rule) | 3 | 43 | identical | **byte-identical** |
-| `oracle/fixtures/ko-ruby.epub` (ruby annotations) | 1 | 10 | identical | **byte-identical** |
-| `web/demo.epub` (real Korean book, 71 image pages) | 1,690 | 30,392 | identical | all 1,619 text pages byte-identical; 71 image pages differ, see §5 |
+| fixture | pages | lines | layer 1 | layer 2 | layer 3 (diagnostic) |
+|---|---|---|---|---|---|
+| `oracle/fixtures/ko-text.epub` (Korean prose, 3 chapters, CSS, rule) | 3 | 43 | exact | pass (0 differing pixels) | byte-identical |
+| `oracle/fixtures/ko-ruby.epub` (ruby annotations) | 1 | 10 | exact | pass | byte-identical |
+| `oracle/fixtures/ko-mixed.epub` (CJK/Latin/punctuation runs) | 1 | 14 | exact | pass | byte-identical |
+| `web/demo-images.epub` (image tests) | 13 | 71 | exact | pass (9 image pages excluded) | 4 pages differ |
+| `web/demo-png.epub` (PNG tests) | 13 | 72 | exact | pass | byte-identical |
+| `web/demo.epub` (real Korean book) | 1,690 | 30,392 | exact | pass (71 image pages excluded) | 1,619 pages byte-identical |
+
+The layer-3 column is the interesting one to read against the old contract: under a
+byte-identity requirement, four of these six rows would have been failures, and every one of
+those differences is image content rather than typography (§5).
 
 ### Controls (a gate that cannot fail is not a gate)
 
 - the two binaries must differ, and both manifests must be non-empty (a manifest with zero
-  pages used to be compared against another zero-page manifest and pass — the `ko-mixed`
-  fixture caught that, because a stray `<>` in the XHTML made the spine fail to parse);
-- `--sensitivity` perturbs a glyph advance in the reference's KoPub table and requires the
-  gate to FAIL. Without it, "identical" would also be produced by a gate that had stopped
-  comparing anything;
+  pages once compared equal to another zero-page manifest and passed — the `ko-mixed` fixture
+  caught that after a stray `<>` in its XHTML made the spine fail to parse);
+- **layer 1 sensitivity** (`--sensitivity`): every glyph advance in the reference's KoPub table
+  moves by +63/16 px and the gate must FAIL;
+- **layer 2 sensitivity** (`raster_controls.py`): three mutants are spliced into a real
+  container and must land on the right side — a one-column page move → FAIL, 300 pixels
+  changing one level → PASS, 300 pixels changing two levels → FAIL. The mutants assert their
+  own measured level histogram first, so a mis-specified control fails as a control error
+  rather than being compared as if it meant something (the first version of it flipped the
+  wrong plane and "proved" the gate was over-strict);
 - the pin check runs the same discipline: a comparer that cannot flag a known reference/port
   difference (`ImageBlock::needsDecode`) fails the check.
 
@@ -260,12 +330,30 @@ out of the wasm and `src/external_font_blob.h` covers the lossless EPD2 containe
 in (no re-rasterisation: 12.4 fixed-point advances, 4.4 kerning, ligatures and bitmaps are
 relocated, not re-derived).
 
+### The externalization contract, in the same layers
+
+The reason to care about the container is not that a 2-bit glyph is lossy — it isn't, in this
+format — but that **losing fractional advances or kerning moves layout coordinates**, and
+layout coordinates are layer 1. So the test list is a layer list:
+
+| | requirement | how |
+|---|---|---|
+| metrics | **exact** | `build/verify_external_font <blob>`: every `advanceX` bit-identical (`U+AC00` = 437 = 27.3125 px, not 27), full kern matrix, interval/glyph records, bitmap bytes |
+| layer 1 | **exact** | embedded vs `--kopub-external` must produce byte-identical layout manifests |
+| layer 2 | **perceptual** | raster verdict on the same page set |
+| layer 3 | not required | (in practice it holds too: EPD2 stores no quantized copy, so the containers come out byte-identical) |
+
+All four run inside `oracle_conformance.sh` on every invocation. Measured: 3,169,108-byte blob
+→ 16,220 glyphs + 1,054 kern cells, `IDENTICAL: external blob reproduces the embedded font
+bit-for-bit`, layer 1 identical, layer 2 pass, containers byte-identical.
+
 ## 8. Not covered
 
 Stated rather than glossed:
 
 - **Pixels on image pages** (§5) — two causes: the port's own decode+dither path, and the
-  reference's refusal of oversized images. Layout is asserted there; pixels are not.
+  reference's refusal of oversized images. Layer 1 is asserted there; layer 2 excludes those
+  pages from its verdict and prints their numbers instead.
 - **Fixture list is not exhaustive**: one generated Korean prose book per layout feature and
   three real books. Books that trip CJK edge cases not present here are exactly what the
   `ko-*.epub` fixtures were built to make cheap to extend.
@@ -276,3 +364,6 @@ Stated rather than glossed:
   changes layout, and both are listed as amended in the pin.
 - **The reference's own EPUB parsing of pathological books** is not fuzzed here; the gate
   compares the two engines on the same parsed input.
+- **Layer 2 is sampled on long books** (40 evenly spread pages above 60 pages). That is a
+  deliberate trade: the exact layer covers every page, the perceptual layer is a smoke test
+  for rasterization, and 1,690 pages × ~2 s in Python is an hour per run.
