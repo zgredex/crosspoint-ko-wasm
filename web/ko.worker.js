@@ -274,7 +274,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '41';
+const FT_MODULE_VERSION = '42';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -1037,6 +1037,7 @@ self.onmessage = async (ev) => {
           counters: COUNTERS,
           frameCache: { entries: frameCache.size, bytes: frameCacheBytes, budget: FRAME_CACHE_BUDGET },
           heapBytes: api ? api.HEAPU8.buffer.byteLength : 0,   // wasm linear memory high-water mark
+          storageBytes: api ? api._ko_storage_bytes() : 0,     // what HalStorage is actually holding
           engine: { spine: currentSpine, pages: currentPages, builtKey, fontStamp },
           keys: { layout: currentSpec ? layoutKey(currentSpec) : null,
                   render: currentSpec ? renderKey(currentSpec) : null },

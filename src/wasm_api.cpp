@@ -575,6 +575,13 @@ KO_EXPORT void ko_xtcz_wrap() {
 
 // Release the module-lifetime container buffer (frees wasm heap; the JS side
 // keeps its own copy once exported). Safe to call anytime.
+// Live HalStorage accounting (§: measure before changing the preflight). The warm preflight calls
+// _ko_build_spine(), which builds a complete RAM-backed section-cache file per spine — so "no page
+// buffers allocated" is only true for the XTH/XTG export buffers. This exposes what the store holds.
+KO_EXPORT size_t ko_storage_bytes() {
+  return Storage.totalBytes();
+}
+
 KO_EXPORT void ko_xtch_release() {
   g_xtchOut.clear();
   g_xtchOut.shrink_to_fit();

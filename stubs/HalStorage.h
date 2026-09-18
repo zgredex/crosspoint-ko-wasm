@@ -166,6 +166,26 @@ class HalStorage {
   // caches from a previous book don't accumulate in the wasm heap).
   void clearAll() { files_.clear(); }
 
+  // Live storage accounting. heapBytes (wasm linear memory) only reports the high-water mark; this is
+  // what HalStorage is actually holding right now — section caches and the mounted EPUB are all
+  // RAM-backed here. Shared blobs (mountSharedBlob aliases) are counted once, and capacity() is used
+  // rather than size() because a released vector's slack still occupies the heap.
+  size_t totalBytes() const {
+    std::vector<const void*> seen;
+    size_t total = 0;
+    for (const auto& kv : files_) {
+      const std::shared_ptr<std::vector<uint8_t>>& blob = kv.second;
+      if (!blob) continue;
+      const void* p = blob.get();
+      bool dup = false;
+      for (const void* s : seen) { if (s == p) { dup = true; break; } }
+      if (dup) continue;
+      seen.push_back(p);
+      total += blob->capacity();
+    }
+    return total;
+  }
+
  private:
   std::map<std::string, std::shared_ptr<std::vector<uint8_t>>> files_;
 };
