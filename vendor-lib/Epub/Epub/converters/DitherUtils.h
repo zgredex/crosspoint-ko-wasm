@@ -15,20 +15,28 @@
 //   - ordered modes (bayer, blue-noise) bracket the sample between two
 //     `ditherLevels` entries and compare the position to a tile threshold;
 //   - error-diffusion modes bin the sample with `ditherThresholds` and diffuse
-//     against `ditherLevels` (the PERCEIVED panel luminances, which are much
-//     darker than the nominal 0/85/170/255);
+//     against `ditherLevels`;
 //   - with dithering off, `thresholds` is used directly.
 //
-// THRESHOLDS are the ko fork's. Its own quantizer
-// (vendor-lib/GfxRenderer/BitmapHelpers.cpp:quantizeSimple, "fine-tuned to the
-// X4 display") is gray < 45 → 0, < 70 → 1, < 140 → 2, else 3, i.e. exactly the
-// `master` preset's `thresholds` triple. That triple is what the ko fork
-// actually ships, so it is the default here.
+// THE MODEL IS THE OFFICIAL CONVERTER'S (epub2xtc.xteink.cn), because matching the vendor's
+// reference pipeline is the point of this port. Its quantizer, verbatim from app.min.js:
+//     quantize(v, t) = t === 1 ? (v < 128 ? 0 : 255)
+//                              : (v > 212 ? 255 : v > 127 ? 170 : v > 42 ? 85 : 0)
+// i.e. bin selection 42/127/212 with reconstruction levels 0/85/170/255, and both cuts
+// INCLUSIVE at the lower bin (42 -> black, 127 -> 85, 212 -> 170). srokl/xtcjsapp and
+// x4converter.rho.sh ship the identical triple. scripts/verify/vendor_model_parity.cpp
+// proves our decisions equal that formula on every grey at both depths.
 //
-// NOT PORTED: 'zhou-fang'. Its kernels are large interpolated tables and the
-// reference implementation modulates thresholds with Math.random(), which is not
-// reproducible; it would need a deterministic noise source first. Flagged rather
-// than faked.
+// The fork's own tables are kept as selectable alternates, not as the default:
+//   kProfileMaster  - quantizeSimple 45/70/140 binning with perceived luminances
+//                     15/30/80/210 (derived from the fork's 92%/67% 1-bit mask densities)
+//   kProfileKoFork  - the same 45/70/140 triple on both paths with nominal levels
+// ko-hash mode ignores the profile entirely: it is the fork's algorithm, verbatim.
+//
+// One deliberate difference from the vendor: their dither scales the diffused error by a
+// strength factor (75% default for image regions, 50% for background) and their default
+// mode dithers the WHOLE page, text included. We diffuse 100% of the error and dither
+// images only (text keeps the firmwware's AA path). Both are documented, not hidden.
 // ============================================================================
 
 // ---------------------------------------------------------------------------
@@ -41,12 +49,21 @@ struct QuantProfile {
   const char* name;
 };
 
-// pr1614: the firmware's older nominal profile.
-inline constexpr QuantProfile kProfilePr1614 = {{42, 127, 212}, {42, 127, 212}, {0, 85, 170, 255}, "pr1614"};
+// nominal: the OFFICIAL converter's model, and what every reference implementation we
+// could read ships. Verified verbatim in three places:
+//   epub2xtc.xteink.cn (vendor)  : v>212?255 : v>127?170 : v>42?85 : 0   | 1-bit: v<128?0:255
+//   srokl/xtcjsapp (assembly+ts) : same triple, same levels
+//   x4converter.rho.sh           : same triple, same levels
+// Levels are the evenly spaced 0/85/170/255 and the cuts are their midpoints. This is the
+// vendor's own tool, so it is what we ship by default — see kDefaultProfile below.
+// (crosspoint-pxc-converter labels this preset "PR1614", the firmware's older nominal set.)
+inline constexpr QuantProfile kProfileNominal = {{42, 127, 212}, {42, 127, 212}, {0, 85, 170, 255}, "nominal"};
 
-// master: default in the converter. `thresholds` == the ko fork's shipped
-// quantizeSimple triple (45/70/140); the dither tables are the X4-perception
-// values the converter carries.
+// master: the ko fork's X4-perception tables, as carried by crosspoint-pxc-converter.
+// `thresholds` == the fork's shipped quantizeSimple triple (45/70/140); the dither tables
+// assume the panel's four states perceive as ~15/30/80/210, derived from the fork's own
+// 1-bit mask densities (92%/67% ink => reflectances ~30/~80 against a 15/210 panel).
+// Kept selectable: it is the only model where ko-hash's dark mids are explained.
 inline constexpr QuantProfile kProfileMaster = {{45, 70, 140}, {30, 50, 140}, {15, 30, 80, 210}, "master"};
 
 // kofork: the ko fork's thresholds used on BOTH paths (dither binning included),
@@ -54,13 +71,12 @@ inline constexpr QuantProfile kProfileMaster = {{45, 70, 140}, {30, 50, 140}, {1
 // fork's thresholds" — kept selectable so it can be measured against `master`.
 inline constexpr QuantProfile kProfileKoFork = {{45, 70, 140}, {45, 70, 140}, {0, 85, 170, 255}, "kofork"};
 
-// Default: the ko fork's own triple (45/70/140) on BOTH paths, with nominal level
-// luminances. This is the strictest reading of "keep the ko fork's thresholds", and
-// it also measured better than `master` in every comparison run (ramp tone error
-// 0.031 vs 0.185; real-photo local tone error 1.36 vs 11.63) — `master`'s
-// perceived-luminance levels (15/30/80/210) are carried here but were never
-// explained, so they are not the default. One line to switch.
-inline constexpr QuantProfile kDefaultProfile = kProfileKoFork;
+// Default: the official converter's model. Our own reference for device truth is the
+// vendor's tool, so when our reading of the fork's tables disagrees with it, the vendor
+// wins — the point of this port is to produce what the official pipeline produces.
+// `kProfileMaster` (fork perception) and `kProfileKoFork` (fork thresholds verbatim)
+// remain selectable for A/B measurement. One line to switch.
+inline constexpr QuantProfile kDefaultProfile = kProfileNominal;
 
 // ---------------------------------------------------------------------------
 // Enumeration
@@ -81,15 +97,18 @@ enum class DitherMode : uint8_t {
 // ---------------------------------------------------------------------------
 // Plain quantization
 // ---------------------------------------------------------------------------
+// The vendor's chain is `v > t2 ? 3 : v > t1 ? 2 : v > t0 ? 1 : 0`, so a value exactly ON a
+// threshold stays in the LOWER bin (42 -> black). Hence `<=` here, not `<`: with `<` the
+// three boundary greys landed one bin high and the parity gate caught it.
 inline uint8_t quantizeWithThresholds(float v, const uint8_t t[3]) {
-  if (v < static_cast<float>(t[0])) return 0;
-  if (v < static_cast<float>(t[1])) return 1;
-  if (v < static_cast<float>(t[2])) return 2;
+  if (v <= static_cast<float>(t[0])) return 0;
+  if (v <= static_cast<float>(t[1])) return 1;
+  if (v <= static_cast<float>(t[2])) return 2;
   return 3;
 }
 
 // Quantization with dithering switched off: the profile's hard threshold triple.
-// For the default profile this is the ko fork's own shipped triple (45/70/140).
+// For the default profile that is the official 42/127/212 -> 0/85/170/255.
 inline uint8_t quantizeToLevel(uint8_t gray) {
   return quantizeWithThresholds(static_cast<float>(gray), kDefaultProfile.thresholds);
 }

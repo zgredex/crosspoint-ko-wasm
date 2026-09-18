@@ -109,6 +109,61 @@ So at 2 tones the fork's rule is within 0.04% of blue noise on tone with **the l
 any model**, and solids stay solid. It clips below luma 64 and above 192 to solid black/white,
 which is what the firmware does and why it is so clean.
 
+## The model is the official converter's (2026-09-18)
+
+The quantization tables are **not** our reading of the ko fork any more: they are the ones
+the vendor's own converter ships, verbatim from `https://epub2xtc.xteink.cn/app.min.js?v=28`:
+
+```js
+function quantize(v, t) {
+  return 1 === t ? (v < 128 ? 0 : 255)
+                 : (v > 212 ? 255 : v > 127 ? 170 : v > 42 ? 85 : 0);
+}
+```
+
+i.e. bin selection **42/127/212** with reconstruction levels **0/85/170/255**, and both cuts
+INCLUSIVE at the lower bin (42 -> black, 127 -> 85, 212 -> 170). `srokl/xtcjsapp`
+(AssemblyScript + TS) and `x4converter.rho.sh` ship the identical triple, so three
+independent implementations agree. Profiles in `DitherUtils.h`:
+
+| profile | binning | levels | status |
+|---|---|---|---|
+| `kProfileNominal` | 42/127/212 | 0/85/170/255 | **default** — the official model |
+| `kProfileMaster` | 30/50/140 | 15/30/80/210 | selectable: the fork's perceived-luminance tables |
+| `kProfileKoFork` | 45/70/140 | 0/85/170/255 | selectable: the fork's own triple on both paths |
+
+Two bugs this switch exposed and fixed:
+
+- our bin convention was `v < t[i]`, the vendor's is `v > t[i]`, so the three boundary greys
+  (42/127/212) landed one bin high;
+- the 2-tone pair was frozen to `kProfileMaster`'s extremes `{15,210}`, so the 1-bit route
+  silently kept the old palette after the bin model changed. It is now read from the active
+  profile, which gives the vendor's `{0,255}` and a cut at 127.5 (= their `v < 128`).
+
+`scripts/verify/vendor_model_parity.cpp` proves all of it against the vendor's formula:
+512 decisions (256 greys x both depths) through `quantizeWithThresholds` and through the
+real `ImageDitherer`, plus 14 flat-patch tone checks. It also prints the per-model tone table
+below, which is where the numbers in the tooltip come from.
+
+**Tone preservation (the point of the model):** a dithered flat patch averages back to its own
+grey — within 0.42 luma units at 4 tones and 1.12 at 2 tones. Per-model mean |patch mean -
+grey| over greys 16..240:
+
+| depth | blue-noise | fs | burkes | stucki | jjn | bayer | ko-hash | zhou-fang | atk | none |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 4 tones | **0.21** | 0.48 | 0.80 | 1.01 | 1.14 | 1.30 | 1.75 | 3.88 | 4.79 | 22.83 |
+| 2 tones | **0.56** | 1.29 | 2.34 | 2.99 | 3.39 | 3.86 | 35.21 | 10.55 | 15.52 | 69.55 |
+
+ko-hash is 35.2 at 2 tones because the fork's 1-bit rule is a noise rule, not a tone rule;
+zhou-fang's threshold modulation is tuned for the fork's level model, so it degrades in the
+official space. Neither is a reason to drop them — they are selectable and documented.
+
+**Still different from the official tool** (deliberate, one line each if you want parity):
+their error diffusion is scaled by a *strength* (75% image regions / 50% background) and their
+default mode dithers the whole page including text; we diffuse 100% and dither image pixels
+only, leaving text to the firmware's AA path. Their preview paints the raw level values
+(0/85/170/255); ours paints the panel's normalized reflectances.
+
 ## Behaviour invariants (measured)
 
 * **Text is untouched.** `web/demo.epub` (2034 pages): blue-noise vs Floyd–Steinberg differ on
@@ -191,5 +246,7 @@ would otherwise run off the end of the error rows.
 ```
 scripts/verify/dither_model_sweep.py <host> <book>     # every model, both depths: distinct? deterministic?
 scripts/verify/plane_compare.py <ref.xtch> <cand.xtc> --list 7   # tone/ink/pepper in reflectance space
+clang++ -std=c++17 -O2 -I vendor-lib/Epub/Epub/converters \
+  scripts/verify/vendor_model_parity.cpp -o /tmp/ab/vendor_parity && /tmp/ab/vendor_parity
 build/ko_xtch_host <book.epub> out.xtc --1bit --image-dither 3   # Floyd-Steinberg, 2 tones
 ```

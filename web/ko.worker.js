@@ -156,7 +156,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '19';
+const FT_MODULE_VERSION = '20';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -234,7 +234,7 @@ async function init() {
   // Cache-bust the engine binaries: the emscripten glue fetches the .wasm with no version
   // query, so without this the edge serves a previously cached engine indefinitely and no
   // engine change can ever reach a returning browser.
-  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=19' : path) });
+  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=20' : path) });
   api = Module;
   // deterministic viewport: engine computes from margins; init with full logical
   api._ko_init(464, 778); // will be fixed up by ko_set_margins on first spec
@@ -615,7 +615,16 @@ self.onmessage = async (ev) => {
           warmToken++;
           while (warmRunning) await new Promise((r) => setTimeout(r, 15));
         }
-        api._ko_export_set_mode(ev.data.mode === 0 ? 0 : 1);
+        // The tone depth must follow the MODE, not whatever spec happens to be
+        // applied: a 1-bit page has to be dithered straight to 2 tones, and if the
+        // spec still says 4 the writer packs a 4-level page into one plane (the
+        // host CLI has always done this; the worker relied on the caller passing
+        // imageToneDepth, which any new export path could forget).
+        const exportMode = ev.data.mode === 0 ? 0 : 1;
+        api._ko_export_set_mode(exportMode);
+        const exportDepth = exportMode === 0 ? 2 : 4;
+        api._ko_set_image_tone_depth(exportDepth);
+        if (currentSpec) currentSpec.imageToneDepth = exportDepth;
         const opts = { xtcz: !!ev.data.xtcz };
         const res = await exportWholeBook(opts, (spine, ofSpines, pages) => {
           self.postMessage({ progress: true, spine, ofSpines, pages });

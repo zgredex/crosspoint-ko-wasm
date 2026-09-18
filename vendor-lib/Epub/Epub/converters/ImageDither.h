@@ -11,10 +11,15 @@
 //   2-bit XTCH -> 4 tones (levels[0..3] of the KO firmware's dither table)
 //   1-bit XTC  -> 2 tones (the two EXTREMES of that same table: black and white)
 // so the choice is not "4-level vs 1-level dithering" but ONE model applied at the depth
-// the export needs. Both depths use the firmware's own tables (kProfileMaster: binning
-// 30/50/140, level luminances 15/30/80/210 - the same {15,30,80,210} anchors the 1-bit
-// writer's kMonoInkDensity derives its 92%/67% ink densities from; see
-// docs/one-bit-dither-vs-threshold.md), so tone means the same thing in both modes.
+// the export needs.
+//
+// The model is the OFFICIAL converter's (epub2xtc.xteink.cn): bin selection 42/127/212 and
+// reconstruction levels 0/85/170/255, which is also what srokl/xtcjsapp and
+// x4converter.rho.sh ship. At 2 tones that gives the pair {0,255} and a cut at 127.5,
+// i.e. the vendor's v<128 -> 0 : 255. kProfileMaster (the fork's X4-perception tables,
+// 30/50/140 with 15/30/80/210) stays selectable for A/B measurement; the 1-bit writer's
+// kMonoInkDensity 92%/67% masks are that model's emulation of its two greys and are used
+// only for 1-bit TEXT anti-aliasing, not for image pixels.
 //
 // Models are from zgredex/crosspoint-pxc-converter (src/domain/dither.ts):
 //   blue-noise, bayer (ordered), fs, atk, jjn, stucki, burkes (error diffusion),
@@ -34,7 +39,7 @@ namespace ko {
 struct ImageDitherOptions {
   DitherMode mode = DitherMode::BLUE_NOISE;   // blue noise on the firmware's dither table
   uint8_t toneDepth = 4;                      // 4 = 2-bit page, 2 = 1-bit page
-  const QuantProfile* profile = &kProfileMaster;
+  const QuantProfile* profile = &kProfileNominal;   // official-model default
 };
 
 inline ImageDitherOptions& imageDitherOptionsRef() {
@@ -107,9 +112,11 @@ class ImageDitherer {
         // would turn 6.6% of pure-black pixels white, which the firmware never does.
         return koForkHashDither1Bit(gray, x, y);
 
-      case DitherMode::ZHOU_FANG:
+      case DitherMode::ZHOU_FANG: {
         if (opt_.toneDepth >= 4) return ed_.applyZhouFang(gray, lx, ly, levels, 4);
-        return ed_.applyZhouFang(gray, lx, ly, twoTone_, 2) ? 3 : 0;
+        const uint8_t two[2] = {black, white};
+        return ed_.applyZhouFang(gray, lx, ly, two, 2) ? 3 : 0;
+      }
 
       case DitherMode::BLUE_NOISE:
       case DitherMode::BAYER:
@@ -158,8 +165,9 @@ class ImageDitherer {
   int originX_ = 0;
   int originY_ = 0;
   int row_ = kNoRow;
-  // levels[0] = black, levels[3] = white in the KO table's luminance order
-  const uint8_t twoTone_[2] = {kProfileMaster.ditherLevels[0], kProfileMaster.ditherLevels[3]};
+  // The 2-tone pair is NOT stored here: it is read from the active profile per pixel
+  // (levels[0] = black, levels[3] = white). Freezing it to one profile is what made the
+  // 1-bit route silently keep the fork's {15,210} pair after the model changed.
 };
 
 // Name -> model, for the host CLI and any tooling that should not hard-code the enum
