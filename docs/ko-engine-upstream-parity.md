@@ -89,7 +89,7 @@ of this work, which confirms nothing else moved. An image-dominated book
 | `imageRendering` (0/1/2) | `IMAGE_RENDERING` | same | exact |
 | `screenMargin` (5–40 step 5, default 5) | `SCREEN_MARGIN_*` | same | exact |
 | `focusReadingEnabled` | forced **0** in the KO build | hardcoded 0 | exact |
-| `fontId` | `hasCustomFont() ? CUSTOM : KOPUB_14_FONT_ID` | defaults to **RIDIBatang 14** | **OPEN** |
+| `fontId` | `hasCustomFont() ? CUSTOM : KOPUB_14_FONT_ID` | same — KoPub Batang 14 | exact (RIDIBatang 14 kept as an XTCKO extra) |
 | `orientation` (4 modes) | remaps viewable margins; swaps 480×800 ↔ 800×480 | portrait only | **parked** |
 | `fontPointSize`, `fontFamily` | inert in the KO build (font comes from `getReaderFontId()`) | n/a | exact |
 | status bar, sleep, buttons, clock, theme, tilt, touch | device UI / hardware | absent | exact (see §5) |
@@ -107,30 +107,29 @@ bottom += max(screenMargin, statusBarHeight)
 viewport = screen − (left + right, top + bottom)
 ```
 
-Default margin 5 → `14 / 8 / 8 / 8` → **464 × 778 px**.
+Default margin 5 → `14 / 8 / 22 / 8` → **464 × 764 px** (statusBarHeight = 19 at the shipped
+defaults, see §5). The port now follows this exactly — `ko::geom::referenceMargins()` in
+`src/ko_engine_driver.h` and `marginsFor()` in `web/ko.worker.js` are the same arithmetic.
+The earlier `14 / 8 / 8 / 8` → 464 × 778 divergence is gone; see
+`docs/ko-oracle-conformance.md` §6 for the measurement and why the reservation is safe to
+bake into page geometry.
 
-## 5. Deliberate divergence — no UI in the file
+## 5. Status-bar lane — reserved in geometry, never drawn
 
-The device's EPUB reader reserves a status-bar lane
-(`statusBarHeight = 19` for the shipped defaults, via
-`UITheme::getStatusBarHeight()` → `metrics.statusBarVerticalMargin`, identical in
-all themes). **The converter does not**, because an XTC/XTCH page is a finished
-bitmap and the UI must never be encoded into it:
+The device's EPUB reader reserves a status-bar lane (`statusBarHeight = 19` for the shipped
+defaults, via `UITheme::getStatusBarHeight()` → `metrics.statusBarVerticalMargin`, identical
+in all shipped themes), and the exporter now reserves the same 19 px so its line breaks land
+where the reader's would. Nothing of the UI is drawn into a page: an XTC/XTCH page is a
+finished bitmap and the device composites its own chrome at read time
+(`XtcReaderActivity` + `xtcStatusBarMode`, whose default is `XTC_STATUS_BAR_HIDE`).
 
-- nothing of the UI is drawn into the page — that is the point;
-- the device composites its own chrome at read time (`XtcReaderActivity` +
-  `xtcStatusBarMode`, whose default is `XTC_STATUS_BAR_HIDE`);
-- baking the reserve in would make one book paginate differently based on a UI
-  setting the file does not contain.
-
-For reference, the reader's live-layout numbers would be 464 × 764 (defaults)
-versus our 464 × 778. If status-bar fidelity is ever wanted, it belongs in the
-**preview** as browser-composited chrome, never in the export.
+The reservation is a constant, not a function of a UI setting, so one book cannot paginate
+two ways because a device has its status bar configured differently.
 
 ## 6. Open items
 
-1. **Default face** — upstream ships `KOPUB_14_FONT_ID` (KoPub Batang 14) and
-   RIDIBatang does not exist there; the port currently defaults to RIDIBatang.
+1. ~~**Default face**~~ — closed: the port now ships `KOPUB_14_FONT_ID` as its default
+   (`getReaderFontId()`), with RIDIBatang 14 kept as a selectable extra.
 2. **Orientation** — the 4 firmware modes remain parked.
 3. **Deployment** — the live Pages site still carries the pre-fix engine and the
    earlier broken `_headers`; one redeploy of `dist/` resolves both.
@@ -245,7 +244,7 @@ return static_cast<int>(getLineHeight(fontId) * compression);          // 절사
 | `imageRendering` (0/1/2) | `IMAGE_RENDERING` | 동일 | 정확 |
 | `screenMargin` (5–40, 간격 5, 기본 5) | `SCREEN_MARGIN_*` | 동일 | 정확 |
 | `focusReadingEnabled` | 한국어 빌드에서 **0**으로 고정 | 0 하드코딩 | 정확 |
-| `fontId` | `hasCustomFont() ? CUSTOM : KOPUB_14_FONT_ID` | 기본이 **RIDIBatang 14** | **미결** |
+| `fontId` | `hasCustomFont() ? CUSTOM : KOPUB_14_FONT_ID` | 동일 — KoPub 바탕 14 | 정확 (RIDIBatang 14는 XTCKO 추가 글꼴) |
 | `orientation` (4개 모드) | 가시 영역 여백 재매핑, 480×800 ↔ 800×480 교체 | 세로 모드만 | **보류** |
 | `fontPointSize`, `fontFamily` | 한국어 빌드에서 무효 (`getReaderFontId()`가 글꼴 결정) | 해당 없음 | 정확 |
 | 상태 표시줄, 슬립, 버튼, 시계, 테마, 기울기, 터치 | 기기 UI / 하드웨어 | 없음 | 정확 (§5 참고) |
@@ -263,30 +262,27 @@ bottom += max(screenMargin, statusBarHeight)
 viewport = screen − (left + right, top + bottom)
 ```
 
-여백 기본값 5 → `14 / 8 / 8 / 8` → **464 × 778 px**.
+여백 기본값 5 → `14 / 8 / 22 / 8` → **464 × 764 px** (기본 설정에서 statusBarHeight = 19,
+§5 참고). 포트는 이제 이 계산을 그대로 따른다 — `src/ko_engine_driver.h`의
+`ko::geom::referenceMargins()`와 `web/ko.worker.js`의 `marginsFor()`가 같은 산술이다.
+이전의 `14 / 8 / 8 / 8` → 464 × 778 차이는 제거되었다. 측정값과 예약이 왜 안전한지는
+`docs/ko-oracle-conformance.md` §6 참고.
 
-## 5. 의도적 차이 — 파일에 UI를 넣지 않는다
+## 5. 상태 표시줄 영역 — 기하에는 예약, 파일에는 없음
 
-기기의 EPUB 리더는 상태 표시줄 영역을 예약한다(출시 기본값에서
-`statusBarHeight = 19`, `UITheme::getStatusBarHeight()` →
-`metrics.statusBarVerticalMargin`이며 모든 테마에서 동일). **변환기는 그렇게 하지
-않는다.** XTC/XTCH 페이지는 완성된 **비트맵**이며 UI는 절대 그 안에 인코딩되어서는
-안 되기 때문이다:
+기기 EPUB 리더는 상태 표시줄 영역을 예약하며(`출시 기본값에서 statusBarHeight = 19`,
+`UITheme::getStatusBarHeight()` → `metrics.statusBarVerticalMargin`, 모든 테마 동일),
+변환기도 같은 19 px를 예약해 줄바꿈 위치가 리더와 같아진다. 페이지에 UI를 그려 넣지는
+않는다: XTC/XTCH 페이지는 완성된 비트맵이고 기기는 읽는 시점에 자체 크롬을 합성한다
+(`XtcReaderActivity` + `xtcStatusBarMode`, 기본값 `XTC_STATUS_BAR_HIDE`).
 
-- 페이지에 UI를 그려 넣지 않는다 — 이것이 핵심이다;
-- 기기는 읽는 시점에 자체 크롬을 합성한다(`XtcReaderActivity` +
-  `xtcStatusBarMode`, 기본값 `XTC_STATUS_BAR_HIDE`);
-- 이 영역을 미리 비워 두면, 파일 자체에는 담기지 않은 UI 설정 때문에 같은 책의
-  페이지 나눔이 달라진다.
-
-참고로 리더의 실시간 레이아웃 수치는 기본값에서 464 × 764이며, 우리 쪽은
-464 × 778이다. 상태 표시줄 충실도가 필요해진다면 그것은 **미리보기**의 문제이며,
-브라우저가 합성하는 크롬으로 처리해야 하고 내보내기에는 절대 넣지 않는다.
+예약은 UI 설정의 함수가 아니라 상수이므로, 기기의 상태 표시줄 설정 때문에 같은 책이
+두 가지로 나뉘는 일은 없다.
 
 ## 6. 미결 사항
 
-1. **기본 글꼴** — 업스트림은 `KOPUB_14_FONT_ID`(KoPub 바탕 14)를 제공하며
-   RIDIBatang은 그곳에 존재하지 않는다. 현재 포트의 기본값은 RIDIBatang이다.
+1. ~~**기본 서체**~~ — 종료: 포트의 기본값은 이제 `KOPUB_14_FONT_ID`이며
+   (`getReaderFontId()`), RIDIBatang 14는 선택 가능한 추가 글꼴로 남는다.
 2. **화면 방향** — 4개 펌웨어 모드는 여전히 보류 상태다.
 3. **배포** — 라이브 Pages 사이트는 아직 수정 전 엔진과 이전의 잘못된 `_headers`를
    제공하고 있다. `dist/`를 한 번 다시 배포하면 둘 다 해결된다.

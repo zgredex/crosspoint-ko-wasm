@@ -137,15 +137,15 @@
       <div class="ctrl segRow">
         <span>글꼴 선택</span>
         <select id="fontPreset" class="visHidden">
-          <option value="ridibatang" selected>RIDIBatang 14 (기본)</option>
-          <option value="kopub">KoPub Batang 14 (내장)</option>
+          <option value="kopub" selected>KoPub Batang 14 (기준 기본 글꼴)</option>
+          <option value="ridibatang">RIDIBatang 14 (XTCKO 추가)</option>
           <option value="custom">사용자 글꼴 (.epdfont)</option>
         </select>
         <span class="seg" role="radiogroup" aria-label="본문 글꼴">
-          <label class="segOpt"><input type="radio" name="fontPresetRadio" value="ridibatang" checked
-                 title="RIDIBatang 14 — KO 빌드 기본 글꼴"><span>RIDIBatang 14</span></label>
-          <label class="segOpt"><input type="radio" name="fontPresetRadio" value="kopub"
-                 title="KoPub Batang 14 (기본 내장)"><span>KoPub Batang 14</span></label>
+          <label class="segOpt"><input type="radio" name="fontPresetRadio" value="kopub" checked
+                 title="KoPub Batang 14 — CrossPoint-KO 기본 본문 글꼴 (getReaderFontId 기본값)"><span>KoPub Batang 14</span></label>
+          <label class="segOpt"><input type="radio" name="fontPresetRadio" value="ridibatang"
+                 title="RIDIBatang 14 — XTCKO 추가 글꼴 (기준 엔진에는 없음)"><span>RIDIBatang 14</span></label>
           <label class="segOpt"><input type="radio" name="fontPresetRadio" value="custom"
                  title="사용자 글꼴 (OTF/TTF를 브라우저에서 변환)"><span>사용자 글꼴</span></label>
         </span>
@@ -174,7 +174,7 @@
           <input type="text" id="fontName" value="custom" maxlength="24">
         </label>
 
-        <label class="ctrl" title="KO 리더 150 dpi 기준 크기 — 14가 내장 RIDIBatang과 같습니다">
+        <label class="ctrl" title="KO 리더 150 dpi 기준 크기 — 14가 기본 글꼴(KoPub Batang 14)과 같습니다">
           <span>글자 크기</span>
           <input type="range" id="fontSize" min="8" max="48" step="1" value="14">
           <output id="fontSizeOut">14 pt</output>
@@ -293,10 +293,13 @@
       <details class="adv" id="engineInfo">
         <summary>변환 엔진 정보</summary>
         <p class="hint">
-          엔진: crosspoint-reader-ko 1.5.0-ko.3 (MIT) WASM 빌드 — KO 타이포그래피<br>
-          본문 글꼴: RIDIBatang 14(기본, advanceY 38), KoPub Batang 14(기본 내장, advanceY 32),
+          엔진: crosspoint-reader-ko @ release/korean 84a39194 (MIT) WASM 빌드 — KO 타이포그래피<br>
+          본문 글꼴: KoPub Batang 14(기본, getReaderFontId 기본값, advanceY 32), RIDIBatang 14(XTCKO 추가, advanceY 38),
           사용자 .epdfont(OTF/TTF 변환). 줄 높이는 펌웨어 값(반올림):
-          RIDIBatang 14는 38/46/53 px, KoPub 14는 32/38/45 px (좁게/보통/넓게)
+          KoPub 14는 32/38/45 px, RIDIBatang 14는 38/46/53 px (좁게/보통/넓게)<br>
+          쪽 여백은 리더 계산식 그대로입니다: 가시 영역 9/3/3/3 + screenMargin,
+          아래는 max(screenMargin, 상태 표시줄 19 px). 기본값 14/8/22/8 → 본문 영역 464×764.
+          상태 표시줄 영역은 <b>예약만</b> 하고 페이지에 그려 넣지 않습니다 — 기기가 읽을 때 자체 크롬을 합성합니다.
         </p>
       </details>
     </details>

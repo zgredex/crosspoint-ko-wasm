@@ -26,6 +26,37 @@ add_compile_definitions(XML_GE=0 XML_CONTEXT_BYTES=1024)
 set(STUB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
 set(VL ${CMAKE_CURRENT_SOURCE_DIR}/vendor-lib)
 
+# ---------------------------------------------------------------------------
+# Reference ("oracle") engine build.
+#
+# -DKO_ENGINE_ROOT=<dir> compiles the engine from a DIFFERENT source root than
+# vendor-lib, so the pinned upstream checkout can be RUN against the port on the
+# same book and the two outputs diffed — a source diff only tells you the text
+# differs, not whether the behaviour does.
+#
+# The root must have vendor-lib's layout (Epub/, GfxRenderer/, EpdFont/, ...),
+# which is exactly what the reference repo's lib/ directory is. There is no
+# copying and no per-file patching: the reference files are compiled as they are,
+# and vendor-lib is appended to the include path only so the port's extra faces
+# (ridibatang/pretendard, which upstream does not ship) still resolve. Every
+# reference file that exists therefore wins over its vendored copy — a
+# substitution is not possible by accident.
+#
+# KO_ORACLE_BUILD also switches the driver off the port's text-once capture path
+# (ko_engine_driver.h), which exists only in the port's GfxRenderer; the reference
+# does the plain three-pass render. That is the one place the harness adapts, and
+# it is a driver-side choice, not an engine one.
+# ---------------------------------------------------------------------------
+set(KO_ENGINE_ROOT "" CACHE PATH "engine source root to compile instead of vendor-lib (default: none)")
+if(KO_ENGINE_ROOT)
+  if(NOT IS_DIRECTORY "${KO_ENGINE_ROOT}")
+    message(FATAL_ERROR "KO_ENGINE_ROOT is not a directory: ${KO_ENGINE_ROOT}")
+  endif()
+  set(VL "${KO_ENGINE_ROOT}")
+  add_compile_definitions(KO_ORACLE_BUILD=1)
+  message(STATUS "KO_ENGINE_ROOT set → compiling the engine from ${VL} (KO_ORACLE_BUILD=1)")
+endif()
+
 include_directories(
   ${STUB_DIR}                                  # our shims first (Arduino/Hal*/Logging)
   ${VL}/Epub
@@ -48,9 +79,31 @@ include_directories(
   ${VL}/expat
   ${VL}/XmlParserUtils
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/JPEGDEC
   ${STUB_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+# Port-only sources and headers, always from the port even in a reference build:
+# the extra Korean faces (upstream ships neither) and every ${VL} entry that the
+# reference tree lacks. Appended AFTER the engine root so it can only fill gaps,
+# never shadow a reference file. The oracle build prints the list so a gap is
+# visible in the build log instead of being discovered as a rendering difference.
+set(PORT_ONLY_DIRS
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor-lib/EpdFont
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor-lib/Epub
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor-lib/Epub/Epub
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor-lib/GfxRenderer
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor-lib
+)
+if(KO_ENGINE_ROOT)
+  include_directories(${PORT_ONLY_DIRS})
+  foreach(_f builtinFonts/ridibatang_14_regular.h builtinFonts/pretendard_10_regular.h)
+    if(NOT EXISTS "${VL}/EpdFont/${_f}")
+      message(STATUS "  port-only header fallback: EpdFont/${_f}")
+    endif()
+  endforeach()
+endif()
 
 set(ENGINE_SOURCES
   ${VL}/Epub/Epub.cpp
@@ -108,6 +161,48 @@ set(STUB_SOURCES
   ${STUB_DIR}/esp_shim.cpp
   ${STUB_DIR}/uzlib_checksums.c
 )
+
+# Declared substitutions for a reference build — one, and it is forced.
+#
+# The reference's PNG path compiles against PNGdec, a bitbank2/ESP32 library that
+# does not exist anywhere in this tree (the port decodes PNG with libpng), so the
+# port's PngToFramebufferConverter stands in: without it nothing that touches a PNG
+# links, and a conformance harness that cannot build the thing it certifies is
+# worthless. Its JPEG counterparts are NOT substituted: JPEGDEC is vendored under
+# third_party/JPEGDEC, so the reference's own JPEG decoders compile and run here.
+#
+# Consequences for the gate, stated instead of glossed:
+#   * text is compared byte-for-byte (planes included);
+#   * JPEG images are compared the same way, decoder and all;
+#   * PNG images are compared on LAYOUT only — two different PNG decoders agree on
+#     dimensions and pixels, but that is a claim, not a measurement, so it is not
+#     gated as one.
+if(KO_ENGINE_ROOT)
+  set(_port_vl ${CMAKE_CURRENT_SOURCE_DIR}/vendor-lib)
+  set(_substitutions
+    Epub/Epub/converters/PngToFramebufferConverter.cpp)
+  foreach(_rel ${_substitutions})
+    if(NOT EXISTS "${_port_vl}/${_rel}")
+      message(FATAL_ERROR "declared substitution does not exist in the port: ${_rel}")
+    endif()
+    message(STATUS "  declared substitution (no host implementation in the reference): ${_rel}")
+  endforeach()
+  set(_mapped "")
+  foreach(_src ${ENGINE_SOURCES})
+    string(REPLACE "${VL}/" "" _rel "${_src}")
+    if(_rel IN_LIST _substitutions)
+      list(APPEND _mapped "${_port_vl}/${_rel}")
+    else()
+      list(APPEND _mapped "${_src}")
+    endif()
+  endforeach()
+  list(LENGTH ENGINE_SOURCES _n_total)
+  list(LENGTH _substitutions _n_sub)
+  message(STATUS "  engine TUs: ${_n_total} (${_n_sub} substituted, ${_n_total} minus ${_n_sub} from the reference)")
+  set(ENGINE_SOURCES "${_mapped}")
+  # The reference's JPEG decoders need their implementation linked.
+  list(APPEND ENGINE_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/JPEGDEC/JPEGDEC.cpp)
+endif()
 
 # ---------------------------------------------------------------------------
 # libjpeg-turbo, vendored so host and wasm share ONE decoder implementation.

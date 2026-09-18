@@ -183,7 +183,8 @@ on-device `XtcReaderActivity::getPixelValue`, and real `.xtch` file byte dissect
 
 1. Image decode relies on JPEGDEC/PNGdec (portable C); very wide/slim PNGs beyond the PNGdec
    row-buffer limit (PNG_MAX_BUFFERED_PIXELS) fail to decode on-page (matches preview).
-2. Fonts: RIDIBatang 14 (KO default) + KoPub Batang 14 built in; runtime `.epdfont` via
+2. Fonts: KoPub Batang 14 (reference default, `getReaderFontId()`) + RIDIBatang 14 as an
+   XTCKO extra; runtime `.epdfont` via
    SdFont resident preload (whole font in RAM). Embedded TTF in EPUBs is not used by the
    device engine (no @font-face support) — all text renders in the spec fontId.
 3. Output is uncompressed by design for XTC/XTCH; the XTCZ (LZ4) wrapper (`ko_xtcz_wrap`)

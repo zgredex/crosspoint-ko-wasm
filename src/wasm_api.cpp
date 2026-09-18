@@ -171,7 +171,8 @@ KO_EXPORT void ko_set_image_dither(int v) { g_spec.imageDither = v; }
 KO_EXPORT void ko_set_image_tone_depth(int v) { g_spec.imageToneDepth = (v == 2) ? 2 : 4; }
 KO_EXPORT void ko_set_focus_reading(int v) { (void)v; g_spec.focusReadingEnabled = 0; }  // EN-only; hardcoded off in KO
 
-// Reader font: RIDIBATANG_14_FONT_ID (default) / KOPUB_14_FONT_ID / CUSTOM_FONT_ID
+// Reader font: KOPUB_14_FONT_ID (reference default) / RIDIBATANG_14_FONT_ID (XTCKO
+// extra) / CUSTOM_FONT_ID.
 // §2/§3 of the KoPub-externalization groundwork. ko_set_font() accepted KOPUB_14_FONT_ID by id alone,
 // so with the face compiled out (or before a lazy fetch has landed) the JS believed the layout was
 // KoPub while the renderer drew whatever it actually had. A face that is not registered must fail
@@ -273,14 +274,15 @@ KO_EXPORT int ko_clear_custom_font() {
     g_renderer->removeFont(CUSTOM_FONT_ID);
   }
   if (g_spec.fontId == CUSTOM_FONT_ID) {
-    g_spec.fontId = RIDIBATANG_14_FONT_ID;
+    // Back to the reference default face, not to a port-specific one.
+    g_spec.fontId = KOPUB_14_FONT_ID;
   }
   return 0;
 }
 
 // Active reader font metrics: returns baseline advance (lineHeight) for the
 // current font at the default (uncompressed) multiplier — the KO doc's
-// advanceY (RIDIBatang 14 → 38 px).
+// advanceY (KoPub Batang 14 → 32 px, RIDIBatang 14 → 38 px).
 KO_EXPORT int ko_font_advance_y() {
   if (!g_renderer) return 0;
   return g_renderer->getLineHeight(g_spec.fontId);

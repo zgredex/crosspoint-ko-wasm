@@ -237,7 +237,7 @@
       // 'custom' only when a runtime font is actually loaded; otherwise the
       // worker would silently keep the default while the UI claims custom.
       font: els.fontPreset.value === 'custom'
-        ? (customFontLoaded ? 'custom' : 'ridibatang')
+        ? (customFontLoaded ? 'custom' : 'kopub')
         : els.fontPreset.value,
     };
   }
@@ -253,15 +253,16 @@
     els.textAa.checked = true;                // device default: on
     els.screenMargin.value = '5';
     els.screenMarginOut.textContent = '5 px';
-    // NOTE: the device's status-bar settings deliberately do NOT feed layout.
-    // The reader reserves a 19 px status-bar lane on-device, but an XTC/XTCH
-    // page is a finished bitmap and the UI must not be encoded into it — the
-    // device composites its own chrome at read time (xtcStatusBarMode, default
-    // hidden). Keeping the file UI-free is why there is no status-bar control
-    // in this panel.
+    // Reference geometry. The reader reserves a 19 px status-bar lane
+    // (UITheme::getStatusBarHeight() on shipped defaults) and screenMargin is
+    // added to all four sides, bottom being max(screenMargin, 19) — see
+    // marginsFor() in ko.worker.js. The lane is a reservation only: no
+    // status-bar pixels are ever written into an exported page, the device
+    // composites its own chrome at read time. It is here so text lands on the
+    // same y the reference reader would use.
     els.imageRendering.value = '0';
     els.imageDither.value = '2';              // blue noise (the firmware's model)
-    els.fontPreset.value = 'ridibatang';
+    els.fontPreset.value = 'kopub';           // CrossPointSettings::getReaderFontId() default
     els.fontSize.value = '14';
     els.fontSizeOut.textContent = '14 pt';
     els.fontWeight.value = '500';
@@ -1033,7 +1034,7 @@
       if (el.type === 'checkbox') el.checked = !!o[id]; else el.value = o[id];
     }
     if (o.fontPreset === 'custom') {          // the .epdfont itself is not remembered
-      const p = els.fontPreset; if (p) p.value = 'ridibatang';
+      const p = els.fontPreset; if (p) p.value = 'kopub';
     }
     syncFontSeg();                            // the radios mirror the (restored) select
     toggleFontPanel();

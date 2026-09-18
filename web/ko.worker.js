@@ -175,37 +175,44 @@ function defaultSpec() {
     imageDither: 2,        // blue noise
     imageToneDepth: 4,     // 2-bit until the app says otherwise
     screenMargin: 5,
-    font: 'ridibatang',      // reader face preset
+    // Reader face. CrossPoint-KO's own default: CrossPointSettings::
+    // getReaderFontId() returns hasCustomFont() ? CUSTOM_FONT_ID : KOPUB_14_FONT_ID.
+    // RIDIBatang does not exist upstream — it is an XTCKO extra, selectable but
+    // never the default, because a different face means different advances and
+    // therefore different line breaks.
+    font: 'kopub',
   };
 }
 
 // ---------------------------------------------------------------------------
-// Text-viewport derivation for the EXPORTED FILE.
+// Text-viewport derivation for the EXPORTED FILE — the reference reader's own
+// arithmetic (CrossPoint-KO @ release/korean, EpubReaderActivity::render()):
 //
-// GfxRenderer::getOrientedViewableTRBL() supplies the viewable margins (portrait
-// 9/3/3/3) and the reader adds screenMargin to every side:
-//
-//   t += screenMargin;  r += screenMargin;  b += screenMargin;  l += screenMargin;
+//   GfxRenderer::getOrientedViewableTRBL()  →  portrait 9/3/3/3
+//   t += screenMargin;  r += screenMargin;  l += screenMargin;
+//   b += max(screenMargin, UITheme::getStatusBarHeight());
 //   viewport = screen - (l+r, t+b)
 //
-// DELIBERATE DIVERGENCE — and it is a hard product constraint: the device's EPUB
-// reader ALSO reserves the status-bar lane (EpubReaderActivity::render() does
-// `b += max(screenMargin, statusBarHeight)`, statusBarHeight = 19 for shipped
-// defaults). We do NOT, because an XTC/XTCH page is a finished BITMAP and the UI
-// must never be encoded into it:
+// getStatusBarHeight() at CrossPointSettings' shipped defaults is
+// metrics.statusBarVerticalMargin = 19: the text lane is visible
+// (statusBarChapterPageCount / statusBarBookProgressPercentage /
+// statusBarTitle=CHAPTER_TITLE / statusBarBattery are all on by default) and
+// progressBarMode is HIDE_PROGRESS, so there is no second term. All shipped
+// themes use 19 (BaseTheme.h / LyraTheme.h / RoundedRaffTheme.h).
 //
-//   * nothing of the UI is drawn into the page — that is the point,
-//   * the device composites its own chrome at read time (XtcReaderActivity +
-//     xtcStatusBarMode, default XTC_STATUS_BAR_HIDE),
-//   * reserving the lane here would bake a UI-driven gap into page geometry, so
-//     one book would paginate differently based on a UI setting the file does
-//     not contain.
+// The lane is a RESERVATION, not content. Nothing of the status bar is ever
+// written into an exported page — the device composites its own chrome at read
+// time (XtcReaderActivity, xtcStatusBarMode default XTC_STATUS_BAR_HIDE) — but
+// reserving it is what puts the lines on the same y the reader would use, and
+// that is the whole point of following this engine. Texts paginate identically
+// whether or not the device has a status bar switched on, because the
+// reservation is a constant here, not a function of a UI setting.
 //
-// Net: default margins 14/8/8/8 → viewport 464x778, matching the official
-// converter byte-for-byte. The reader's live-layout numbers (464x764) are a
-// *preview* concern only — chrome composited by the browser, never exported.
+// Net: default margins 14/8/22/8 → viewport 464x764, matching the reference
+// reader's live layout.
 // ---------------------------------------------------------------------------
 const VIEWABLE_MARGIN = { top: 9, right: 3, bottom: 3, left: 3 };  // GfxRenderer::VIEWABLE_MARGIN_*
+const REFERENCE_STATUS_LANE = 19;   // UITheme::getStatusBarHeight() on the shipped defaults
 const SCREEN_W = 480;
 const SCREEN_H = 800;
 
@@ -215,7 +222,7 @@ function marginsFor(spec) {
     top: VIEWABLE_MARGIN.top + m,
     right: VIEWABLE_MARGIN.right + m,
     left: VIEWABLE_MARGIN.left + m,
-    bottom: VIEWABLE_MARGIN.bottom + m,
+    bottom: VIEWABLE_MARGIN.bottom + Math.max(m, REFERENCE_STATUS_LANE),
   };
 }
 
@@ -417,7 +424,7 @@ async function init() {
   Module = await factory({ locateFile: (path) => asset(path) });
   api = Module;
   // deterministic viewport: engine computes from margins; init with full logical
-  api._ko_init(464, 778); // will be fixed up by ko_set_margins on first spec
+  api._ko_init(464, 764); // will be fixed up by ko_set_margins on first spec
   return true;
 }
 
@@ -877,8 +884,8 @@ self.onmessage = async (ev) => {
         clearFrameCache();    // §6: frames keyed by the old stamp can never hit again
         appliedFont = null;          // §1: face selection must be re-sent
         api._ko_clear_custom_font();
-        currentSpec = Object.assign(currentSpec || defaultSpec(), { font: 'ridibatang' });
-        post(id, true, { font: 'ridibatang', fontStamp });
+        currentSpec = Object.assign(currentSpec || defaultSpec(), { font: defaultSpec().font });
+        post(id, true, { font: defaultSpec().font, fontStamp });
         break;
       }
 

@@ -1,6 +1,9 @@
 # CMake build outputs
 build/
 build-wasm/
+# reference-build trees (compiled from the pinned CrossPoint-KO checkout)
+build-oracle/
+build-oracle-perturbed/
 
 # Python caches
 __pycache__/

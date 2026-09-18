@@ -29,6 +29,7 @@
 #include <EpdFontFamily.h>
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
+#include "layout_manifest.h"
 // §5 font-contribution measurement toggles. Default 1 so every other build (native host, any TU
 // that misses the definition) keeps the fonts embedded and behaves exactly as before.
 #ifndef KO_EMBED_KOPUB
@@ -61,6 +62,66 @@ struct RenderedPage {
   std::vector<uint8_t> msb;   // 48000 bytes: MSB gray plane (light+dark mask)
 };
 
+// Page geometry as the REFERENCE reader computes it.
+//
+// CrossPoint-KO @ release/korean 84a39194, EpubReaderActivity::render():
+//
+//   renderer.getOrientedViewableTRBL(&t,&r,&b,&l);   // portrait 9/3/3/3
+//   t += SETTINGS.screenMargin;  l += SETTINGS.screenMargin;  r += SETTINGS.screenMargin;
+//   b += std::max(SETTINGS.screenMargin, UITheme::getStatusBarHeight());
+//
+// getStatusBarHeight() at shipped defaults (CrossPointSettings.h):
+//   statusBarChapterPageCount=1, statusBarBookProgressPercentage=1,
+//   statusBarTitle=CHAPTER_TITLE, statusBarBattery=1  →  textLaneVisible(true) == true
+//   progressBarMode=HIDE_PROGRESS                     →  no progress bar term
+//   → UITheme::getStatusBarHeight() == metrics.statusBarVerticalMargin == 19
+//     (BaseTheme.h:138 / LyraTheme.h:37 / RoundedRaffTheme.h:37 — all shipped themes)
+//
+// So the reference viewport on the 480x800 panel is 464x764 at the default
+// screenMargin of 5, and every screenMargin step grows top/left/right by 5 while
+// the bottom stays pinned to the 19 px lane until screenMargin exceeds it.
+//
+// The lane is a RESERVATION, not content: nothing of the status bar is ever
+// written into an exported page (the device composites its own chrome at read
+// time, and XtcReaderActivity's default xtcMode is XTC_STATUS_BAR_HIDE). It
+// exists here only so the lines land on the same y the reader would put them on.
+namespace geom {
+
+constexpr int kViewableTop = 9;     // GfxRenderer::VIEWABLE_MARGIN_TOP
+constexpr int kViewableRight = 3;   // GfxRenderer::VIEWABLE_MARGIN_RIGHT
+constexpr int kViewableBottom = 3;  // GfxRenderer::VIEWABLE_MARGIN_BOTTOM
+constexpr int kViewableLeft = 3;    // GfxRenderer::VIEWABLE_MARGIN_LEFT
+
+constexpr int kScreenMarginDefault = 5;   // CrossPointSettings::SCREEN_MARGIN_MIN
+constexpr int kScreenMarginMin = 5;       // SCREEN_MARGIN_MIN
+constexpr int kScreenMarginMax = 40;      // SCREEN_MARGIN_MAX
+constexpr int kScreenMarginStep = 5;      // SCREEN_MARGIN_STEP
+
+// UITheme::getStatusBarHeight() on the shipped defaults. Fixed: the reference
+// reader has no way to be in a state where the lane height differs without the
+// user changing status-bar settings, and those are not part of a book.
+constexpr int kReferenceStatusLane = 19;
+
+struct Margins {
+  int top;
+  int right;
+  int bottom;
+  int left;
+};
+
+constexpr Margins referenceMargins(int screenMargin) {
+  return Margins{kViewableTop + screenMargin, kViewableRight + screenMargin,
+                 kViewableBottom + (screenMargin > kReferenceStatusLane ? screenMargin : kReferenceStatusLane),
+                 kViewableLeft + screenMargin};
+}
+
+constexpr bool isScreenMarginAllowed(int screenMargin) {
+  return screenMargin >= kScreenMarginMin && screenMargin <= kScreenMarginMax &&
+         (screenMargin - kScreenMarginMin) % kScreenMarginStep == 0;
+}
+
+}  // namespace geom
+
 // Mirror of CrossPointSettings knobs (values identical to device enums).
 struct Spec {
   // --- Korean typography / layout knobs ---
@@ -80,14 +141,33 @@ struct Spec {
   int imageDither = 2;                // BLUE_NOISE (the previous fixed behaviour)
   int imageToneDepth = 4;             // 4 = 2-bit XTCH, 2 = 1-bit XTC
   // --- page geometry ---
+  // Reference-reader geometry at the default screenMargin: 14 / 8 / 22 / 8 →
+  // viewport 464x764. See ko::geom above for the derivation from
+  // EpubReaderActivity::render(). applyScreenMargin() recomputes all four from a
+  // screenMargin value; setting the margins directly is the raw override the
+  // measurement flags use.
   uint16_t viewportWidth = 0;         // set by driver from margins
   uint16_t viewportHeight = 0;
-  int marginTop = 14;                 // physical-ish logical offsets (9 viewable + 5 screen)
-  int marginRight = 8;
-  int marginBottom = 8;
-  int marginLeft = 8;
+  int marginTop = geom::referenceMargins(geom::kScreenMarginDefault).top;
+  int marginRight = geom::referenceMargins(geom::kScreenMarginDefault).right;
+  int marginBottom = geom::referenceMargins(geom::kScreenMarginDefault).bottom;
+  int marginLeft = geom::referenceMargins(geom::kScreenMarginDefault).left;
   // --- reader face ---
-  int fontId = RIDIBATANG_14_FONT_ID;  // KO typography build default
+  // CrossPoint-KO's reader face. CrossPointSettings::getReaderFontId() returns
+  // hasCustomFont() ? CUSTOM_FONT_ID : KOPUB_14_FONT_ID — RIDIBatang does not
+  // exist upstream, so it is an XTCKO extra, never the default.
+  int fontId = KOPUB_14_FONT_ID;
+
+  // Recompute all four margins the way the reference does. Call before the
+  // first buildSection(); the viewport is derived from the margins, never set
+  // independently.
+  void applyScreenMargin(int screenMargin) {
+    const geom::Margins m = geom::referenceMargins(screenMargin);
+    marginTop = m.top;
+    marginRight = m.right;
+    marginBottom = m.bottom;
+    marginLeft = m.left;
+  }
 };
 
 class EngineDriver {
@@ -152,11 +232,16 @@ class EngineDriver {
     ko::setImageDitherOptions(opts);
   }
 
-  bool renderPage(int pageIndex, const Spec& spec, RenderedPage& out) {
+  bool renderPage(int pageIndex, const Spec& spec, RenderedPage& out, ManifestPage* probe = nullptr,
+                  int spineIndex = 0) {
     if (!section_) return false;
     applyImageDitherOptions(spec);
     auto page = section_->loadPage(pageIndex);
     if (!page) return false;
+    // Probe the layout while the page is alive. Cheap relative to the render, and it
+    // keeps ONE code path: the manifest can never describe a different page than the
+    // one that produced the planes.
+    if (probe) *probe = probePage(*page, spineIndex, pageIndex);
 
     auto renderPass = [&](bool imagesOnly) {
       if (!imagesOnly || page->hasImages()) {
@@ -173,7 +258,8 @@ class EngineDriver {
 
     const bool aaOn = spec.textAntiAliasing != 0;
     // ---------------------------------------------------------------------
-    // TEXT-ONCE PATH - ENABLED, gated byte-identical (docs/stage-a-text-once.md).
+    // TEXT-ONCE PATH — the port's optimization. ENABLED for the port build, gated
+    // byte-identical against the pre-change engine (docs/stage-a-text-once.md).
     //
     // With AA on the gray passes contribute nothing but the text's coverage
     // classification, so text is blitted ONCE (the BW pass) while its per-pixel
@@ -200,29 +286,51 @@ class EngineDriver {
     // Measured on the 2,034-page Korean text book: renderPage 1,370 -> 892 ms
     // (-35%), total 1,521 -> 1,043 ms; 0/2,034 pages differ. Book-wide gates
     // (text book, image book, and real EPUBs) are recorded in the doc above.
+    //
+    // REFERENCE BUILD (KO_ORACLE_BUILD): forced OFF, and the capture calls do not
+    // exist at all. The reference GfxRenderer has no capture API — its behaviour IS
+    // the plain three-pass render — so the reference build is also the standing
+    // control that keeps this optimization honest: if the two builds' planes ever
+    // differ, the shortcut is wrong.
     // ---------------------------------------------------------------------
+#ifdef KO_ORACLE_BUILD
+    const bool textOnce = false;
+#else
     const bool textOnce = true;
+#endif
     // AA OFF means text is drawn in the BW pass only: the reference's gray passes
     // render images and nothing else, so an AA-off page carries no text greys at
     // all. The capture must be switched off together with it, or the composed gray
     // planes would carry text greys that an AA-off page must not have.
     const bool captureText = textOnce && aaOn;
 
+    // The three calls below are the port's capture API. It does not exist in the
+    // reference renderer, so the reference build simply does not make them — and
+    // captureText is compile-time false there, so nothing is skipped that would
+    // have run.
+#ifndef KO_ORACLE_BUILD
     if (captureText) renderer_.beginLevelCapture();
+#endif
     renderPass(false);
+#ifndef KO_ORACLE_BUILD
     if (captureText) renderer_.endLevelCapture();
+#endif
     out.bw.assign(display_.getFrameBuffer(), display_.getFrameBuffer() + 48000);
 
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     renderPass(textOnce ? true : !aaOn);
+#ifndef KO_ORACLE_BUILD
     if (captureText) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), true);
+#endif
     renderer_.copyGrayscaleLsbBuffers();
 
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
     renderPass(textOnce ? true : !aaOn);
+#ifndef KO_ORACLE_BUILD
     if (captureText) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), false);
+#endif
     renderer_.copyGrayscaleMsbBuffers();
 
     renderer_.setRenderMode(GfxRenderer::BW);
