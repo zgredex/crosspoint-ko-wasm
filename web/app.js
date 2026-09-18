@@ -59,8 +59,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=56');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=61');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -104,6 +103,7 @@
     // the export engine holds the same book and must go with it, or it would convert a book the reader
     // has already replaced
     killExportEngine();
+    killPool();                       // a new book invalidates every pooled engine's heap too
     // kill worker + reject in-flight calls so no promise hangs forever
     try { worker.terminate(); } catch (_) {}
     worker = spawnWorker();
@@ -148,10 +148,22 @@
   // page otherwise, and the split-engine gate needs to inspect and destroy it deliberately: a
   // correctness test for "the export engine was told font:custom but never given one" cannot be
   // driven through the UI, because the UI is now careful enough not to produce that state.
+  // Where the workers live, resolved once. Each spawner used to derive this locally; adding a third
+  // spawner (the pool) without the derivation was an instant runtime error.
+  const WORKER_BASE = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
+
   window.__export = {
     call: (...a) => exportCall(...a),
     kill: () => killExportEngine(),
     isLoaded: () => !!exportLoaded,
+  };
+
+  // Debug hook for the export pool, for the same reason: the pool's behaviour (how many engines it
+  // built, whether pooled bytes equal serial bytes) is not visible from the page otherwise.
+  window.__pool = {
+    run: (mode, xtcz, engines) => pooledExportBook(mode === 0 ? 0 : 1, !!xtcz, null, engines),
+    size: () => poolSize(book ? book.spineCount : 1),
+    engines: () => poolEngines.length,
   };
 
   // ---- the export engine ------------------------------------------------------
@@ -184,8 +196,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=56');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=61');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -1462,6 +1473,154 @@
   // Export the whole book at the current mode, then hand the browser the file.
   // Fast path: if the background warm already produced bytes for exactly this
   // output key, pull them from the worker (no re-render) and download.
+
+  // ---- export pool -----------------------------------------------------------
+  // The serial export walks every spine on ONE engine. The pool walks them across N engines and
+  // assembles centrally. Two properties are enforced here rather than hoped for:
+  //
+  //   * spines are dispatched DYNAMICALLY — a worker pulls the next index when it finishes, instead of
+  //     being handed a contiguous block. Spine cost is measurably uneven (one spine of 60 carries ~9%
+  //     of the work on the big fixture), and a static split would leave every other worker idle behind
+  //     whoever drew the heavy one.
+  //   * assembly order is SPINE order, never completion order. Page numbering and the chapter table
+  //     are functions of position in the book; a fast worker finishing first must not affect them.
+  //
+  // Pool members are deliberately NOT the export engine: that engine also serves the background warm
+  // and the single-engine path the pool is measured against. Keeping them separate means a pool member
+  // can be destroyed at any time without invalidating a warm or the download path.
+  const POOL_MAX = 8;              // beyond this the per-engine constant costs dominate the gain
+  let poolEngines = [];            // [{ call, kill, loaded, busy }]
+  let poolKey = null;              // book identity the current pool was built for
+
+  function poolSize(spineCount) {
+    const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+    // One engine fewer than the machine has, so the reader's own engine and the compositor keep a
+    // core; never more engines than spines to hand out.
+    return Math.max(1, Math.min(spineCount, Math.max(1, hw - 1), POOL_MAX));
+  }
+
+  function killPool() {
+    for (const e of poolEngines) e.kill();
+    poolEngines = [];
+    poolKey = null;
+  }
+
+  function spawnPoolEngine() {
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=61');
+    const pending = new Map();
+    let nextId = 1;
+    const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };
+    w.onmessage = (ev) => {
+      const m = ev.data;
+      if (m && m.progress) return;                 // progress carries no id; the pool reports its own
+      const p = pending.get(m.id);
+      if (!p) return;
+      pending.delete(m.id);
+      clearTimeout(p.timer);
+      m.ok ? p.resolve(m) : p.reject(new Error(m.error || 'pool worker error'));
+    };
+    w.onerror = (e) => { e.preventDefault(); engine.kill('worker error'); };
+    engine.call = (cmd, payload = {}, transfer, timeoutMs) => {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          engine.kill('timeout: ' + cmd);           // same rule as the export engine: destroy, don't orphan
+          reject(new Error('timeout: ' + cmd));
+        }, timeoutMs || CALL_TIMEOUT_MS);
+        pending.set(id, { resolve, reject, timer });
+        w.postMessage(Object.assign({ id, cmd }, payload), transfer || []);
+      });
+    };
+    engine.kill = (why) => {
+      try { w.terminate(); } catch (_) {}
+      for (const [, p] of pending) { clearTimeout(p.timer); p.reject(new Error(why || 'pool engine stopped')); }
+      pending.clear();
+    };
+    // Loading a pool member means: the book, and the font the page owns. A member that cannot restore
+    // the current font must not be used — it would encode spines with the wrong face (the regression the
+    // split-engine gate exists for).
+    engine.loaded = (async () => {
+      await engine.call('load', { blob: currentBookBlob }, null, 300000);
+      if (customFontAsset) {
+        const bytes = customFontAsset.bytes.slice(0);
+        await engine.call('loadFont', { epdfont: bytes, name: customFontAsset.name }, [bytes], 120000);
+      }
+      return engine;
+    })().catch((e) => { engine.kill('load failed'); throw e; });
+    return engine;
+  }
+
+  // Build (or reuse) a pool for the open book. Returns [] when the book is too small to be worth it.
+  async function ensurePool(spineCount, forceEngines) {
+    const want = forceEngines ? Math.max(1, Math.min(forceEngines, spineCount)) : poolSize(spineCount);
+    // Automatically, a pool is only worth building when it can actually run spines in parallel. An
+    // explicitly requested size is honoured even at 1, because measuring the pool against itself
+    // (its own overhead, with no parallelism) is how the scaling numbers below stay honest.
+    if (!forceEngines && want < 2) return [];
+    const key = bookEpoch + ':' + want;
+    if (poolKey === key && poolEngines.length === want) return poolEngines;
+    killPool();
+    const engines = [];
+    for (let i = 0; i < want; i++) engines.push(spawnPoolEngine());
+    try {
+      await Promise.all(engines.map((e) => e.loaded));
+    } catch (e) {
+      for (const en of engines) en.kill('pool load failed');
+      throw e;
+    }
+    poolEngines = engines;
+    poolKey = key;
+    return poolEngines;
+  }
+
+  // Encode every spine across the pool, then assemble once. Returns the same shape as the serial path's
+  // exportBook result so the download code does not care which strategy ran.
+  async function pooledExportBook(mode, xtcz, onProgress, forceEngines) {
+    const spineCount = book.spineCount;
+    const engines = await ensurePool(spineCount, forceEngines);
+    if (!engines.length) return null;              // caller falls back to the serial path
+    const t0 = performance.now();
+    const spec = readSpec();
+    const results = new Array(spineCount);
+    let next = 0;
+    let done = 0;
+    const pull = async (engine) => {
+      for (;;) {
+        const spine = next++;
+        if (spine >= spineCount) return;
+        const r = await engine.call('encodeSpine', { spine, spec, mode }, null, 300000);
+        results[spine] = r;
+        engine.spines++;
+        done++;
+        if (onProgress) onProgress(done, spineCount, r.pageCount);
+      }
+    };
+    await Promise.all(engines.map(pull));
+    const encodeMs = performance.now() - t0;
+
+    // Central assembly, in SPINE order. One worker writes the container: page records are appended as
+    // encoded, and the chapter candidates go in the order the serial path accumulates them (spine, then
+    // TOC index), so the shared builder in the engine produces the same table either way.
+    const tAsm = performance.now();
+    const transfer = [];
+    for (const r of results) if (r && r.bytes) transfer.push(r.bytes);
+    const asm = await engines[0].call('assembleSpines',
+      { mode, xtcz, spines: results.map((r) => (r ? r : { pageCount: 0 })) }, transfer, 600000);
+    const assembleMs = performance.now() - tAsm;
+
+    return {
+      file: asm.bytes,
+      pages: asm.pages,
+      xtcz: asm.xtcz,
+      rawBytes: asm.rawBytes,
+      mode,
+      // Reported so the pool's cost is attributable: encode (the parallel part) vs assembly (serial).
+      pool: { engines: engines.length, encodeMs, assembleMs, recordBytes: asm.recordBytes },
+      spineTimes: results.map((r, i) => ({ spine: i, ms: 0 })),
+    };
+  }
+
   async function exportAndDownload() {
     if (!book || exporting) return;
     if (!(await call('ping', {}, [], 10000))) return;

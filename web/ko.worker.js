@@ -1201,6 +1201,115 @@ self.onmessage = async (ev) => {
         break;
       }
 
+// Call fn(ptr) with a NUL-terminated UTF-8 copy of `str` in wasm memory. Written out explicitly
+// instead of relying on the JS glue to marshal a string for a char* argument: it is not obvious from
+// the call site whether that conversion happens, and a silently-null path is exactly the kind of thing
+// that would produce a container with missing chapter names and no error.
+function withCString(str, fn) {
+  const bytes = new TextEncoder().encode(str == null ? '' : String(str));
+  const ptr = api._malloc(bytes.length + 1);
+  try {
+    api.HEAPU8.set(bytes, ptr);
+    api.HEAPU8[ptr + bytes.length] = 0;
+    return fn(ptr);
+  } finally {
+    api._free(ptr);
+  }
+}
+
+      case 'encodeSpine': {
+        // ONE spine, laid out + rendered + ENCODED on this engine, returned as a single transferable
+        // buffer. This is the unit of parallel work: rendering is ~85% of export time and it is
+        // per-spine work, while the container is not. Page encoding is unchanged — the same writer
+        // the serial path uses, on a spine-local basis.
+        if (foregroundExportRunning) { post(id, false, { error: 'export already running' }); break; }
+        foregroundExportRunning = true;
+        try {
+          await stopWarmBeforeMutation();
+          if (ev.data.spec) await applySpecIfChanged(ev.data.spec);
+          const m = ev.data.mode === 0 ? 0 : 1;
+          api._ko_export_set_mode(m);
+          api._ko_set_image_tone_depth(m === 0 ? 2 : 4);
+          if (currentSpec) currentSpec.imageToneDepth = m === 0 ? 2 : 4;
+          const spine = ev.data.spine | 0;
+          const n = api._ko_encode_spine(spine);
+          if (n < 0) { post(id, false, { error: 'encode spine failed: ' + spine }); break; }
+          const ptr = api._ko_spine_data_ptr();
+          const size = api._ko_spine_data_size();
+          const bytes = api.HEAPU8.slice(ptr, ptr + size);
+          // Only the per-page LENGTHS cross; offsets are their prefix sum, derivable exactly.
+          const lptr = api._ko_spine_page_lengths();
+          const lengths = Array.from(new Uint32Array(api.HEAPU8.buffer, lptr, n));
+          const tocN = api._ko_spine_toc_count();
+          const toc = [];
+          for (let i = 0; i < tocN; i++) {
+            toc.push({ tocIndex: api._ko_spine_toc_index(i),
+                       localPage: api._ko_spine_toc_local_page(i),
+                       title: api.UTF8ToString(api._ko_spine_toc_title(i)) });
+          }
+          post(id, true, {
+            spine, pageCount: n, bytes: bytes.buffer, lengths, toc,
+            fallbackName: api.UTF8ToString(api._ko_spine_fallback_name()),
+          }, [bytes.buffer]);
+        } finally {
+          foregroundExportRunning = false;
+        }
+        break;
+      }
+
+      case 'assembleSpines': {
+        // ONE assembler writes the container. The records arrive already encoded; this only appends
+        // them in the order the caller sent (spine order) and builds the chapter table with the same
+        // shared builder the serial path uses. Completion order must never reach this code, so the
+        // caller is responsible for sending spines in index order.
+        const mode = ev.data.mode === 0 ? 0 : 1;
+        if (api._ko_assemble_begin(mode) < 0) { post(id, false, { error: 'assemble begin failed' }); break; }
+        let base = 0;
+        let raw = 0;
+        let bad = null;
+        for (const sp of (ev.data.spines || [])) {
+          const pages = sp.pageCount | 0;
+          if (pages <= 0) continue;                     // matches the serial path's `if (added > 0)`
+          const lengths = sp.lengths;
+          const bytes = new Uint8Array(sp.bytes);
+          const offs = new Uint32Array(pages);
+          let acc = 0;
+          for (let i = 0; i < pages; i++) { offs[i] = acc; acc += lengths[i]; }
+          if (acc !== bytes.length) { bad = 'spine ' + sp.spine + ': lengths sum ' + acc + ' != ' + bytes.length + ' bytes'; break; }
+          const bptr = api._malloc(bytes.length);
+          const optr = api._malloc(pages * 4);
+          const lptr = api._malloc(pages * 4);
+          try {
+            api.HEAPU8.set(bytes, bptr);
+            new Uint32Array(api.HEAPU8.buffer, optr, pages).set(offs);
+            new Uint32Array(api.HEAPU8.buffer, lptr, pages).set(lengths);
+            if (api._ko_assemble_add_spine(bptr, bytes.length, pages, optr, lptr) < 0) {
+              bad = 'assemble add spine failed for spine ' + sp.spine; break;
+            }
+          } finally {
+            api._free(bptr); api._free(optr); api._free(lptr);
+          }
+          for (const t of (sp.toc || [])) {
+            const r = withCString(t.title, (tp) => api._ko_assemble_add_toc(base, tp, t.localPage | 0));
+            void r;
+          }
+          withCString(sp.fallbackName, (fp) => api._ko_assemble_add_fallback(base, fp, pages));
+          base += pages;
+          raw += bytes.length;
+        }
+        if (bad) { post(id, false, { error: bad }); break; }
+        const total = api._ko_assemble_finish();
+        if (total < 0) { post(id, false, { error: 'assemble finish failed' }); break; }
+        if (ev.data.xtcz) api._ko_xtcz_wrap();
+        const p2 = api._ko_xtch_ptr();
+        const sz = api._ko_xtch_size();
+        const out = api.HEAPU8.slice(p2, p2 + sz);
+        post(id, true, { pages: total, spinePages: base, recordBytes: raw,
+                         xtcz: !!ev.data.xtcz, rawBytes: raw,
+                         bytes: out.buffer }, [out.buffer]);
+        break;
+      }
+
       case 'exportBook': {
         // whole-book export with the current spec; 1-bit XTC or 2-bit XTCH per
         // mode (xtcz=true wraps in XTZ4/LZ4); progress posts (no op id)
