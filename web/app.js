@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=38');
+    const w = new Worker(base + 'ko.worker.js?v=39');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -822,7 +822,11 @@
     warmKeyAtFire = key;
     const tok = warmVersion;
     try {
-      const r = await call('warm', { mode: state.mode, xtcz: els.lz4Wrap.checked, token: tok }, null, 900000);
+      // §3 of the 1.3 audit: the warm carries the spec it is producing. Otherwise it silently
+      // depends on a preview render having already applied the same settings to the engine.
+      const warmSpec = readSpec();
+      const r = await call('warm', { spec: warmSpec, mode: state.mode, xtcz: els.lz4Wrap.checked, token: tok },
+                            null, 900000);
       if (tok !== warmVersion) return;    // settings changed mid-warm → stale
       if (r && r.warm === 'ready') {
         warmSpecKey = key;
@@ -1268,8 +1272,9 @@
       // screen (in 1-bit the AA switch decides the blue-noise dither), and a knob
       // changed inside the repaint-coalescing window would otherwise not have
       // reached the engine yet. Idempotent and cheap.
-      await call('spec', { spec: readSpec() });
-      const res = await call('exportBook', { mode, xtcz }, null, 600000);
+      // §3: one message = one transaction. The worker applies this snapshot after taking the export
+      // lock, so the file cannot be built from a mixture of settings.
+      const res = await call('exportBook', { spec: readSpec(), mode, xtcz }, null, 600000);
       const u8 = new Uint8Array(res.file);
       const filename = exportFilename(xtcz);
       const ratio = xtcz && res.rawBytes ? ' (원본의 ' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '%)' : '';

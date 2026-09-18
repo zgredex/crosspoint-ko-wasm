@@ -42,8 +42,18 @@ let bookGen = 0;
 const COUNTERS = {
   epdfontLoads: 0, fontApplies: 0, fontSkips: 0, specApplies: 0, layoutApplies: 0,
   renderApplies: 0, builds: 0, renders: 0, framesPosted: 0, cacheHits: 0, prefetches: 0,
-  cacheEvictions: 0, warmYields: 0, warmCooldowns: 0,
+  cacheEvictions: 0, warmYields: 0, warmCooldowns: 0, aborts: 0,
 };
+
+// §1 of the 1.3 audit: ONE way to stop an export early. Every early return and every throw inside
+// exportWholeBook must release the writer's partially accumulated pages, otherwise they stay in the
+// wasm heap until the next ko_export_begin(). COUNTERS.aborts makes a missed path visible in stats.
+function cancelCurrentExport(total) {
+  api._ko_export_abort();
+  invalidateSectionTracking();
+  COUNTERS.aborts += 1;
+  return { cancelled: true, pages: total };
+}
 function clearFrameCache() {
   frameCache.clear();
   frameCacheBytes = 0;
@@ -119,14 +129,24 @@ let warmRunning = false;
 const MUTATING_COMMANDS = ['spec', 'load', 'loadFile', 'loadFont', 'clearFont', 'convertFont'];
 let foregroundExportRunning = false;
 
-// A background warm shares the engine and the C export buffer, so anything that replaces engine state
-// has to stop it and wait until it has actually stopped: bumping the token only asks it to abort at
-// its next spine yield, and the handler is suspended at that yield.
+// §2 of the 1.3 audit: a background warm shares the engine and the C export buffer, so anything that
+// replaces engine state must stop it and WAIT until it has actually stopped. The previous version
+// gave up after 4000 spins and let the caller mutate anyway — failing OPEN, which is exactly the race
+// this exists to prevent. It now awaits a completion promise, so there is no timing assumption at all.
+let resolveWarmDone = null;
+let warmDone = Promise.resolve();
+function beginWarm() {
+  warmRunning = true;
+  warmDone = new Promise((resolve) => { resolveWarmDone = resolve; });
+}
+function endWarm() {
+  warmRunning = false;
+  if (resolveWarmDone) { resolveWarmDone(); resolveWarmDone = null; }
+}
 async function stopWarmBeforeMutation() {
   if (!warmRunning) return;
-  warmToken++;
-  let spins = 0;
-  while (warmRunning && spins++ < 4000) await new Promise((r) => setTimeout(r, 0));
+  warmToken++;              // ask it to abort at its next yield
+  await warmDone;           // and wait for the handler to actually finish
   dropWarmResult();
 }
 
@@ -244,7 +264,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '38';
+const FT_MODULE_VERSION = '39';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -397,7 +417,13 @@ async function exportWholeBook(opts, onProgress) {
     tick('exportSpine');
     const n = api._ko_export_spine(s);
     tock('exportSpine');
-    if (n < 0) throw new Error('export spine ' + s + ' failed');
+    if (n < 0) {
+      // abnormal exit: release the pages accumulated so far, then propagate
+      api._ko_export_abort();
+      invalidateSectionTracking();
+      COUNTERS.aborts += 1;
+      throw new Error('export spine ' + s + ' failed');
+    }
     total += n;
     // §1: _ko_export_spine() just rebuilt the C++ section_ for THIS spine. Never let JS claim an
     // interactive spine is still built across this point.
@@ -407,26 +433,28 @@ async function exportWholeBook(opts, onProgress) {
     // of export work).
     COUNTERS.warmYields += 1;
     await yieldToLoop();
-    if (cancelCheck && cancelCheck()) {
-      // §3: release this export's accumulated pages NOW instead of at the next ko_export_begin()
-      api._ko_export_abort();
-      invalidateSectionTracking();
-      return { cancelled: true, pages: total };
-    }
+    if (cancelCheck && cancelCheck()) return cancelCurrentExport(total);
     if (cooloff) {
       // and if the user just turned a page, keep standing aside until they are idle again — this is
       // speculative work, so interactive latency wins.
       while (Date.now() - lastInteractiveAt < INTERACTIVE_COOLOFF_MS) {
         COUNTERS.warmCooldowns += 1;
         await new Promise((r) => setTimeout(r, INTERACTIVE_COOLOFF_MS));
-        if (cancelCheck && cancelCheck()) return { cancelled: true, pages: total };
+        // §1: the cool-off is a cancellation path too — it used to return without aborting, leaking
+        // everything accumulated so far.
+        if (cancelCheck && cancelCheck()) return cancelCurrentExport(total);
       }
     }
   }
   tick('exportFinish');
   const pages = api._ko_export_finish();
   tock('exportFinish');
-  if (pages < 0) throw new Error('export_finish failed');
+  if (pages < 0) {
+    api._ko_export_abort();
+    invalidateSectionTracking();
+    COUNTERS.aborts += 1;
+    throw new Error('export_finish failed');
+  }
   const rawBytes = api._ko_xtch_size();   // pre-wrap container size
   if (xtcz) {
     tick('xtczWrap');
@@ -435,7 +463,12 @@ async function exportWholeBook(opts, onProgress) {
   }
   const ptr = api._ko_xtch_ptr();
   const size = api._ko_xtch_size();
-  if (!ptr || size <= 0) throw new Error('export produced no bytes');
+  if (!ptr || size <= 0) {
+    api._ko_export_abort();
+    invalidateSectionTracking();
+    COUNTERS.aborts += 1;
+    throw new Error('export produced no bytes');
+  }
   const out = new Uint8Array(api.HEAPU8.buffer.slice(ptr, ptr + size));
   api._ko_xtch_release();
   return { file: out, pages, bytes: out.byteLength, spines, xtcz, rawBytes: rawBytes || 0 };
@@ -804,7 +837,7 @@ self.onmessage = async (ev) => {
         if (myTok < warmToken) { post(id, true, { warm: 'superseded' }); break; }
         warmToken = Math.max(warmToken, myTok);   // adopt: newer warms supersede
         if (warmRunning) { post(id, true, { warm: 'busy' }); break; }
-        warmRunning = true;
+        beginWarm();
         // The warm pass drives the engine through every spine; the JS tracker
         // (currentSpine) can't follow, so any render that interleaves between
         // the warm's spine yields must force a rebuild of its own spine.
@@ -812,7 +845,16 @@ self.onmessage = async (ev) => {
         dropWarmResult();     // §3: never hold this warm plus a previous one
         try {
           tick('warm');
-          api._ko_export_set_mode(ev.data.mode === 0 ? 0 : 1);
+          // §3 of the 1.3 audit: the warm carries the spec it is producing, so it does not depend on
+          // a preview render having already applied the same settings.
+          if (ev.data.spec) applySpecIfChanged(ev.data.spec);
+          const warmMode = ev.data.mode === 0 ? 0 : 1;
+          api._ko_export_set_mode(warmMode);
+          // the tone depth must follow the MODE (a 1-bit page packs 2 tones); the warm previously
+          // inherited whatever the spec said, so a 1-bit warm could pack 4-level pages into one plane
+          const warmDepth = warmMode === 0 ? 2 : 4;
+          api._ko_set_image_tone_depth(warmDepth);
+          if (currentSpec) currentSpec.imageToneDepth = warmDepth;
           const res = await exportWholeBook({
             xtcz: !!ev.data.xtcz,
             cancelCheck: () => myTok < warmToken,   // a newer warm superseded us
@@ -830,7 +872,7 @@ self.onmessage = async (ev) => {
           post(id, true, { warm: 'ready', pages: res.pages });
         } finally {
           invalidateSectionTracking();   // §1: also on a cancelled or superseded warm
-          warmRunning = false;
+          endWarm();
         }
         break;
       }
@@ -873,15 +915,16 @@ self.onmessage = async (ev) => {
         // §1: from here to the finally, the engine state is frozen: any mutating command that arrives
         // in a yield window is rejected rather than silently changing what the file contains.
         foregroundExportRunning = true;
-        if (warmRunning) {
-          warmToken++;
-          while (warmRunning) await new Promise((r) => setTimeout(r, 15));
-        }
+        // §2: same fail-closed wait as any other mutation (it also drops the superseded warm bytes)
+        await stopWarmBeforeMutation();
         // The tone depth must follow the MODE, not whatever spec happens to be
         // applied: a 1-bit page has to be dithered straight to 2 tones, and if the
         // spec still says 4 the writer packs a 4-level page into one plane (the
         // host CLI has always done this; the worker relied on the caller passing
         // imageToneDepth, which any new export path could forget).
+        // §3 of the 1.3 audit: the snapshot is applied AFTER the lock is held, so the settings the
+        // file is built from are exactly the settings the caller sent with this one message.
+        if (ev.data.spec) applySpecIfChanged(ev.data.spec);
         const exportMode = ev.data.mode === 0 ? 0 : 1;
         api._ko_export_set_mode(exportMode);
         const exportDepth = exportMode === 0 ? 2 : 4;
