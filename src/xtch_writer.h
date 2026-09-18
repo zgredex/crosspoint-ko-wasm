@@ -20,29 +20,33 @@
 
 #include <cstdint>
 
+#include "../vendor-lib/Epub/Epub/converters/DitherUtils.h"  // the quantizer model
 #include "../vendor-lib/Epub/Epub/converters/BlueNoise64.h"  // 64x64 void-and-cluster
 
 // Ink densities for the 1-bit dither, indexed by the 4-level grey value
 // (v = 0 white | 1 dark grey | 2 light grey | 3 black).
 //
-// A dithered patch must have the same AVERAGE reflectance as the grey level it stands in
-// for. With the panel's four states perceived as white 210 / light grey 80 / dark grey 30
-// / black 15, density = (210 - R) / (210 - 15):
+// A dithered patch must have the same AVERAGE tone as the level it stands in for, so the ink
+// fraction for a level L is (255 - L) / 255 and the mask threshold IS 255 - L. Both numbers
+// are derived from the quantizer's profile rather than written out here, because this is the
+// last place that could silently keep a different model: the old hard-coded {0,235,170,255}
+// encoded the fork's perceived-luminance levels (dark grey as 92% ink, i.e. reflectance ~30),
+// while the official model's levels are the nominal 0/85/170/255 - its dark grey (85) needs
+// 67% ink and its light grey (170) needs 33%.
 //
-//   v=0 white      R=210 -> 0.000 ->   0
-//   v=1 dark grey  R= 30 -> 0.923 -> 235
-//   v=2 light grey R= 80 -> 0.667 -> 170
-//   v=3 black      R= 15 -> 1.000 -> 255
+//   v=0 white      L=255 -> 0.000 ->   0
+//   v=1 dark grey  L= 85 -> 0.667 -> 170
+//   v=2 light grey L=170 -> 0.333 ->  85
+//   v=3 black      L=  0 -> 1.000 -> 255
 //
-// The upstream attempt used 62% / 19% here, which renders dark grey far too light and
-// throws away most of the contrast the panel's greys actually have.
-//
-// NOTE: the 15/30/80/210 anchors come from the panel model used by the converter, not from
-// a calibrated measurement of our own unit. If a real test pattern says otherwise, these
-// three numbers are the only thing that needs to change.
-inline constexpr uint8_t kMonoInkDensity[4] = {0, 235, 170, 255};
+// Change the quantization model and these follow it; they are not independent knobs.
+inline constexpr uint8_t kMonoInkDensity[4] = {
+    0,
+    static_cast<uint8_t>(255 - kProfileNominal.ditherLevels[1]),
+    static_cast<uint8_t>(255 - kProfileNominal.ditherLevels[2]),
+    255};
 
-// Precomputed 8-bit masks for the mono dither. Densities are {0, 235, 170, 255} and the test is
+// Precomputed 8-bit masks for the mono dither. Densities are kMonoInkDensity and the test is
 // `noise < density`, so there are THREE real thresholds: 235 (v=1 dark), 170 (v=2 light), 255 (v=3
 // black). The 255 layer is NOT optional - the comparison is strict and the table holds all 256
 // values, so 1 in 256 black pixels must not ink. Omitting it cost ~70 wrong bits per page, which is
@@ -51,7 +55,7 @@ inline constexpr uint8_t kMonoInkDensity[4] = {0, 235, 170, 255};
 struct MonoNoiseMasks {
   uint8_t m[3][64][60];
   MonoNoiseMasks() {
-    const int thr[3] = {235, 170, 255};
+    const int thr[3] = {kMonoInkDensity[1], kMonoInkDensity[2], kMonoInkDensity[3]};
     for (int t = 0; t < 3; ++t) {
       for (int y = 0; y < 64; ++y) {
         for (int k = 0; k < 60; ++k) {

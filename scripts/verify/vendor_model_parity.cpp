@@ -159,6 +159,90 @@ int main() {
     }
   }
 
+  // ---- 8. EVERY model must use the model's levels and cuts -----------------
+  // Three universal assertions, so a model cannot quietly keep old tables:
+  //  (a) membership - no model may emit a level outside the profile's four;
+  //  (b) cuts - an error-diffusion model's decision at (0,0) of the first row has no
+  //      carried error, so it must equal the vendor's quantize() exactly;
+  //  (c) bracketing - an ordered/diffusion model must put the top level on the fraction of
+  //      pixels implied by WHERE the grey sits between two levels.
+  {
+    struct M { const char* name; DitherMode mode; bool ed; bool brackets; };
+    const M models[] = {{"none", DitherMode::NONE, false, false},
+                        {"bayer", DitherMode::BAYER, false, true},
+                        {"blue-noise", DitherMode::BLUE_NOISE, false, true},
+                        {"fs", DitherMode::FS, true, false},
+                        {"atk", DitherMode::ATK, true, false},
+                        {"jjn", DitherMode::JJN, true, false},
+                        {"stucki", DitherMode::STUCKI, true, false},
+                        {"burkes", DitherMode::BURKES, true, false},
+                        {"zhou-fang", DitherMode::ZHOU_FANG, true, false},
+                        {"ko-hash", DitherMode::KO_HASH, false, false}};
+    for (int depth = 4; depth >= 2; depth -= 2) {
+      const int nLev = depth == 2 ? 2 : 4;
+      for (const M& m : models) {
+        ko::ImageDitherOptions o;
+        o.mode = m.mode; o.profile = &kDefaultProfile; o.toneDepth = static_cast<uint8_t>(depth);
+        ko::ImageDitherer d(o);
+        d.reset(256, 0, 0);
+        for (int g = 0; g <= 255; ++g) {                       // (a) membership
+          const uint8_t lv = d(static_cast<uint8_t>(g), g, 0) & 3;
+          const int val = kDefaultProfile.ditherLevels[lv];
+          if (val != 0 && val != 255 && depth == 2) {
+            printf("FAIL depth 2 model %s emitted %d (not a 2-tone level)\n", m.name, val); ++fails;
+          }
+          bool known = false;
+          for (int k = 0; k < 4; ++k) known = known || val == kDefaultProfile.ditherLevels[k];
+          if (!known) { printf("FAIL model %s emitted level %d\n", m.name, val); ++fails; }
+        }
+        if (m.mode == DitherMode::KO_HASH) continue;           // profile-free by design (fork verbatim)
+        if (m.ed && depth == 4) {                              // (b) cuts at (0,0)
+          for (int g = 0; g <= 255; ++g) {
+            ko::ImageDitherer e(o);
+            e.reset(256, 0, 0);
+            const int ours = kDefaultProfile.ditherLevels[e(static_cast<uint8_t>(g), 0, 0) & 3];
+            const int theirs = vendorQuantize(g, false);
+            if (ours != theirs) {
+              printf("FAIL model %s cut at g=%d -> %d, vendor %d\n", m.name, g, ours, theirs); ++fails;
+            }
+          }
+        }
+      }
+      // (c) bracketing: fraction of the top level over a patch vs the ideal for that grey
+      if (depth == 4) {
+        const int patch = 128;
+        const int greys[] = {40, 100, 150, 200};
+        for (const M& m : models) {
+          if (!m.brackets) continue;
+          for (unsigned gi = 0; gi < sizeof(greys) / sizeof(greys[0]); ++gi) {
+            const int g = greys[gi];
+            // the grey sits between levels[lo] and levels[lo+1]; the UPPER of that pair is
+            // the level whose pixel fraction must equal the position within the bracket
+            int lo = 0;
+            for (int k = 2; k >= 0; --k) if (g >= kDefaultProfile.ditherLevels[k]) { lo = k; break; }
+            const int hi = lo + 1;
+            const double ideal = (g - kDefaultProfile.ditherLevels[lo]) /
+                                 static_cast<double>(kDefaultProfile.ditherLevels[hi] -
+                                                     kDefaultProfile.ditherLevels[lo]);
+            ko::ImageDitherOptions o;
+            o.mode = m.mode; o.profile = &kDefaultProfile; o.toneDepth = 4;
+            ko::ImageDitherer d(o);
+            d.reset(patch, 0, 0);
+            int upper = 0;
+            for (int y = 0; y < patch; ++y)
+              for (int x = 0; x < patch; ++x)
+                if ((d(static_cast<uint8_t>(g), x, y) & 3) == hi) ++upper;
+            const double frac = upper / static_cast<double>(patch * patch);
+            if (frac < ideal - 0.06 || frac > ideal + 0.06) {
+              printf("FAIL model %s bracketing grey=%d: level[%d] fraction %.3f, ideal %.3f\n",
+                     m.name, g, hi, frac, ideal); ++fails;
+            }
+          }
+        }
+      }
+    }
+  }
+
   printf(fails == 0 ? "PASS — official model matched on 512 decisions, 512 e2e pixels, 14 tone patches\n"
                     : "FAILED — %d mismatches\n", fails);
   return fails == 0 ? 0 : 1;

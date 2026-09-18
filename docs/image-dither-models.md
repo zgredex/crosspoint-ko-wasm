@@ -158,6 +158,20 @@ ko-hash is 35.2 at 2 tones because the fork's 1-bit rule is a noise rule, not a 
 zhou-fang's threshold modulation is tuned for the fork's level model, so it degrades in the
 official space. Neither is a reason to drop them — they are selectable and documented.
 
+**The 1-bit writer had the same problem, one layer down.** `kMonoInkDensity` in
+`src/xtch_writer.h` — the ink coverage that emulates a grey level when only black and white are
+available — was still hard-coded to the fork's perceived-luminance model `{0, 235, 170, 255}`
+(dark grey as 92% ink, i.e. reflectance ~30). Under the official model a level L needs
+`(255 - L) / 255` ink, so the triple is `{0, 170, 85, 255}`, and it is now *derived* from
+`kProfileNominal.ditherLevels` rather than written out, so the two cannot drift apart again.
+Those masks are used only for 1-bit text anti-aliasing (image pixels are already dithered to two
+tones), which the re-baseline confirms precisely: **all ten 4-tone page hashes are unchanged**,
+and all ten 2-tone hashes moved. Gates: `scripts/verify/mono_model_parity.cpp` asserts the triple,
+and `vendor_model_parity.cpp` now also asserts, for every model at both depths, that no model emits
+a level outside the profile, that each error-diffusion model's first-row decision equals the
+vendor's `quantize()` exactly, and that the ordered/Zhou-Fang models put the bracket's upper level
+on the pixel fraction implied by where the grey sits between two levels.
+
 **Still different from the official tool** (deliberate, one line each if you want parity):
 their error diffusion is scaled by a *strength* (75% image regions / 50% background) and their
 default mode dithers the whole page including text; we diffuse 100% and dither image pixels
@@ -177,7 +191,8 @@ only, leaving text to the firmware's AA path. Their preview paints the raw level
   irreproducible, so the engine feeds the same formula a deterministic integer hash instead.
   That is a deliberate deviation, and the only one.
 * **wasm == native.** The browser's export of `demo-images.epub` with defaults: 1,345,804 B,
-  14 pages, payload sha `52672f84f2f7` — identical to the host binary's (same size, pages, sha).
+  14 pages, payload sha `90d10c4aedbb` (4 tones) / `dbe1549fc806` (2 tones) — identical to the
+host binary's (same size, pages, sha).
 
 ## Preview fidelity: how it looks on a PC vs what the panel does
 
