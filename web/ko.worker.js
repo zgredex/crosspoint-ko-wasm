@@ -57,13 +57,14 @@ function frameCacheGet(key) {
   return hit;
 }
 
-function frameCachePut(key, img) {
-  // Store a COPY: the buffer handed to post() is transferred, which detaches it.
-  const copy = new Uint8ClampedArray(img.data.length);
-  copy.set(img.data);
+// §4 of the 1.1 audit: a frame that is about to be transferred to the main thread MUST be copied
+// (the transfer detaches the source), but a prefetch-only frame is never transferred, so the cache
+// can take ownership of it instead of paying a second 1.5 MB copy.
+function frameCachePut(key, data, takeOwnership) {
+  const stored = takeOwnership ? data : new Uint8ClampedArray(data);   // ctor on a typed array copies
   if (frameCache.has(key)) frameCacheBytes -= frameCache.get(key).data.length;
-  frameCache.set(key, { data: copy });
-  frameCacheBytes += copy.length;
+  frameCache.set(key, { data: stored });
+  frameCacheBytes += stored.length;
   while (frameCacheBytes > FRAME_CACHE_BUDGET && frameCache.size > 1) {
     const oldest = frameCache.keys().next().value;
     frameCacheBytes -= frameCache.get(oldest).data.length;
@@ -94,6 +95,17 @@ let fontStamp = 0;
 
 // Background whole-book conversion result (held in worker, pulled on demand).
 let warmBytes = null;
+
+// §3 of the 1.1 audit: a completed warm is the whole container in the JS heap — ~195 MB for a
+// 2,000-page XTCH. It was only ever cleared by fetchWarm(), so a cancelled warm, a new book and the
+// next warm all left their megabytes resident, and two warm results could coexist.
+function dropWarmResult() {
+  warmBytes = null;
+  warmPages = 0;
+  warmRaw = 0;
+  warmMode = 1;
+  warmXtcz = false;
+}
 let warmPages = 0;
 let warmRaw = 0;
 let warmMode = 1;
@@ -215,7 +227,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '36';
+const FT_MODULE_VERSION = '37';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -287,6 +299,34 @@ function composePage() {
   return _stage('compose.view', _frameFromEngine);
 }
 
+// §2 + §5 of the 1.1 audit: speculation must never sit in front of the requested frame, and a
+// cache HIT must schedule a prefetch too — otherwise a sequential read alternates miss/hit and only
+// every other turn is covered.
+//
+// The reply is posted first; this runs as its own macrotask, so the extra render cannot delay the
+// frame the user is waiting for. Every guard is re-checked when the task actually runs: if a warm
+// started, the book changed, the spine/page state moved on, or the render key or font stamp changed,
+// a frame rendered now would belong to different state — so it is dropped instead of cached.
+function schedulePrefetch(spine, page, pages, mono, rk, fStamp, gen) {
+  setTimeout(() => {
+    if (warmRunning) return;                       // the engine is walking spines
+    if (gen !== bookGen) return;                   // different book
+    if (spine !== currentSpine || pages !== currentPages) return;
+    if (fStamp !== builtFontStamp) return;
+    if (rk !== renderKey(currentSpec || {})) return;
+    const next = page + 1;
+    if (next >= pages) return;
+    const nk = gen + ':' + spine + ':' + next + ':' + (mono ? 1 : 0) + ':' + rk + ':' + fStamp;
+    if (frameCache.has(nk)) return;
+    // Always preceded by a real render of the requested page, so the engine's planes can never be
+    // composed as the wrong page here.
+    if (api._ko_render_page(next) !== 0) return;
+    const nextImg = mono ? composeMono() : composePage();
+    frameCachePut(nk, nextImg.data, true);         // never transferred → the cache takes ownership
+    COUNTERS.prefetches += 1;
+  }, 0);
+}
+
 async function init() {
   // Emscripten MODULARIZE: ko_xtch_wasm.js defines createKoEngine in scope.
   const factory = self.createKoEngine;
@@ -300,17 +340,23 @@ async function init() {
   return true;
 }
 
-// Engine build-state invalidation. currentSpine/currentPages/builtKey describe
-// what the ENGINE has built; a whole-book export runs every spine through the
-// engine, so its end state is undefined — force a real rebuild next render.
-// The warm pass drives the engine through every spine, so the JS tracker can't follow it (spine
-// and page counts are invalidated). Composed frames stay valid, though: a frame is a pure function
-// of (book generation, spine, page, mode, render key, font stamp). So the frame cache is NOT cleared
-// here any more — only the tracking state — and clearing on a load is explicit.
-function invalidateEngine() {
+// Engine build-state invalidation. currentSpine/currentPages/builtKey describe what the ENGINE has
+// built. Composed frames stay valid across a warm — a frame is a pure function of (book generation,
+// spine, page, mode, render key, font stamp) — so the frame cache is NOT cleared here; only the
+// tracking state is, and clearing on a load is explicit.
+//
+// §1 of the 1.1 audit: _ko_export_spine() internally calls g_driver->buildSection(spine, g_spec), so
+// it changes the real C++ EngineDriver::section_ on every spine. Once preview renders may interleave
+// with the warm, JS claiming "spine N is built" is a lie as soon as one export spine runs: the next
+// uncached page of spine N would be rendered from whatever section_ the export last built. Section
+// tracking therefore dies after EVERY export spine; the font cache only dies on a wholesale reset.
+function invalidateSectionTracking() {
   currentSpine = -1;
   currentPages = 0;
   builtKey = null;
+}
+function invalidateEngine() {
+  invalidateSectionTracking();
   appliedFont = null;          // the warm walked whole spines; re-send the face on the next spec
 }
 
@@ -336,6 +382,9 @@ async function exportWholeBook(opts, onProgress) {
     tock('exportSpine');
     if (n < 0) throw new Error('export spine ' + s + ' failed');
     total += n;
+    // §1: _ko_export_spine() just rebuilt the C++ section_ for THIS spine. Never let JS claim an
+    // interactive spine is still built across this point.
+    invalidateSectionTracking();
     if (onProgress) onProgress(s + 1, spines, total);
     // §4: yield after EVERY spine (measured: yielding every 4th let a page turn queue behind ~150 ms
     // of export work).
@@ -449,6 +498,16 @@ function applySpec(raw) {
   return { layout: lk, layoutChanged: lk !== lkBefore };
 }
 
+// Margins/viewport for the readout. The firmware's own arithmetic: viewable margins + screenMargin
+// on all four sides, no UI reserve. Shared by the spec and render replies.
+function viewportInfo(spec) {
+  const mg = marginsFor(spec);
+  return {
+    margins: mg,
+    viewport: { width: SCREEN_W - mg.left - mg.right, height: SCREEN_H - mg.top - mg.bottom },
+  };
+}
+
 // The render path carries the spec, so an unchanged spec costs nothing at all (§2).
 function applySpecIfChanged(raw) {
   if (currentSpec && renderKey(currentSpec) === renderKey(Object.assign(defaultSpec(), raw || {}))) {
@@ -476,6 +535,7 @@ self.onmessage = async (ev) => {
         const bytes = new Uint8Array(epub);
         const bufPtr = api._malloc(bytes.length);
         api.HEAPU8.set(bytes, bufPtr);
+        dropWarmResult();     // §3: warm bytes belong to the previous book
         spineCount = api._ko_load_epub(bufPtr, bytes.length, '/book.epub');
         api._free(bufPtr);
         if (spineCount < 0) {
@@ -512,14 +572,14 @@ self.onmessage = async (ev) => {
         markInteractive();
         // margins: viewable area + screenMargin on all four sides (no UI reserve)
         applySpec(ev.data.spec);
-        const mg = marginsFor(currentSpec);
+        const vp = viewportInfo(currentSpec);
         tock('spec');
         post(id, true, {
           specKey: layoutKey(currentSpec),          // layout key: the only thing that repaginates
           renderKey: renderKey(currentSpec),
           layoutChanged: true,
-          margins: mg,
-          viewport: { width: SCREEN_W - mg.left - mg.right, height: SCREEN_H - mg.top - mg.bottom },
+          margins: vp.margins,
+          viewport: vp.viewport,
         });
         break;
       }
@@ -542,9 +602,10 @@ self.onmessage = async (ev) => {
 
       case 'render': {
         markInteractive();
-        // §2: the spec travels with the render, so an ordinary page turn is one request. When it has
-        // not changed, this does nothing at all.
-        if (ev.data.spec) applySpecIfChanged(ev.data.spec);
+        // §2/§8: the spec travels with the render, so an ordinary page turn is one request and a
+        // settings change is one request too. When it has not changed, this does nothing at all.
+        let vpInfo = null;
+        if (ev.data.spec && applySpecIfChanged(ev.data.spec)) vpInfo = viewportInfo(currentSpec);
         const key = layoutKey(currentSpec || {});
         const wantMono = ev.data.mode === 0;   // 1-bit XTC preview (BW plane only)
         // rebuild if spine, LAYOUT, OR loaded font changed since the last build
@@ -579,8 +640,12 @@ self.onmessage = async (ev) => {
           COUNTERS.cacheHits += 1;
           const reply = new Uint8ClampedArray(cachedFrame.data.length);
           reply.set(cachedFrame.data);
-          post(id, true, { page, pages: currentPages, image: reply.buffer, mono: wantMono, cached: true },
+          post(id, true, { page, pages: currentPages, image: reply.buffer, mono: wantMono, cached: true,
+                           viewport: vpInfo ? vpInfo.viewport : null,
+                           margins: vpInfo ? vpInfo.margins : null },
                [reply.buffer]);
+          // §5: a hit must also extend the chain, or sequential reading only covers every other turn.
+          schedulePrefetch(currentSpine, page, currentPages, wantMono, rk, builtFontStamp, bookGen);
           break;
         }
 
@@ -596,20 +661,15 @@ self.onmessage = async (ev) => {
         // mode: 1-bit → BW plane only (no AA greys), 2-bit → full 4-level
         const img = wantMono ? composeMono() : composePage();
         tock('compose');
-        frameCachePut(frameKey, img);
+        frameCachePut(frameKey, img.data);      // copied: this buffer is transferred below
         const tx = img.data.buffer;
         COUNTERS.framesPosted += 1;
-        // §5: prefetch the next page so a sequential turn is a cache hit. Rendering is preceded by a
-        // render of the requested page on every cache miss, so speculative planes cannot be composed
-        // as the wrong page.
-        if (!warmRunning && page + 1 < currentPages) {
-          const nk = bookGen + ':' + currentSpine + ':' + (page + 1) + ':' + (wantMono ? 1 : 0) + ':' + rk + ':' + builtFontStamp;
-          if (!frameCache.has(nk) && api._ko_render_page(page + 1) === 0) {
-            frameCachePut(nk, wantMono ? composeMono() : composePage());
-            COUNTERS.prefetches += 1;
-          }
-        }
-        post(id, true, { page, pages: currentPages, image: tx, mono: wantMono }, [tx]);
+        // §2: user-visible work is finished — send it NOW. The prefetch is speculative and must never
+        // delay the requested frame (it used to run between compose() and post()).
+        post(id, true, { page, pages: currentPages, image: tx, mono: wantMono,
+                         viewport: vpInfo ? vpInfo.viewport : null,
+                         margins: vpInfo ? vpInfo.margins : null }, [tx]);
+        schedulePrefetch(currentSpine, page, currentPages, wantMono, rk, builtFontStamp, bookGen);
         break;
       }
 
@@ -668,6 +728,7 @@ self.onmessage = async (ev) => {
         customFontBytes = new Uint8Array(ev.data.epdfont);
         customFontName = (ev.data.name || 'custom').replace(/[^\w-]/g, '') || 'custom';
         fontStamp++;
+        clearFrameCache();    // §6: frames keyed by the old stamp can never hit again
         tick('applyFont');
         const ok = applyFont('custom');
         tock('applyFont');
@@ -684,6 +745,7 @@ self.onmessage = async (ev) => {
       case 'clearFont': {
         customFontBytes = null;
         fontStamp++;
+        clearFrameCache();    // §6: frames keyed by the old stamp can never hit again
         appliedFont = null;          // §1: face selection must be re-sent
         api._ko_clear_custom_font();
         currentSpec = Object.assign(currentSpec || defaultSpec(), { font: 'ridibatang' });
@@ -707,6 +769,7 @@ self.onmessage = async (ev) => {
         // (currentSpine) can't follow, so any render that interleaves between
         // the warm's spine yields must force a rebuild of its own spine.
         invalidateEngine();
+        dropWarmResult();     // §3: never hold this warm plus a previous one
         try {
           tick('warm');
           api._ko_export_set_mode(ev.data.mode === 0 ? 0 : 1);
@@ -726,6 +789,7 @@ self.onmessage = async (ev) => {
           invalidateEngine();
           post(id, true, { warm: 'ready', pages: res.pages });
         } finally {
+          invalidateSectionTracking();   // §1: also on a cancelled or superseded warm
           warmRunning = false;
         }
         break;
@@ -736,6 +800,7 @@ self.onmessage = async (ev) => {
         // next spine yield (it polls myTok < warmToken). No new warm starts;
         // the app will fire one again once the user settles.
         warmToken++;
+        dropWarmResult();     // §3: a superseded/cancelled warm's megabytes must not linger
         post(id, true, { warmCancel: true });
         break;
       }

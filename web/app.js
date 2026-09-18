@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=36');
+    const w = new Worker(base + 'ko.worker.js?v=37');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -381,18 +381,16 @@
     ctx.putImageData(img, 0, 0);
   }
 
-  async function pushSpec() {
-    const r = await call('spec', { spec: readSpec() });
-    // Surface the derived text viewport. It is the firmware's own arithmetic
-    // (viewable margins + screenMargin + status-bar lane), so showing it makes
-    // pagination behaviour auditable instead of mysterious.
-    if (els.viewportOut && r && r.viewport) {
-      const m = r.margins || {};
-      els.viewportOut.textContent =
-        '본문 영역: ' + r.viewport.width + '×' + r.viewport.height +
-        ' px · 여백 T/R/B/L ' + m.top + '/' + m.right + '/' + m.bottom + '/' + m.left +
-        ' · 파일에 UI 없음';
-    }
+  // Surface the derived text viewport. It is the firmware's own arithmetic (viewable margins +
+  // screenMargin + status-bar lane), so showing it makes pagination behaviour auditable instead of
+  // mysterious. The worker returns it on the render reply now that the spec travels with the render.
+  function showViewport(r) {
+    if (!els.viewportOut || !r || !r.viewport || !r.margins) return;
+    const m = r.margins;
+    els.viewportOut.textContent =
+      '본문 영역: ' + r.viewport.width + '×' + r.viewport.height +
+      ' px · 여백 T/R/B/L ' + m.top + '/' + m.right + '/' + m.bottom + '/' + m.left +
+      ' · 파일에 UI 없음';
   }
 
   // §2: the spec only has to be pushed when it actually changed. Every spec push used to run
@@ -409,17 +407,18 @@
     viewingCover = false;
     if (!quiet) busy('미리보기 생성 중');   // scrub-path re-renders stay silent
     try {
-      // push the spec only on change, then render (the worker rebuilds the spine when the LAYOUT
-      // changed). The chosen export mode travels with the render so the preview is quantized
-      // exactly like the file the mode produces.
+      // §8 of the 1.1 audit: the spec rides on the render request when it changed, so a settings
+      // change is ONE worker round trip instead of two (the reply carries the fresh viewport and
+      // margins for the readout). The chosen export mode travels with the render too, so the preview
+      // is quantized exactly like the file the mode produces.
       const key = currentSpecKey();
-      if (key !== lastPushedSpecKey) {
-        await pushSpec();
-        lastPushedSpecKey = key;
-      }
+      const spec = key !== lastPushedSpecKey ? readSpec() : null;
       const spine = Math.min(state.spine, book.spineCount - 1);
       const page = keepPage ? state.page : 0;
-      const r = await call('render', { spine, page, mode: state.mode });
+      const payload = { spine, page, mode: state.mode };
+      if (spec) payload.spec = spec;
+      const r = await call('render', payload);
+      if (spec) { lastPushedSpecKey = key; showViewport(r); }
       if (tok !== renderToken) return;          // superseded
       state.spine = spine;
       state.page = r.page;
@@ -1414,7 +1413,9 @@
   if (restored) syncDependentControls();
   setAppState(book ? 'loaded' : 'empty');
   updateExportSummary();
-  hasFontBackend();   // one probe: is the server-side converter deployed here?
+  // §7 of the 1.1 audit: no eager probe here. convertFont() already probes the backend, and only
+  // if in-browser conversion fails — doing it at boot meant a pointless POST to /api/convert-font on
+  // every visit to discover that the Python dev endpoint is not deployed.
   worker = spawnWorker();
   // The engine init is deferred to an idle slot so the picker paints without waiting on the
   // §10: be precise about what this defers. spawnWorker() already ran, and ko.worker.js starts
