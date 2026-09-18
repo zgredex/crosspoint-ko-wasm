@@ -329,7 +329,6 @@ main {
   margin: 6px 0 2px;
 }
 .backendNote b { color: #ffb84d; }
-.uploadBox.noBackend .fileInput + .fileBtn { opacity: 0.5; }
 #fontConvertBtn { margin-top: 8px; }
 
 /* ---- scrollbars: dark, slim, consistent ---- */

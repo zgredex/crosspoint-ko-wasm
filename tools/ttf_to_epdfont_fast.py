@@ -67,7 +67,7 @@ def _load_ft():
     return False
 
 
-def embolden_glyph(face, emb_px64):
+def embolden_glyph(face, emb_px64, cp=None):
     """Embolden the already-loaded outline glyph in place, then rasterize it.
 
     face must have the target glyph loaded with FT_LOAD_NO_BITMAP (outline,
@@ -81,8 +81,20 @@ def embolden_glyph(face, emb_px64):
     slot = face.glyph._FT_GlyphSlot
     outline = ctypes.byref(slot.contents.outline)
     rc = _FT_Outline_Embolden(ctypes.cast(outline, ctypes.c_void_p), emb_px64, emb_px64)
+    if rc == 6:  # FT_Err_Invalid_Argument: outline too degenerate to thicken
+        # Space has n_points == 0; U+2000-style glyphs have a single point and no
+        # contour. FreeType rejects both, and raising here aborted the WHOLE conversion
+        # for any font as soon as --embolden was used, because U+0020 and U+2000 are both
+        # in the default intervals. Nothing to thicken: render plainly and carry on.
+        # Same rule in tools/ft_wasm.c.
+        rc = _FT_Render_Glyph(ctypes.cast(slot, ctypes.c_void_p), 0)  # FT_RENDER_MODE_NORMAL
+        if rc != 0:
+            raise RuntimeError("FT_Render_Glyph failed rc=%d" % rc)
+        return
     if rc != 0:
-        raise RuntimeError("FT_Outline_Embolden failed rc=%d" % rc)
+        raise RuntimeError("FT_Outline_Embolden failed rc=%d (codepoint U+%s, n_points=%d)"
+                           % (rc, ("%04X" % cp) if cp is not None else "?",
+                              slot.contents.outline.n_points))
     rc = _FT_Render_Glyph(ctypes.cast(slot, ctypes.c_void_p), 0)  # FT_RENDER_MODE_NORMAL
     if rc != 0:
         raise RuntimeError("FT_Render_Glyph failed rc=%d" % rc)
@@ -219,7 +231,7 @@ def convert_ttf_to_epdfont(font_files, font_name, size, output_path, additional_
                     if do_embolden:
                         # outline load (hinted) → FT_Outline_Embolden → raster
                         f.load_glyph(gi, freetype.FT_LOAD_NO_BITMAP)
-                        embolden_glyph(f, embolden_px64)
+                        embolden_glyph(f, embolden_px64, cp)
                     else:
                         f.load_glyph(gi, freetype.FT_LOAD_RENDER)
                     face = f

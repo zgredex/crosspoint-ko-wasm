@@ -149,6 +149,28 @@ function post(id, ok, payload, transfer) {
   self.postMessage(Object.assign({ id, ok }, payload), transfer || []);
 }
 
+// ---- font conversion (no local server needed) -----------------------------
+// FreeType (tools/ft_wasm.c) + the .epdfont packer (web/epdfont.js), both loaded on
+// first use so a page that never picks a custom font pays nothing. Version-pinned like
+// the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
+// would serve a cached module forever after any rebuild.
+const FT_MODULE_VERSION = '15';
+let fontConv = null;
+let ftVersionString = '';
+async function getFontConverter() {
+  if (fontConv) return fontConv;
+  if (typeof EpdFontConverter === 'undefined') {
+    importScripts('ft_wasm.js?v=' + FT_MODULE_VERSION, 'epdfont.js?v=' + FT_MODULE_VERSION);
+  }
+  fontConv = await EpdFontConverter.load({
+    factory: createFtConverter({
+      locateFile: (p) => (p.indexOf('.wasm') >= 0 ? p + '?v=' + FT_MODULE_VERSION : p),
+    }),
+  });
+  ftVersionString = fontConv.ftVersion || '';
+  return fontConv;
+}
+
 // Copy a 48000-byte plane from wasm heap into a JS Uint8Array.
 function copyPlane(kind) {
   const ptr = api._ko_plane_ptr(kind);
@@ -210,7 +232,7 @@ async function init() {
   // Cache-bust the engine binaries: the emscripten glue fetches the .wasm with no version
   // query, so without this the edge serves a previously cached engine indefinitely and no
   // engine change can ever reach a returning browser.
-  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=14' : path) });
+  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=15' : path) });
   api = Module;
   // deterministic viewport: engine computes from margins; init with full logical
   api._ko_init(464, 778); // will be fixed up by ko_set_margins on first spec
@@ -451,6 +473,39 @@ self.onmessage = async (ev) => {
         const bytes = new Uint8Array(api.HEAPU8.buffer.slice(ptr, ptr + size));
         const tx = bytes.buffer;
         post(id, true, { cover: tx }, [tx]);
+        break;
+      }
+
+      case 'convertFont': {
+        // TTF/OTF -> .epdfont, in this worker. This is the ONLY conversion path on the
+        // hosted build (no backend there), and app.js prefers it locally too: the font
+        // bytes never leave the tab and a full Hangul font lands in ~150-400 ms.
+        // Parity with tools/ttf_to_epdfont_fast.py is byte-for-byte on every case
+        // measured (scripts/verify/epdfont_parity.js).
+        tick('convertFont');
+        const conv = await getFontConverter();
+        const res = conv.convert({
+          fontBytes: new Uint8Array(ev.data.font),
+          name: ev.data.name || 'custom',
+          size: ev.data.size || 14,
+          twoBit: ev.data.twoBit !== false,
+          weight: ev.data.weight || 500,
+          noHangul: !!ev.data.noHangul,
+          extraIntervals: ev.data.extraIntervals || [],
+          spacePx: ev.data.spacePx,
+        });
+        const buf = res.bytes.buffer;
+        tock('convertFont');
+        post(id, true, {
+          epdfont: buf,
+          meta: {
+            glyphs: res.glyphCount, intervals: res.intervalCount, bitmapBytes: res.bitmapBytes,
+            advanceY: res.advanceY, ascender: res.ascender, descender: res.descender,
+            weightMode: res.weightMode, effectiveWeight: res.effectiveWeight,
+            nativeWeight: res.nativeWeight, emboldenPx64: res.emboldenPx64,
+            ftVersion: ftVersionString,
+          },
+        }, [buf]);
         break;
       }
 

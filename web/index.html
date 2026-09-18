@@ -127,7 +127,9 @@
       <div id="fontUpload" class="uploadBox hidden">
         <p class="hint">Pick a TTF/OTF and tune — every change re-converts and
           re-paginates live (visible page first, rest of the book pre-converts
-          silently once you stop). Same output the X4 loads from <code>/fonts/</code>.</p>
+          silently once you stop). Same output the X4 loads from <code>/fonts/</code>.
+          Conversion runs entirely in your browser (FreeType in WASM — nothing to install),
+          and a full modern-Hangul face takes a few hundred milliseconds.</p>
 
         <div class="ctrl fileCtrl">
           <span>Font file <i>OTF/TTF</i></span>
@@ -180,14 +182,7 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
         </div>
 
         <div id="fontConvStatus" class="fontStatus"></div>
-        <p id="fontBackendNote" class="hint backendNote hidden">
-          <b>Hosted build:</b> font conversion needs the local converter
-          (<code>server.py</code> + <code>tools/ttf_to_epdfont_fast.py</code>), which is not
-          deployed here — the WASM engine (EPUB → XTC/XTCH/XTCZ preview &amp; export) runs fully
-          in your browser, but custom TTF/OTF fonts can't be rasterized without it.
-          <span class="dim">커스텀 폰트 변환은 로컬 서버(<code>server.py</code>)에서만 동작합니다.
-          나머지 기능은 브라우저에서 그대로 사용할 수 있습니다.</span>
-        </p>
+        
       </div>
     </section>
 
@@ -256,6 +251,6 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
   </aside>
 </main>
 
-<script src="app.js?v=14"></script>
+<script src="app.js?v=15"></script>
 </body>
 </html>

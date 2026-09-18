@@ -56,7 +56,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=14');
+    const w = new Worker(base + 'ko.worker.js?v=15');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -411,10 +411,9 @@
   }
 
   // ---- backend capability ------------------------------------------------
-  // Custom-font conversion (TTF/OTF → .epdfont) is done by the local Python
-  // server (server.py → tools/ttf_to_epdfont_fast.py, freetype). A static
-  // deploy has no such endpoint, so probe once and say so plainly rather than
-  // surfacing a bare "HTTP 404" in the middle of a knob scrub.
+  // Font conversion runs in the browser now (worker: FreeType wasm + web/epdfont.js), so
+  // nothing here is "missing" on a static deploy any more. This probe only decides whether
+  // the legacy PYTHON endpoint is available to fall back to (local development).
   let fontBackend = null;        // null = unknown, true = present, false = static deploy
   let fontBackendProbe = null;
   function hasFontBackend() {
@@ -429,31 +428,57 @@
         } catch (_) {
           fontBackend = false;
         }
-        if (!fontBackend) {
-          fontBackendProbe = Promise.resolve(false);
-          const note = document.getElementById('fontBackendNote');
-          if (note) note.classList.remove('hidden');
-          els.fontUpload.classList.add('noBackend');
-        }
         return fontBackend;
       })();
     }
     return fontBackendProbe;
   }
 
-  // POST the chosen font + tuning knobs to the local converter; returns the
-  // .epdfont ArrayBuffer (or throws with the server's message).
-  // Hot-path protocol: the FIRST convert of a picked file uploads the bytes and
-  // the server registers a fontId (sha256); every later knob change sends only
-  // the tiny params + fontId, so scrubbing never re-uploads the 3–10 MB font.
-  let fontIdByFile = {};    // file fingerprint → registered fontId
+  // Convert the chosen font + tuning knobs to .epdfont.
+  //
+  // The conversion now runs IN THE BROWSER (worker: FreeType wasm + web/epdfont.js), so the
+  // hosted build needs nothing installed on the user's machine and the font bytes never leave
+  // the tab. server.py is kept only as a fallback for development: if the in-browser
+  // converter fails to load, the old endpoint is tried when it exists.
+  let fontIdByFile = {};    // file fingerprint → registered fontId (server fallback only)
+  let fontConvIsLocal = true;  // false only if the in-browser converter failed and the
+                               // Python endpoint took over (see the ladder guard above)
   const fontFp = (f) => (f ? f.name + '|' + f.size + '|' + (f.lastModified || 0) : '');
-  async function convertFont(fontFile) {
-    if (!(await hasFontBackend())) {
-      throw new Error('custom font conversion needs the local server (server.py) — '
-        + '커스텀 폰트 변환은 로컬 서버에서만 동작합니다. '
-        + 'This hosted build ships the WASM engine only.');
-    }
+
+  async function convertFontLocal(fontFile) {
+    const raw = await fontFile.arrayBuffer();
+    const iv = els.fontIntervals.value.trim();
+    const sp = parseInt(els.fontSpacePx.value, 10);
+    const name = els.fontName.value.trim() || 'custom';
+    const size = parseInt(els.fontSize.value, 10) || 14;
+    const weight = parseInt(els.fontWeight.value, 10) || 500;
+    const t0 = performance.now();
+    const r = await call('convertFont', {
+      font: raw,
+      name: name,
+      size: size,
+      weight: weight,
+      twoBit: true,             // reader fonts are always 2-bit; the XTC/XTCH output depth
+                                // is the export mode, applied at pack time
+      noHangul: !els.fontHangul.checked,
+      extraIntervals: iv ? iv.split(/[\s,]+/).filter(Boolean) : [],
+      spacePx: isNaN(sp) ? undefined : sp,
+    }, [raw], 120000);
+    r._bytes = r.epdfont;
+    r.bytes = r.epdfont.byteLength;
+    r.ms = Math.round(performance.now() - t0);
+    // flatten the worker's meta so the callers' status text reads the same as it did for
+    // the server response (name/size/weight/glyphs/weightMode/bytes)
+    Object.assign(r, r.meta || {});
+    r.name = name;
+    r.size = size;
+    r.weight = r.effectiveWeight || weight;
+    r.inBrowser = true;
+    return r;
+  }
+
+  async function convertFontServer(fontFile) {
+    fontConvIsLocal = false;   // the ladder may warm the server cache again
     const fp = fontFp(fontFile);
     const fd = new FormData();
     const known = fontIdByFile[fp];
@@ -462,9 +487,7 @@
     fd.append('name', els.fontName.value.trim() || 'custom');
     fd.append('size', String(parseInt(els.fontSize.value, 10) || 14));
     fd.append('weight', String(parseInt(els.fontWeight.value, 10) || 500));
-    fd.append('twoBit', '1');   // reader fonts are always 2-bit; output depth
-                                // (XTC 1-bit vs XTCH 2-bit) is the export mode,
-                                // applied at pack time — never at font build
+    fd.append('twoBit', '1');
     if (!els.fontHangul.checked) fd.append('noHangul', '1');
     const iv = els.fontIntervals.value.trim();
     if (iv) fd.append('extraIntervals', iv);
@@ -476,18 +499,29 @@
       // the server may have evicted the registered font → re-upload once
       if (known && /fontId|missing 'font'/.test(j.error || '')) {
         delete fontIdByFile[fp];
-        return convertFont(fontFile);
+        return convertFontServer(fontFile);
       }
       const why = j.error || j.stderr || ('HTTP ' + resp.status);
       throw new Error('conversion failed: ' + String(why).slice(0, 400));
     }
     if (j.fontId) fontIdByFile[fp] = j.fontId;
-    const b64 = j.epdfont;
-    const bin = atob(b64);
+    const bin = atob(j.epdfont);
     const buf = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
     j._bytes = buf.buffer;
     return j;
+  }
+
+  async function convertFont(fontFile) {
+    try {
+      return await convertFontLocal(fontFile);
+    } catch (e) {
+      // Fall back to the local dev server only if this deploy actually has one; a static
+      // host 404s the probe. Either way the error that reaches the user is the in-browser
+      // one, which is the path that is supposed to work everywhere.
+      if (await hasFontBackend().catch(() => false)) return convertFontServer(fontFile);
+      throw e;
+    }
   }
 
   async function applyCustomFont(meta) {
@@ -651,6 +685,12 @@
   let ladderActive = false;
   function scheduleWeightLadder() {
     if (ladderActive || !book) return;
+    // Nothing to warm when conversion is local: the ladder exists to pre-fill the PYTHON
+    // server's memo cache so a weight scrub does not pay a round trip per step. In-browser
+    // conversion takes ~150-400 ms for a full Hangul font, straight from the picked file,
+    // so fourteen extra conversions would only burn worker time for no benefit — the first
+    // scrub converts on demand instead.
+    if (fontConvIsLocal) return;
     ladderActive = true;
     const f = els.fontFile.files && els.fontFile.files[0];
     const run = async () => {
@@ -716,7 +756,9 @@
                  ' [' + wm + '] · ' + meta.glyphs + ' glyphs — applying…', false);
       await applyCustomFont(meta);
       fontStatus('✓ ' + (meta.name || 'custom') + ' ' + meta.size + 'pt active (' +
-                 meta.glyphs + ' glyphs, ' + Math.round(meta.bytes / 1024) + ' KB)', false);
+                 meta.glyphs + ' glyphs, ' + Math.round(meta.bytes / 1024) + ' KB' +
+                 (meta.inBrowser ? ', converted in your browser in ' + meta.ms + ' ms — ' +
+                   (meta.ftVersion || 'FreeType') : '') + ')', false);
       invalidateWarm();
       scheduleWarm(700);
       scheduleWeightLadder();   // warm neighbor weights for the first scrub
