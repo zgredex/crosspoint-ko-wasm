@@ -739,6 +739,13 @@ async function applySpec(raw) {
   const rk = renderKey(currentSpec);
   COUNTERS.specApplies += 1;
 
+  // The commit above is needed by every step below, but it must not SURVIVE a failure: a spec that
+  // claims font:"custom" while the engine is still on KoPub makes every later applySpecIfChanged()
+  // short-circuit on "no change" and render or export the wrong face silently. Measured with the
+  // fail-closed test: the first call threw correctly, and the very next exportBook still produced a
+  // KoPub file — because the failed spec had already been written down.
+  try {
+
   api._ko_set_line_compression(currentSpec.lineCompression);
   api._ko_set_paragraph_indent(currentSpec.paragraphIndent);
   api._ko_set_character_wrap(currentSpec.characterWrap);
@@ -762,8 +769,17 @@ async function applySpec(raw) {
     tock('ensureFace');
   }
   tick('applyFont');
-  applyFont(currentSpec.font);            // no-op unless the face or the font stamp changed
+  // Fail closed. applyFont() returns false when the requested face cannot be made active — a
+  // custom font that was never uploaded to THIS engine, or a built-in whose blob could not be
+  // registered. Continuing would render with whatever face was previously applied and still report
+  // success, which is a wrong output that looks like a working one. With the preview and export
+  // engines now separate, this is exactly how a custom-font export could have silently produced a
+  // KoPub file.
+  const fontOk = applyFont(currentSpec.font);
   tock('applyFont');
+  if (!fontOk) {
+    throw new Error('requested font "' + currentSpec.font + '" is not available in this engine');
+  }
 
   if (lk !== lkBefore) {
     const mg = marginsFor(currentSpec);
@@ -772,6 +788,11 @@ async function applySpec(raw) {
   }
   if (rk !== rkBefore) clearFrameCache();  // frames are keyed by render key: old ones are dead weight
   return { layout: lk, layoutChanged: lk !== lkBefore };
+
+  } catch (e) {
+    currentSpec = before;    // an unmet requirement must be re-attempted, not remembered as satisfied
+    throw e;
+  }
 }
 
 // Margins/viewport for the readout. The firmware's own arithmetic: viewable margins + screenMargin
@@ -874,7 +895,14 @@ self.onmessage = async (ev) => {
         // a new book cleared the in-memory FS: re-apply the custom font if one
         // is loaded, so the reader face survives chapter navigation
         if (customFontBytes && currentSpec && currentSpec.font === 'custom') {
-          applyFont('custom');
+          // a new book cleared the in-memory FS, so the custom font has to go back in; if that fails
+          // the engine would render this book with the default face while the page believes otherwise
+          if (!applyFont('custom')) {
+            const ep = api._ko_error();
+            post(id, false, { error: 'epdfont re-apply after book load failed: ' +
+                                     (api.UTF8ToString(ep) || 'failed') });
+            return;
+          }
         }
         post(id, true, { spineCount, hrefs, title });
         break;

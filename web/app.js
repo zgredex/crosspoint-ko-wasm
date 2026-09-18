@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=47');
+    const w = new Worker(base + 'ko.worker.js?v=56');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -116,7 +116,10 @@
       // §8: prefer the remembered File — it survives a cancelled picker and is populated by
       // drag/drop, neither of which the input's FileList can do.
       const f = currentBookFile || (els.file.files && els.file.files[0]) || null;
-      if (f) {
+      if (currentBookBlob) {
+        pendingBookFile = f;
+        return loadBook(currentBookBlob, (f && f.name) || (book && book.title) || 'book.epub');
+      } else if (f) {
         pendingBookFile = f; return loadBook(f, f.name);
       } else {
         const q = new URLSearchParams(location.search);
@@ -141,6 +144,15 @@
     });
   }
   window.__call = call;   // debug hook (stats etc.)
+  // Debug hook for the export engine. The split means the export engine's state is invisible from the
+  // page otherwise, and the split-engine gate needs to inspect and destroy it deliberately: a
+  // correctness test for "the export engine was told font:custom but never given one" cannot be
+  // driven through the UI, because the UI is now careful enough not to produce that state.
+  window.__export = {
+    call: (...a) => exportCall(...a),
+    kill: () => killExportEngine(),
+    isLoaded: () => !!exportLoaded,
+  };
 
   // ---- the export engine ------------------------------------------------------
   // A SECOND worker instance running the same ko.worker.js. Everything whole-book — the speculative
@@ -155,9 +167,25 @@
   const exportPending = new Map();
   let exportLoaded = null;        // promise: "this engine has the current book"
 
+  // The page owns the converted .epdfont, exactly as it owns the EPUB Blob. It cannot live only in
+  // the preview worker, because a newly created export engine would then have no idea a custom font
+  // was in play — and the spec it is handed legitimately says font:"custom". One canonical copy here,
+  // expendable copies handed to each engine (a transferred ArrayBuffer is detached, so the copy that
+  // goes out can never be the copy we keep).
+  let customFontAsset = null;     // { name, bytes: ArrayBuffer, generation }
+  let customFontGeneration = 0;
+
+  // And the page owns the current BOOK, for the same reason. Without it, an engine that has to be
+  // rebuilt — after a kill, a crash, or a timeout — could only be rebuilt when the book happened to
+  // come from the file picker (currentBookFile); a book opened from ?epub= left nothing to reload
+  // from, and the recovery path silently did nothing. Measured: after killing the export engine, an
+  // export of a fetch-loaded book failed instead of rebuilding. A Blob is a reference, so retaining
+  // it costs the page nothing.
+  let currentBookBlob = null;
+
   function spawnExportWorker() {
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=47');
+    const w = new Worker(base + 'ko.worker.js?v=56');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -192,6 +220,12 @@
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         exportPending.delete(id);
+        // Kill the engine, do not merely reject. After a timeout the caller has lost synchronization
+        // with a worker that may still be mutating engine state — a 600 s export can keep converting
+        // while the UI reports failure, and the next export would then meet a busy engine holding
+        // half a book. Unknown state is cheap to destroy here: the next call rebuilds the engine from
+        // the EPUB Blob and the retained font asset.
+        killExportEngine();
         reject(new Error('timeout: ' + cmd));
       }, timeoutMs || CALL_TIMEOUT_MS);
       exportPending.set(id, { resolve, reject, timer });
@@ -205,6 +239,12 @@
     if (exportWorker) { try { exportWorker.terminate(); } catch (_) {} }
     exportWorker = null;
     exportLoaded = null;
+    // Anything the PAGE believes about that engine has to go with it. warmSpecKey says "a converted
+    // container is sitting in the engine, ready to download" — after a kill that is false, and the
+    // download path would take the warm branch and hand the user an error instead of a file.
+    // Measured: killing the engine and pressing export produced
+    // '✗ 내보내기에 실패했습니다' with no file, because the warm it promised no longer existed.
+    warmSpecKey = null;
     for (const [, p] of exportPending) { clearTimeout(p.timer); p.reject(new Error('export engine stopped')); }
     exportPending.clear();
   }
@@ -213,8 +253,18 @@
   // transferred ArrayBuffer is DETACHED for the first reader, so the second engine could never see
   // it, and keeping a page-side copy would double a 200 MB book's memory.
   function loadExportEngine(blob) {
-    exportLoaded = exportCall('load', { blob }, null, 300000)
-      .catch((e) => { exportLoaded = null; throw e; });
+    exportLoaded = (async () => {
+      await exportCall('load', { blob }, null, 300000);
+      // Whatever the engine is, it must end up in the state the page describes — book AND font. This
+      // is what makes killing the export engine safe: no worker holds irreplaceable state, so a hard
+      // kill costs a re-load rather than a silently wrong next export.
+      if (customFontAsset) {
+        const bytes = customFontAsset.bytes.slice(0);
+        await exportCall('loadFont',
+                         { epdfont: bytes, name: customFontAsset.name }, [bytes], 120000);
+      }
+      return true;
+    })().catch((e) => { exportLoaded = null; throw e; });
     return exportLoaded;
   }
 
@@ -718,8 +768,28 @@
   }
 
   async function applyCustomFont(meta) {
-    // hand the .epdfont bytes to the engine (worker caches + re-applies after loads)
-    const r = await call('loadFont', { epdfont: meta._bytes, name: meta.name }, [meta._bytes]);
+    // One canonical copy stays here; each engine gets a disposable copy, because transferring detaches
+    // the buffer that was sent. The previous version handed meta._bytes straight to the preview worker
+    // and kept nothing, so the export engine could be told font:"custom" while owning no such font.
+    const retained = meta._bytes.slice(0);
+    customFontAsset = { name: meta.name, bytes: retained, generation: ++customFontGeneration };
+
+    const previewBytes = retained.slice(0);
+    const r = await call('loadFont', { epdfont: previewBytes, name: meta.name }, [previewBytes]);
+
+    // A newly converted font must reach the export engine too, or the next conversion is built from a
+    // different face than the preview shows. Best-effort: loadExportEngine() restores it anyway, and
+    // that path is the one that has to be correct.
+    if (exportLoaded) {
+      try {
+        await exportLoaded;
+        const exportBytes = retained.slice(0);
+        await exportCall('loadFont', { epdfont: exportBytes, name: meta.name }, [exportBytes], 120000);
+      } catch (e) {
+        console.warn('[export] custom font sync failed:', e && e.message);
+      }
+    }
+
     els.fontPreset.value = 'custom';
     syncFontSeg();
     // update the face field so spec() pushes the right font; quiet re-render —
@@ -743,6 +813,8 @@
 
   async function loadBook(blob, name) {
     renderToken++;                      // kill in-flight renders
+    currentBookBlob = blob;             // rebuildable from here on, whatever its source
+    window.__koOpenT0 = performance.now();   // per book, or the timings below lie on the second open
     // §2 of the 1.2 audit: cancel the warm BEFORE asking the engine to load. Cancelling afterwards
     // left the warm free to resume between spines against a book that had already been replaced (the
     // worker also waits for it to stop now, but the request must not be sent first either).
@@ -757,9 +829,6 @@
       // A book change resets the export engine outright: one engine per book, and no chance of a
       // leftover instance still converting the previous one.
       killExportEngine();
-      loadExportEngine(blob).catch((e) => {
-        console.warn('[export] engine load failed:', e && e.message);
-      });
       const r = await call('load', { blob }, null, 120000);
       // §5: canonicalize ONCE, here. The header, the export filename and every later comparison
       // then use one composed string. An NFD metadata title used to reach the filename sanitizer
@@ -789,6 +858,27 @@
       invalidateWarm();           // warm bytes (if any) belong to a previous book
       lastPushedSpecKey = null;   // §2: a fresh engine needs the spec once
       await refresh(false);
+      // The reader has a usable page. Only NOW is the export engine prepared: starting it alongside
+      // the preview load made opening a book two complete engine initialisations at once — instantiate
+      // wasm, fetch and register the reader face, read the Blob, parse ZIP/OPF/TOC, twice — competing
+      // with the work the user is actually waiting for. Nothing needs the export engine yet: the warm
+      // is speculative and scheduled below, and the export path loads on demand.
+      //
+      // requestIdleCallback is right here and was wrong for the readiness ping it was once misused on:
+      // this is genuinely work nobody is waiting for. The timeout bounds how long the engine may be
+      // absent if the page never goes idle.
+      const tFirstPage = performance.now();
+      const prepExport = () => {
+        window.__koBookOpen = { firstPageMs: +(tFirstPage - window.__koOpenT0).toFixed(1) };
+        loadExportEngine(blob).then(() => {
+          window.__koBookOpen.exportReadyMs =
+            +(performance.now() - window.__koOpenT0).toFixed(1);
+        }).catch((e) => {
+          console.warn('[export] engine load failed:', e && e.message);
+        });
+      };
+      if (typeof requestIdleCallback === 'function') requestIdleCallback(prepExport, { timeout: 1000 });
+      else setTimeout(prepExport, 0);
       scheduleWarm(3000);          // pre-convert the fresh book once idle
     } catch (e) {
       reportError(e, 'EPUB 열기');
@@ -1391,8 +1481,10 @@
           (u8.byteLength / 1048576).toFixed(1) + ' MB' + ratio + ' (사전 변환)';
         setStatus('✓ 내보내기 완료 — ' + filename);   // §4: resolve the header, not just the panel
         saveBlob(u8, filename);
-        warmSpecKey = null;   // bytes handed over; next warm refills
-        refresh(true);        // engine was invalidated by the warm pass
+        // Bytes handed over; next settings change schedules another warm. No preview refresh: the
+        // warm ran on the export engine, which shares no state with the preview engine now — the
+        // reason this line existed was written when one engine did both jobs.
+        warmSpecKey = null;
       } catch (e) {
         els.exportStatus.textContent = '✗ 미리 변환본을 불러오지 못했습니다. 미리보기를 한 번 넘긴 뒤 다시 시도해 주세요.';
         setStatus('✗ 내보내기에 실패했습니다. 미리보기를 한 번 넘긴 뒤 다시 시도해 주세요.', true);
@@ -1420,8 +1512,8 @@
       // already does — loaded in parallel with the preview — but a load failure or a setting change
       // that killed the engine lands here, and re-loading is far cheaper than a failed export.
       if (!exportLoaded) {
-        const f = currentBookFile || (els.file.files && els.file.files[0]) || null;
-        if (f) { try { await loadExportEngine(f); } catch (_) {} }
+        const src = currentBookBlob || currentBookFile || (els.file.files && els.file.files[0]) || null;
+        if (src) { try { await loadExportEngine(src); } catch (_) {} }
       } else {
         try { await exportLoaded; } catch (_) {}
       }
@@ -1449,11 +1541,14 @@
         (u8.byteLength / 1048576).toFixed(1) + ' MB' + ratio;
       saveBlob(u8, filename);
       setStatus('✓ 내보내기 완료 — ' + filename);   // §4: otherwise desktop says "생성 중" forever
-      // the export ran every spine through the engine; the next preview render
-      // rebuilds the current spine so the page stays in sync with the book
-      refresh(true);
-      invalidateWarm();
-      scheduleWarm(2000);
+      // The export ran on its OWN engine: the preview's section_ and frame cache are untouched, so
+      // there is nothing to refresh here.
+      //
+      // And nothing to re-warm either. This used to call invalidateWarm() + scheduleWarm(2000), which
+      // rendered the entire book a second time two seconds after the first pass finished, for settings
+      // that had not changed. exportBook() also drops any warm bytes on entry, so no buffer exists to
+      // keep; warmSpecKey = null states that, and the next actual settings change schedules a warm.
+      warmSpecKey = null;
     } catch (e) {
       els.exportStatus.textContent = '✗ ' + describeError(e, '내보내기');
       setStatus('✗ ' + describeError(e, '내보내기'), true);
