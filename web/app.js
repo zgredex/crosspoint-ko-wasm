@@ -6,6 +6,10 @@
 
   const els = {
     file: $('epubFile'), status: $('status'),
+    bookTitle: $('bookTitle'), bookChange: $('bookChange'),
+    pageStatus: $('pageStatus'), sidebar: $('sidebar'), drawerToggle: $('drawerToggle'),
+    exportJump: $('exportJump'), exportSummary: $('exportSummary'),
+    exportProgress: $('exportProgress'),
     page: $('page'), loading: $('loading'), pagerEl: $('pager'),
     prevBtn: $('prevBtn'), nextBtn: $('nextBtn'), pageInfo: $('pageInfo'),
     spineSel: $('spineSel'), coverBtn: $('coverBtn'),
@@ -56,13 +60,16 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=23');
+    const w = new Worker(base + 'ko.worker.js?v=32');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
       if (m && m.progress && els.exportStatus) {
-        els.exportStatus.textContent = '생성 중 ' + m.spine + '/' + m.ofSpines + ' ' +
+        els.exportProgress.textContent = '생성 중 ' + m.spine + '/' + m.ofSpines + ' ' +
           '(' + m.pages + '쪽 완료)…';
+        // set once: re-assigning the same string still mutates the live region
+        if (els.exportStatus.textContent !== '기기 파일 생성 중…')
+          els.exportStatus.textContent = '기기 파일 생성 중…';
         return;
       }
       const p = pending.get(m.id);
@@ -164,6 +171,21 @@
     if (els.status) els.status.title = String((e && e.message) || e || '');
   }
 
+  // §4: EPUB metadata and filenames can arrive decomposed (NFD Hangul), which renders as
+  // broken-looking jamo. Display normalization only — byte data is never touched.
+  function normalizeDisplayText(value) {
+    try { return String(value == null ? '' : value).normalize('NFC'); }
+    catch (e) { return String(value == null ? '' : value); }
+  }
+
+  // §1: two explicit UI states drive everything (CSS keys off the attribute)
+  function setAppState(next) {
+    document.body.dataset.appState = next;
+    if (next === 'loaded') {
+      updateZoomCss();          // the preview box only has its real size once visible
+    }
+  }
+
   function setStatus(msg, isErr) {
     // A polite region for progress, assertive for failures (item 4). Toggling aria-live is the
     // supported way to raise severity on one region without double-announcing the message.
@@ -216,7 +238,7 @@
     els.embeddedStyle.checked = true;
     els.textAa.checked = true;                // device default: on
     els.screenMargin.value = '5';
-    els.screenMarginOut.textContent = '5';
+    els.screenMarginOut.textContent = '5 px';
     // NOTE: the device's status-bar settings deliberately do NOT feed layout.
     // The reader reserves a 19 px status-bar lane on-device, but an XTC/XTCH
     // page is a finished bitmap and the UI must not be encoded into it — the
@@ -299,13 +321,13 @@
     if (!book) return;
     ++renderToken;
     viewingCover = true;
-    setStatus('표지…');
     busy('표지 생성 중');
     try {
       const r = await call('cover', { kind: 0 });
       const img = bmpToImageData(r.cover);
       drawCoverFitted(img);          // letterbox into the fixed 480×800 screen
-      setStatus(book.title + ' — cover (표지)');
+      els.pageStatus.textContent = '표지';
+      els.page.setAttribute('aria-label', '도서 표지 미리보기');
     } catch (e) {
       reportError(e, '표지 렌더링');
       viewingCover = false;
@@ -383,12 +405,13 @@
       drawImage(r.image);
       updateZoomCss();
       updatePager();
-      setStatus(book.title + ' — ' + (r.page + 1) + '/' + r.pages + '쪽' +
-                (r.mono ? ' · 1-bit 미리보기' : ''));
-      // a screen reader cannot read rasterized text, but it can say what this object is
-      els.page.setAttribute('aria-label',
-        '도서 미리보기, ' + (els.spineSel.value ? (Number(els.spineSel.value) + 1) + '장 ' : '') +
-        (r.page + 1) + '쪽');
+      // Routine navigation must not flood a live region: the page counter is plain text
+      // (readable on demand), while #status keeps only meaningful events.
+      const chapter = els.spineSel.value ? (Number(els.spineSel.value) + 1) + '장 ' : '';
+      els.pageStatus.textContent = chapter + (r.page + 1) + '/' + r.pages +
+                                   (r.mono ? ' · 1-bit' : '');
+      // §15: a screen reader cannot read rasterized text, but it can say what this object is
+      els.page.setAttribute('aria-label', '도서 미리보기, ' + chapter + (r.page + 1) + '쪽');
     } catch (e) {
       if (tok === renderToken) reportError(e, '페이지 렌더링');
     } finally {
@@ -583,7 +606,8 @@
   function populateSpines(hrefs) {
     els.spineSel.innerHTML = '';
     hrefs.forEach((h, i) => {
-      const label = h.replace(/\.(xhtml|html|htm)$/i, '').replace(/[_]+/g, ' ') || ('spine ' + i);
+      const label = normalizeDisplayText(h.replace(/\.(xhtml|html|htm)$/i, '')
+                        .replace(/[_]+/g, ' ')) || ('spine ' + i);
       const opt = document.createElement('option');
       opt.value = i;
       opt.textContent = (i + 1) + '. ' + label;
@@ -603,7 +627,12 @@
       populateSpines(r.hrefs);
       state = { spine: 0, page: 0, pages: 0, mode: state.mode };  // keep output mode
       els.coverBtn.disabled = false;
-      document.body.classList.remove('no-book');   // ②/③ become available
+      setAppState('loaded');
+      const shownTitle = normalizeDisplayText(r.title || name || '제목 없음');
+      els.bookTitle.textContent = shownTitle;
+      els.bookTitle.hidden = false;
+      els.bookTitle.title = shownTitle;
+      setStatus('✓ EPUB 열기 완료');
       els.downloadBtn.disabled = exporting;
       els.exportStatus.textContent = '';
       invalidateWarm();           // warm bytes (if any) belong to a previous book
@@ -625,7 +654,7 @@
     // reflect the chosen file on the picker label (native "no file chosen" text
     // belongs to the hidden input — the label is what the user sees)
     const lab = document.querySelector('label[for=epubFile]');
-    if (lab) lab.textContent = f.name;
+    if (lab) lab.textContent = normalizeDisplayText(f.name);
     f.arrayBuffer().then((buf) => loadBook(buf, f.name));
   }
 
@@ -652,6 +681,7 @@
   });
 
   els.coverBtn.addEventListener('click', () => loadCover());
+  els.bookChange.addEventListener('click', () => els.file.click());
 
   // ---- unified settings scheduler (rAF-paced hot path) ----
   // Every knob change funnels here. Sliders update their <output> live on
@@ -1060,6 +1090,12 @@
   // The engine always renders the full 3-plane content; the chosen mode decides
   // how it is quantized. The worker composes the preview through the same
   // quantization the encoder applies, so preview == file by construction.
+  function updateExportSummary() {
+    if (!els.exportSummary) return;
+    const mode = state && state.mode === 0 ? 'XTC · 1비트 · 작은 파일' : 'XTCH · 2비트 · 이미지 품질 우선';
+    els.exportSummary.textContent = mode + (els.lz4Wrap && els.lz4Wrap.checked ? ' + LZ4 (.xtcz)' : '');
+  }
+
   function syncExportSeg() {
     els.exportSeg.querySelectorAll('input[name=exportModeRadio]').forEach((r) => {
       r.checked = Number(r.value) === state.mode;
@@ -1071,6 +1107,7 @@
     state.mode = Number(seg.value);
     syncExportSeg();
     syncAaToMode();
+    updateExportSummary();
     savePrefs();
     // re-render the current page so the preview shows the chosen mode
     if (book) { invalidateWarm(); refresh(true); scheduleWarm(700); }
@@ -1099,7 +1136,10 @@
     if (!n) n = 'book';
     const pre = (els.exportName.value || '').trim();
     const ext = xtcz ? '.xtcz' : (state.mode === 0 ? '.xtc' : '.xtch');
-    return (pre ? pre.replace(/[^\w\-\[\]]/g, '') + ' ' : '') + n + ext;
+    // the prefix keeps Hangul (w and the \w class do not cover it) and the result is trimmed,
+    // otherwise a prefix made only of non-ASCII characters left a stray leading space
+    const cleanPre = pre.replace(/[^\w\-\[\]가-힣]/g, '').trim();
+    return (cleanPre ? cleanPre + ' ' : '') + n + ext;
   }
 
   // Export the whole book at the current mode, then hand the browser the file.
@@ -1180,6 +1220,7 @@
     // output container changes → warm bytes stale → pre-convert the new variant
     invalidateWarm();
     if (book) scheduleWarm(700);
+    updateExportSummary();
     savePrefs();
   });
   syncExportSeg();   // reflect initial mode (XTCH 2-bit) on the toggle
@@ -1193,11 +1234,42 @@
     else if (e.key === 'ArrowRight') els.nextBtn.click();
   });
 
+  // ---- settings drawer (tablet/mobile): the sidebar becomes an off-canvas panel ----
+  const drawerBackdrop = document.createElement('div');
+  drawerBackdrop.className = 'drawerBackdrop';
+  drawerBackdrop.hidden = true;
+  document.body.appendChild(drawerBackdrop);
+
+  function setDrawer(open) {
+    const isOpen = document.body.classList.toggle('drawer-open', !!open);
+    els.drawerToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    drawerBackdrop.hidden = !isOpen;
+    if (isOpen) {
+      const first = els.sidebar.querySelector('select, input, button, summary');
+      if (first) first.focus({ preventScroll: true });
+    }
+  }
+  els.drawerToggle.addEventListener('click', () => setDrawer(!document.body.classList.contains('drawer-open')));
+  drawerBackdrop.addEventListener('click', () => { setDrawer(false); els.drawerToggle.focus(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && document.body.classList.contains('drawer-open')) {
+      setDrawer(false);
+      els.drawerToggle.focus();
+    }
+  });
+  els.exportJump.addEventListener('click', () => {
+    setDrawer(true);
+    const card = document.getElementById('exportPanel');
+    if (card && card.scrollIntoView) card.scrollIntoView({ block: 'end' });
+  });
+
   // ---- boot ----
   // Restore remembered preferences before the engine sees a spec, so the first render already
   // uses the user's settings. Nothing about a book is ever stored.
   const restored = loadPrefs();
   if (restored) syncDependentControls();
+  setAppState(book ? 'loaded' : 'empty');
+  updateExportSummary();
   hasFontBackend();   // one probe: is the server-side converter deployed here?
   worker = spawnWorker();
   // The engine init is deferred to an idle slot so the picker paints without waiting on the

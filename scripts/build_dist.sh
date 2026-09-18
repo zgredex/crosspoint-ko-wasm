@@ -26,6 +26,9 @@ if [ -e "$OUT/demo.epub" ]; then
   exit 1
 fi
 
+# §26: content-address the generated engine/FreeType artifacts and write the manifest
+env -i PATH=/opt/homebrew/bin:/usr/bin:/bin /usr/bin/python3 "$HERE/scripts/fingerprint_assets.py" "$OUT"
+
 echo "built $OUT"
 echo "  files: $(find "$OUT" -type f | wc -l | tr -d ' ')   size: $(du -sh "$OUT" | cut -f1)"
 ls -1 "$OUT"

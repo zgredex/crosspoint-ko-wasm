@@ -23,23 +23,12 @@ body {
 }
 
 /* ---- header ---- */
-header {
-  padding: 12px 20px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  gap: 24px;
-  flex-wrap: wrap;
-  background: var(--panel);
-}
-h1 { font-size: 17px; margin: 0; font-weight: 600; }
 h1 .dim { color: var(--dim); font-weight: 400; font-size: 13px; margin-left: 8px; }
 /* brand tagline: second line under XTCKO, dim and small */
 h1 .tagline { display: block; color: var(--dim); font-weight: 400;
   font-size: 11.5px; margin: 2px 0 0 0; letter-spacing: 0.01em; }
 /* step markers for the ①선택 → ②미리보기/조판 → ③내보내기 flow */
 .step { color: var(--dim); font-weight: 400; margin-right: 2px; }
-#fileRow { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 320px; }
 .status {
   color: var(--dim); font-size: 13px; margin-left: auto;
   /* long book titles truncate on one line instead of wrapping */
@@ -52,21 +41,6 @@ h1 .tagline { display: block; color: var(--dim); font-weight: 400;
 .status.ok { color: #7bdc9b; }
 
 /* ---- layout: preview (always visible) | settings | export ---- */
-main {
-  display: flex;
-  flex: 1;
-  overflow: hidden;
-}
-#preview {
-  flex: 1;
-  min-width: 0;              /* never pushed off by the rails */
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
-  padding: 12px;
-  overflow: hidden;          /* page is always in view */
-}
 /* scrollable viewport for the canvas — fits at 100%, scrolls when zoomed in */
 #canvasScroll {
   flex: 1;
@@ -79,28 +53,6 @@ main {
   padding: 8px;
 }
 #canvasScroll #canvasWrap { margin: auto; }
-#controls {
-  width: 330px;
-  min-width: 300px;
-  max-width: 38vw;
-  overflow-y: auto;
-  padding: 14px;
-  border-left: 1px solid var(--border);
-  background: var(--panel);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-#exportPanel {
-  width: 240px;
-  min-width: 240px;
-  max-width: 30vw;
-  overflow-y: auto;
-  padding: 14px;
-  border-left: 1px solid var(--border);
-  background: var(--panel);
-}
-
 /* ---- drop zone: the one obvious action before a book is loaded ---- */
 #dropZone {
   flex: 1;
@@ -126,13 +78,6 @@ details.help > p { margin: 4px 0 8px; }
 .dropActions { margin: 0; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
 .privacy { margin: 10px 0 0; font-size: 12.5px; color: var(--ok, #7ec699); }
 .dropMeta { margin: 4px 0 0; font-size: 12px; color: var(--dim); }
-#emptyState {
-  color: var(--dim);
-  font-size: 13.5px;
-  text-align: center;
-  max-width: 34ch;
-  line-height: 1.6;
-}
 body:not(.no-book) #emptyState { display: none; }
 /* the second and third steps cannot act before a book is loaded: hide, don't disable */
 body.no-book #controls, body.no-book #exportPanel { display: none; }
@@ -158,29 +103,6 @@ h1, h2, .hint, .privacy, .dropTitle, .dropMeta, #emptyState,
 .hint { line-height: 1.6; }
 
 /* ---- mobile (item 23): single column, comfortable targets, no sideways page scroll ---- */
-@media (max-width: 900px) {
-  header { padding: 10px 12px; gap: 12px; }
-  main { flex-direction: column; overflow: auto; }
-  #preview { flex: none; min-height: 60vh; padding: 8px; }
-  #canvasScroll { overflow: auto; }
-  #pager { flex-direction: row; flex-wrap: wrap; justify-content: center; }
-  #controls, #exportPanel {
-    width: auto; min-width: 0; max-width: none;
-    border-left: 0; border-top: 1px solid var(--border);
-    overflow-y: visible;
-  }
-  .btn, .segBtn, .fileBtn, .chapter select, .ctrl select, .ctrl input[type=range] {
-    min-height: 34px;
-  }
-  .privacy, .dropMeta, .hint { font-size: 13px; }
-}
-@media (max-width: 480px) {
-  #fileRow, #dropZone { min-width: 0; width: 100%; }
-  h1 { font-size: 15px; }
-  h1 .dim { display: block; margin: 2px 0 0; font-size: 12px; }
-  .ctrl { flex-wrap: wrap; }
-  .ctrl.stacked input[type=text] { width: 100%; }
-}
 .card {
   background: var(--panel2);
   border: 1px solid var(--border);
@@ -370,26 +292,7 @@ summary:focus-visible, [tabindex]:focus-visible {
   justify-content: flex-end;
   flex: 1;
 }
-.segBtn {
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--dim);
-  border-radius: 7px;
-  padding: 6px 10px;
-  font: inherit;
-  font-size: 12.5px;
-  line-height: 1.3;
-  cursor: pointer;
-  transition: all 0.12s ease;
-  text-align: center;
-}
 .segBtn:hover:not(.active) { border-color: var(--dim); color: var(--ink); }
-.segBtn.active {
-  background: rgba(79, 156, 247, 0.18);
-  border-color: var(--accent);
-  color: #fff;
-  font-weight: 600;
-}
 .segBtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* select kept for state but never shown (segmented buttons drive it) */
@@ -562,3 +465,157 @@ summary:focus-visible, [tabindex]:focus-visible {
 }
 .exportStatus:empty { display: none; }
 #exportCard button.btn:disabled { opacity: 0.35; cursor: default; }
+
+
+/* =====================================================================
+   LAYOUT v24 — two explicit states, compact app bar (52 px), preview-first
+   workspace, horizontal preview toolbar, one sidebar, drawer below 1150 px.
+   ===================================================================== */
+:root { --appbar-h: 52px; }
+
+/* ---- app bar --------------------------------------------------------- */
+#appbar {
+  position: sticky; top: 0; z-index: 30;
+  min-height: var(--appbar-h);
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) minmax(0, auto) auto;
+  align-items: center; gap: 10px;
+  padding: 6px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+#appbar .brand { font-weight: 700; font-size: 15px; }
+#appbar .brandSub { color: var(--dim); font-size: 12.5px; }
+#appbar .status { margin: 0; text-align: right; min-width: 0; font-size: 13px; }
+#appbar .appbarActions { display: flex; gap: 8px; }
+.bookTitle {
+  margin: 0; font-size: 14px; font-weight: 600; color: var(--ink);
+  min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+body[data-app-state="empty"] #bookChange { display: none; }
+
+/* ---- ① import state: one centered card, nothing else ------------------ */
+#importScreen {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  padding: 24px; min-height: calc(100vh - var(--appbar-h));
+}
+body[data-app-state="loaded"] #importScreen { display: none; }
+#importCard {
+  width: min(560px, 100%); background: var(--panel2);
+  border: 1px solid var(--border); border-radius: 14px;
+  padding: 26px 24px; text-align: center;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .18);
+}
+#importCard h2 { font-size: 20px; margin: 0 0 6px; text-transform: none;
+                 letter-spacing: 0; color: var(--ink); }
+#importCard .sub { margin: 0 0 18px; color: var(--dim); font-size: 13.5px; }
+#importCard #dropZone { min-width: 0; }
+
+/* ---- ②③ workspace: preview + one sidebar ----------------------------- */
+body[data-app-state="empty"] #workspace { display: none; }
+#workspace {
+  flex: 1; min-height: 0; overflow: hidden;
+  display: grid; grid-template-columns: minmax(0, 1fr) 350px;
+}
+#previewPane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#canvasScroll { flex: 1; min-height: 0; max-width: 100%; overflow: auto;
+                display: flex; align-items: center; justify-content: center; padding: 10px; }
+#canvasWrap { margin: auto; position: relative; }
+
+/* ---- preview toolbar: horizontal (the vertical rail cost 159 px of page width) ---- */
+#pager.preview-toolbar {
+  display: flex; flex-direction: row; flex-wrap: wrap; align-items: center;
+  justify-content: flex-start; gap: 8px 10px;
+  width: auto; min-width: 0; max-width: none; align-self: stretch;
+  padding: 8px 12px; border: 0; border-top: 1px solid var(--border);
+  border-radius: 0; background: var(--panel);
+}
+#pager.preview-toolbar button { width: auto; min-height: 34px; min-width: 34px; padding: 4px 10px; }
+.tbGroup { display: inline-flex; align-items: center; gap: 6px; }
+.tbField {
+  display: inline-flex; flex-direction: row; align-items: center; gap: 6px;
+  width: auto; flex: 0 1 auto; min-width: 0;
+}
+.tbField .tbLabel { color: var(--dim); font-size: 12px; }
+.tbField select { max-width: 30vw; }
+.scaleCtrl input[type=range] { width: 96px; }
+.pageStatus { margin-left: auto; color: var(--dim); font-size: 12.5px; white-space: nowrap; }
+#drawerToggle { display: none; }   /* the sidebar is permanent above 1150 px */
+#exportJump { display: none; }     /* mobile only */
+
+/* ---- one sidebar: settings then export, scrolls on its own ----------- */
+#sidebar {
+  display: flex; flex-direction: column; gap: 12px;
+  width: auto; min-width: 0; max-width: none;
+  overflow-y: auto; overscroll-behavior: contain;
+  padding: 14px 14px 0; background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+#sidebar > * { flex: 0 0 auto; }
+
+/* ---- §9 sticky export actions: the final action never scrolls away --- */
+.export-actions {
+  position: sticky; bottom: 0;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px 0 12px; margin-top: 4px;
+  background: linear-gradient(180deg, rgba(44, 49, 59, 0), var(--panel2) 26%);
+}
+.exportSummary { margin: 0; font-size: 12.5px; color: var(--dim); }
+.srOnly { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+          overflow: hidden; clip-path: inset(50%); border: 0; }
+
+/* ---- tablet (760–1150 px): preview keeps its width, settings become a drawer ---- */
+@media (max-width: 1150px) {
+  #workspace { grid-template-columns: minmax(0, 1fr); }
+  #drawerToggle { display: inline-flex; }
+  #previewPane { min-height: calc(100vh - var(--appbar-h)); }
+  #sidebar {
+    position: fixed; top: var(--appbar-h); right: 0; bottom: 0;
+    width: min(360px, 85vw); z-index: 40; padding-bottom: 0;
+    transform: translateX(102%); transition: transform .18s ease;
+    box-shadow: -14px 0 34px rgba(0, 0, 0, .38);
+  }
+  body.drawer-open #sidebar { transform: none; }
+  .drawerBackdrop { position: fixed; inset: var(--appbar-h) 0 0 0; z-index: 35;
+                    background: rgba(0, 0, 0, .45); border: 0; }
+  body:not(.drawer-open) .drawerBackdrop { display: none; }
+  .export-actions { position: static; background: none; }
+  .btn, .fileBtn, .chapter select, .ctrl select, .ctrl input[type=range] { min-height: 34px; }
+  .privacy, .dropMeta, .hint { font-size: 13px; }
+}
+
+/* ---- mobile (<760 px): preview first, settings behind the drawer ---- */
+@media (max-width: 760px) {
+  /* single row keeps the bar <= 72 px; the title truncates instead of wrapping to a second row */
+  #appbar { grid-template-columns: auto minmax(0, 1fr) minmax(0, auto) auto; padding: 5px 12px; }
+  #appbar .brandSub { display: none; }
+  .bookTitle { grid-column: auto; font-size: 13px; }
+  #importScreen { padding: 16px; }
+  #previewPane { min-height: calc(100vh - var(--appbar-h) - 6px); }
+  #pager.preview-toolbar { justify-content: space-between; }
+  .pageStatus { margin-left: 0; }
+  #exportJump { display: inline-flex; }
+  .tbField select { max-width: 44vw; }
+  /* id-scoped so the desktop toolbar rule (#pager.preview-toolbar button { 34px }) cannot win */
+  #pager.preview-toolbar button, #pager.preview-toolbar select,
+  #pager.preview-toolbar input[type=range], #appbar button, #sidebar button, #sidebar select,
+  #sidebar input[type=range], #importScreen .fileBtn, .fileBtn { min-height: 40px; }
+  details.help > summary { width: 28px; height: 28px; }   /* WCAG 2.5.8 target size */
+  .ctrl.check { padding: 10px 0; }
+  .ctrl input[type=checkbox] { width: 20px; height: 20px; }
+  #sidebar { width: min(360px, 92vw); }
+}
+
+@media (max-width: 480px) {
+  #importCard, #dropZone { min-width: 0; width: 100%; }
+  #importCard { padding: 18px 14px; }
+  #importCard h2 { font-size: 17px; }
+  #appbar .brandSub { display: none; }
+  .tbField .tbLabel { display: none; }
+  .scaleCtrl input[type=range] { width: 52px; }
+  .tbField select { max-width: 34vw; }   /* 2 toolbar rows at 320 px, not 3 */
+  #pageInfo { min-width: 54px; }
+  #pager #pageStatus { display: none; }   /* the toolbar counter already shows the position */
+  .ctrl { flex-wrap: wrap; }
+  .ctrl.stacked input[type=text] { width: 100%; }
+}

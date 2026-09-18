@@ -24,7 +24,10 @@ cp build-wasm/ko_xtch_wasm.wasm build-wasm/ko_xtch_wasm.js web/
 echo "== refresh dist/ =="
 bash scripts/build_dist.sh
 
-DIST_SHA=$(shasum -a 256 dist/ko_xtch_wasm.wasm | awk '{print $1}')
+# §26: dist/ carries the content-addressed name, so resolve it through the manifest
+DIST_WASM=$(env -i PATH=/opt/homebrew/bin:/usr/bin:/bin /usr/bin/python3 -c \
+  "import json,sys; print(json.load(open('dist/assets.json'))['ko_xtch_wasm.wasm'])")
+DIST_SHA=$(shasum -a 256 "dist/$DIST_WASM" | awk '{print $1}')
 if [ "$BUILD_SHA" != "$DIST_SHA" ]; then
   echo "FAIL: dist/ wasm does not match the build"
   echo "      build-wasm : ${BUILD_SHA:0:16}"
@@ -42,7 +45,14 @@ echo "== deploy =="
 npx -y wrangler@latest pages deploy dist --project-name=crosspoint-ko-wasm --branch=main
 
 echo "== verify live artifact =="
-LIVE_SHA=$(curl -s "https://crosspoint-ko-wasm.pages.dev/ko_xtch_wasm.wasm?cb=$(date +%s)" | shasum -a 256 | awk '{print $1}')
+# §26: the wasm is content-addressed now, so ask the manifest for its current name
+LIVE_WASM=$(curl -s "https://crosspoint-ko-wasm.pages.dev/assets.json?cb=$(date +%s)" \
+  | sed -n 's/.*"ko_xtch_wasm.wasm"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+if [ -z "$LIVE_WASM" ]; then
+  echo "WARN: no manifest at /assets.json yet — falling back to the plain wasm name"
+  LIVE_WASM=ko_xtch_wasm.wasm
+fi
+LIVE_SHA=$(curl -s "https://crosspoint-ko-wasm.pages.dev/${LIVE_WASM}?cb=$(date +%s)" | shasum -a 256 | awk '{print $1}')
 if [ "$LIVE_SHA" != "$BUILD_SHA" ]; then
   echo "FAIL: live wasm does not match the build"
   echo "      build-wasm : ${BUILD_SHA:0:16}"

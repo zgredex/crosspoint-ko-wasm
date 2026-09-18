@@ -3,66 +3,85 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XTCKO — EPUB → XTC 변환기 (KO 포크 렌더링 규칙)</title>
+<title>XTCKO — EPUB → XTC 변환기 (KO 포크 조판 규칙)</title>
 <meta name="description" content="KO 포크의 실제 조판 규칙으로 EPUB을 기기용 XTC/XTCH 파일로 변환합니다. 파일은 서버로 전송되지 않고 브라우저에서 처리됩니다.">
 <meta property="og:title" content="XTCKO — EPUB → XTC 변환기">
-<meta property="og:description" content="KO 포크 렌더링 규칙을 따르는 EPUB → XTC 변환기. 모든 변환이 브라우저에서 실행됩니다.">
+<meta property="og:description" content="KO 포크 조판 규칙을 따르는 EPUB → XTC 변환기. 모든 변환이 브라우저에서 실행됩니다.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f172a'/%3E%3Cpath d='M9 9l14 14M23 9L9 23' stroke='%23e8eaf0' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=32">
 </head>
-<body class="no-book">
-<header>
-  <h1>EPUB → XTC 변환기 <span class="dim">KO 포크 조판 규칙</span></h1>
-  <div id="fileRow">
+<body data-app-state="empty">
+
+<!-- compact app bar: brand + (loaded) title + (loaded) book change. The event status line lives
+     here in both states so it is never duplicated or hidden behind a panel. -->
+<header id="appbar">
+  <span class="brand">XTCKO</span>
+  <span class="brandSub">EPUB → XTC</span>
+  <h1 id="bookTitle" class="bookTitle" hidden></h1>
+  <span id="status" class="status" role="status" aria-live="polite">EPUB 파일을 선택하세요</span>
+  <div class="appbarActions">
+    <button id="bookChange" class="btn secondary small" title="다른 EPUB 파일 선택">EPUB 변경</button>
+  </div>
+</header>
+
+<!-- ① import state: one centered card. No settings, no export, no engine internals. -->
+<main id="importScreen">
+  <section id="importCard">
+    <h2>EPUB → XTC 변환기</h2>
+    <p class="sub">KO 포크 조판 규칙으로 기기용 XTC/XTCH 파일을 만듭니다.</p>
+
     <div id="dropZone">
       <input type="file" id="epubFile" class="fileInput" accept=".epub,application/epub+zip"
              title="EPUB 파일 선택">
       <p class="dropStep">① EPUB 선택</p>
       <p class="dropTitle">EPUB 파일을 끌어다 놓거나 파일을 선택하세요</p>
       <p class="dropActions">
-        <label for="epubFile" class="btn secondary fileBtn" title="EPUB 파일 선택">EPUB 파일 선택</label>
+        <label for="epubFile" class="btn primary fileBtn" title="EPUB 파일 선택">EPUB 파일 선택</label>
       </p>
       <p class="privacy">파일은 서버에 업로드되지 않습니다. 모든 변환은 이 브라우저에서 처리됩니다.</p>
       <p class="dropMeta">EPUB 2/3 · DRM 없는 파일 · 480×800 기기용 XTC / XTCH</p>
     </div>
-    <span id="status" class="status" role="status" aria-live="polite">EPUB 파일을 선택하세요</span>
-  </div>
-</header>
+  </section>
+</main>
 
-<main>
-  <!-- Preview: always visible, left; vertical book controls right of canvas -->
-  <section id="preview">
-    <!-- scrollable canvas viewport: fits at 100%, scrolls when zoomed in -->
+<!-- ②③ workspace state: preview + one sidebar -->
+<main id="workspace" class="workspace">
+  <section id="previewPane">
     <div id="canvasScroll">
-      <p id="emptyState">EPUB 파일을 선택하면 이곳에 기기 화면 그대로의 미리보기가 표시됩니다.</p>
       <div id="canvasWrap">
         <canvas id="page" width="480" height="800" role="img"
                 aria-label="도서 미리보기"></canvas>
-        <div id="loading" class="hidden" role="status" aria-live="polite">미리보기 생성 중…</div>
+        <div id="loading" class="hidden">미리보기 생성 중…</div>
+        <span id="exportProgress" class="srOnly" aria-hidden="true"></span>
       </div>
     </div>
 
-    <!-- book controls + view scale, vertical rail right of the canvas -->
-    <nav id="pager">
-      <button id="prevBtn" title="이전 페이지" aria-label="이전 페이지" disabled>◀</button>
-      <span id="pageInfo">– / –</span>
-      <button id="nextBtn" title="다음 페이지" aria-label="다음 페이지" disabled>▶</button>
-      <label class="chapter">
-        <span>장</span>
+    <!-- horizontal preview toolbar (was a vertical rail: it cost a fixed 159 px of preview width) -->
+    <nav id="pager" class="preview-toolbar" aria-label="미리보기 탐색">
+      <span class="tbGroup">
+        <button id="prevBtn" title="이전 페이지" aria-label="이전 페이지" disabled>‹</button>
+        <span id="pageInfo">– / –</span>
+        <button id="nextBtn" title="다음 페이지" aria-label="다음 페이지" disabled>›</button>
+      </span>
+      <label class="tbField chapter">
+        <span class="tbLabel">장</span>
         <select id="spineSel" disabled></select>
       </label>
-      <button id="coverBtn" title="책 표지 보기" disabled>표지</button>
-
-      <label class="scaleCtrl" title="화면 확대 전용 — 다시 렌더링하지 않습니다. 100%에서 창에 맞고, 100%를 넘으면 확대됩니다(스크롤로 이동). 내보내는 파일은 언제나 480×800 기기 픽셀입니다.">
-        <span>미리보기 배율</span>
+      <button id="coverBtn" class="btn secondary small" title="책 표지 보기" disabled>표지</button>
+      <label class="tbField scaleCtrl"
+             title="화면 확대 전용 — 다시 렌더링하지 않습니다. 100%에서 창에 맞고, 100%를 넘으면 확대됩니다(스크롤로 이동). 내보내는 파일은 언제나 480×800 기기 픽셀입니다.">
+        <span class="tbLabel">배율</span>
         <input type="range" id="zoom" min="50" max="400" value="100" aria-label="미리보기 배율">
         <output id="zoomOut">100%</output>
       </label>
+      <span id="pageStatus" class="pageStatus"></span>
+      <button id="drawerToggle" class="btn secondary small drawerOnly"
+              aria-expanded="false" aria-controls="sidebar">설정</button>
+      <button id="exportJump" class="btn secondary small mobileOnly">내보내기</button>
     </nav>
   </section>
 
-  <!-- Settings column -->
-  <aside id="controls">
+  <aside id="sidebar" aria-label="설정 및 내보내기">
     <section class="card">
       <h2><span class="step">②</span> 본문 설정</h2>
 
@@ -86,16 +105,7 @@
         </select>
       </label>
 
-      <label class="ctrl check" title="문단 첫 줄을 들여쓸지 정합니다.">
-        <input type="checkbox" id="paragraphIndent">
-        <span>첫 줄 들여쓰기</span>
-      </label>
-      <details class="help">
-        <summary aria-label="첫 줄 들여쓰기 도움말">?</summary>
-        <p class="hint">첫 줄 들여쓰기. 책 CSS가 이미 들여쓰기한 문단에는 적용되지 않습니다: CSS text-indent가 있는 문단(한국 소설 대부분은 p{text-indent:1em})은 이 스위치와 무관하게 들여쓰기되므로 그런 책에서는 거의 바뀌지 않습니다(측정: 2034쪽 중 1쪽). CSS 들여쓰기가 없는 책에서는 대부분 바뀝니다(14쪽 중 12쪽). U+3000 접두사로 구현 — EM-SPACE와 달리 모든 한글 폰트에 있습니다.</p>
-      </details>
-
-      <label class="ctrl check" title="글자 가장자리를 회색으로 부드럽게 그릴지 정합니다.">
+      <label class="ctrl check" id="textAaLab" title="글자 가장자리를 회색으로 부드럽게 그릴지 정합니다.">
         <input type="checkbox" id="textAa" checked>
         <span>글자 안티앨리어싱 <em class="aaHint"></em></span>
       </label>
@@ -104,36 +114,14 @@
         <p class="hint">텍스트 안티앨리어싱. 2-bit XTCH: 그레이 평면이 2비트 글리프 커버리지를 담습니다(펌웨어와 동일, 끄면 텍스트가 1비트). 1-bit XTC: 이미지는 어느 쪽이든 이미지 디더링 모델로 처리되고, 이 스위치는 텍스트까지 하프톤 처리할지(켜짐: 부드러운 가장자리) 1비트로 선명하게 둘지(꺼짐)를 정합니다.</p>
       </details>
 
-      <label class="ctrl check">
-        <input type="checkbox" id="extraParagraphSpacing" checked>
-        <span>문단 간격</span>
-      </label>
-
       <label class="ctrl check" title="공백뿐 아니라 글자 사이에서도 줄을 바꿉니다.">
         <input type="checkbox" id="characterWrap" checked>
         <span>한글 글자 단위 줄바꿈</span>
       </label>
       <details class="help">
         <summary aria-label="한글 글자 단위 줄바꿈 도움말">?</summary>
-        <p class="hint">한글 글자 단위 줄바꿈: 공백뿐 아니라 글자 사이에서도 줄을 바꿉니다. KO 리더 기본값이며, 양끝 정렬 한국어에서 단어 사이가 크게 벌어지는 것을 막습니다. 하이픈보다 우선합니다 — 글자 단위로 어디서든 줄을 바꿀 수 있어 하이픈이 할 일이 없습니다(업스트림: &amp;quot;Hyphenation only applies in word-wrap mode&amp;quot;).</p>
+        <p class="hint">한글 글자 단위 줄바꿈: 공백뿐 아니라 글자 사이에서도 줄을 바꿉니다. KO 리더 기본값이며, 양끝 정렬 한국어에서 단어 사이가 크게 벌어지는 것을 막습니다. 하이픈보다 우선합니다 — 글자 단위로 어디서든 줄을 바꿀 수 있어 하이픈이 할 일이 없습니다(업스트림: "Hyphenation only applies in word-wrap mode").</p>
       </details>
-
-      <p class="hint hidden" id="wrapNote">한글 글자 단위 줄바꿈이 켜져 있으면 하이픈은 적용되지
-        않습니다. 하이픈을 쓰려면 이 옵션을 끄세요.</p>
-
-      <label class="ctrl check" title="줄에 들어가지 않는 단어를 나눕니다.">
-        <input type="checkbox" id="hyphenation">
-        <span>하이픈 처리</span>
-      </label>
-      <details class="help">
-        <summary aria-label="하이픈 처리 도움말">?</summary>
-        <p class="hint">줄에 들어가지 않는 단어를 나눕니다: 책 언어에 패턴이 있으면 언어 패턴(en/de/fr/es/it/pl/ru/sv/fi/uk), 없으면 폴백 분절(업스트림에 한국어 하이픈 패턴이 없어 한글 단어는 보이는 하이픈 없이 나뉩니다). '한글 글자 단위 줄바꿈'이 켜져 있으면 도달할 수 없고 아무것도 바꾸지 않으므로 숨깁니다.</p>
-      </details>
-
-      <label class="ctrl check">
-        <input type="checkbox" id="embeddedStyle" checked>
-        <span>EPUB 원본 스타일 사용</span>
-      </label>
     </section>
 
     <section class="card" id="fontCard">
@@ -216,7 +204,7 @@
         </div>
 
         <div id="fontConvStatus" class="fontStatus" role="status" aria-live="polite"></div>
-        
+
       </div>
     </section>
 
@@ -260,20 +248,53 @@
       <button id="resetBtn" class="btn secondary">기본값으로 되돌리기</button>
     </section>
 
-    <details class="adv" id="engineInfo">
-      <summary>변환 엔진 정보</summary>
-      <p class="hint">
-        엔진: crosspoint-reader-ko 1.5.0-ko.3 (MIT) WASM 빌드 — KO 타이포그래피<br>
-        본문 글꼴: RIDIBatang 14(기본, advanceY 38), KoPub Batang 14(기본 내장, advanceY 32),
-        사용자 .epdfont(OTF/TTF 변환). 줄 높이는 펌웨어 값(반올림):
-        RIDIBatang 14는 38/46/53 px, KoPub 14는 32/38/45 px (좁게/보통/넓게)
-      </p>
-    </details>
-  </aside>
+    <!-- §10: the controls a Korean reader rarely touches, out of the first-glance path -->
+    <details class="adv" id="advancedSettings">
+      <summary>고급 설정</summary>
 
-  <!-- Export column -->
-  <aside id="exportPanel">
-    <section class="card" id="exportCard">
+      <label class="ctrl check" title="문단 첫 줄을 들여쓸지 정합니다.">
+        <input type="checkbox" id="paragraphIndent">
+        <span>첫 줄 들여쓰기</span>
+      </label>
+      <details class="help">
+        <summary aria-label="첫 줄 들여쓰기 도움말">?</summary>
+        <p class="hint">첫 줄 들여쓰기. 책 CSS가 이미 들여쓰기한 문단에는 적용되지 않습니다: CSS text-indent가 있는 문단(한국 소설 대부분은 p{text-indent:1em})은 이 스위치와 무관하게 들여쓰기되므로 그런 책에서는 거의 바뀌지 않습니다(측정: 2034쪽 중 1쪽). CSS 들여쓰기가 없는 책에서는 대부분 바뀝니다(14쪽 중 12쪽). U+3000 접두사로 구현 — EM-SPACE와 달리 모든 한글 폰트에 있습니다.</p>
+      </details>
+
+      <label class="ctrl check">
+        <input type="checkbox" id="extraParagraphSpacing" checked>
+        <span>문단 간격</span>
+      </label>
+
+      <p class="hint hidden" id="wrapNote">한글 글자 단위 줄바꿈이 켜져 있으면 하이픈은 적용되지
+        않습니다. 하이픈을 쓰려면 이 옵션을 끄세요.</p>
+
+      <label class="ctrl check" id="hyphenationLab" title="줄에 들어가지 않는 단어를 나눕니다.">
+        <input type="checkbox" id="hyphenation">
+        <span>하이픈 처리</span>
+      </label>
+      <details class="help">
+        <summary aria-label="하이픈 처리 도움말">?</summary>
+        <p class="hint">줄에 들어가지 않는 단어를 나눕니다: 책 언어에 패턴이 있으면 언어 패턴(en/de/fr/es/it/pl/ru/sv/fi/uk), 없으면 폴백 분절(업스트림에 한국어 하이픈 패턴이 없어 한글 단어는 보이는 하이픈 없이 나뉩니다). '한글 글자 단위 줄바꿈'이 켜져 있으면 도달할 수 없고 아무것도 바꾸지 않으므로 숨깁니다.</p>
+      </details>
+
+      <label class="ctrl check">
+        <input type="checkbox" id="embeddedStyle" checked>
+        <span>EPUB 원본 스타일 사용</span>
+      </label>
+
+      <details class="adv" id="engineInfo">
+        <summary>변환 엔진 정보</summary>
+        <p class="hint">
+          엔진: crosspoint-reader-ko 1.5.0-ko.3 (MIT) WASM 빌드 — KO 타이포그래피<br>
+          본문 글꼴: RIDIBatang 14(기본, advanceY 38), KoPub Batang 14(기본 내장, advanceY 32),
+          사용자 .epdfont(OTF/TTF 변환). 줄 높이는 펌웨어 값(반올림):
+          RIDIBatang 14는 38/46/53 px, KoPub 14는 32/38/45 px (좁게/보통/넓게)
+        </p>
+      </details>
+    </details>
+
+    <section class="card" id="exportPanel">
       <h2><span class="step">③</span> 내보내기</h2>
       <p class="hint" id="exportSub">EPUB 1권 → 기기 파일 1개. 미리보기는 선택한 모드의 결과를
         그대로 보여줍니다.</p>
@@ -291,6 +312,10 @@
         <input type="checkbox" id="lz4Wrap">
         <span>LZ4로 압축 (.xtcz)</span>
       </label>
+      <details class="help">
+        <summary aria-label="LZ4 압축 도움말">?</summary>
+        <p class="hint">파일을 LZ4 블록으로 감싸 <code>.xtcz</code>로 저장합니다. 기기 펌웨어 5.1.6 이상에서 읽을 수 있습니다. 압축률은 책 내용에 따라 크게 달라집니다 — 이미지가 많은 책에서 특히 잘 줄어듭니다(측정: 이미지 위주 14쪽 책 673,804 → 118,487 바이트, 17.6%). 텍스트만 있는 책은 줄어드는 폭이 작습니다.</p>
+      </details>
 
       <label class="ctrl">
         <span>파일 이름</span>
@@ -298,10 +323,13 @@
                aria-label="파일 이름 접두사" title="책 제목 앞에 붙는 접두사">
       </label>
 
-      <button id="downloadBtn" class="btn primary" disabled
-              title="현재 설정과 모드로 책 전체를 다시 렌더링한 뒤 기기 파일로 저장합니다">변환 파일 다운로드</button>
-
-      <div id="exportStatus" class="exportStatus" role="status" aria-live="polite"></div>
+      <!-- §9: the final action stays reachable while the sidebar scrolls -->
+      <div class="export-actions">
+        <p class="exportSummary" id="exportSummary"></p>
+        <button id="downloadBtn" class="btn primary" disabled
+                title="현재 설정과 모드로 책 전체를 다시 렌더링한 뒤 기기 파일로 저장합니다">변환 파일 다운로드</button>
+        <div id="exportStatus" class="exportStatus" role="status" aria-live="polite"></div>
+      </div>
 
       <p class="hint" id="viewportOut"
          title="내보내는 모든 페이지의 본문 영역: 480×800 화면에서 보기 여백과 여백 설정을 뺀 값. 상태 표시줄도 크롬도 없습니다 — 파일에는 UI가 들어가지 않고, 기기가 읽을 때 자체 UI를 합성합니다."></p>
@@ -309,6 +337,6 @@
   </aside>
 </main>
 
-<script src="app.js?v=23"></script>
+<script src="app.js?v=32"></script>
 </body>
 </html>

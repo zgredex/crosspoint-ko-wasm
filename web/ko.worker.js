@@ -6,7 +6,14 @@
 //   {id, cmd:'pageCount'}             → current spine page count
 // Replies {id, ok, ...}. ImageData buffers are transferable copies.
 /* eslint-env worker */
-importScripts('ko_xtch_wasm.js');   // defines createKoEngine (MODULARIZE)
+// §26: generated artifacts are content-addressed (name.<hash8>.ext). The manifest is imported
+// under this worker's own ?v= cache-bust, so it is always as fresh as the worker. If it is missing
+// (e.g. serving web/ without build_dist.sh), the plain names below still work as before.
+importScripts('assets.js' + self.location.search);
+const ASSETS = self.__ASSETS || {};
+const asset = (name) => ASSETS[name] || name;
+
+importScripts(asset('ko_xtch_wasm.js'));   // defines createKoEngine (MODULARIZE)
 
 let Module = null;         // wasm module instance
 let api = null;            // C-export surface
@@ -156,17 +163,17 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '23';
+const FT_MODULE_VERSION = '32';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
   if (fontConv) return fontConv;
   if (typeof EpdFontConverter === 'undefined') {
-    importScripts('ft_wasm.js?v=' + FT_MODULE_VERSION, 'epdfont.js?v=' + FT_MODULE_VERSION);
+    importScripts(asset('ft_wasm.js'), 'epdfont.js?v=' + FT_MODULE_VERSION);
   }
   fontConv = await EpdFontConverter.load({
     factory: createFtConverter({
-      locateFile: (p) => (p.indexOf('.wasm') >= 0 ? p + '?v=' + FT_MODULE_VERSION : p),
+      locateFile: (p) => asset(p),
     }),
   });
   ftVersionString = fontConv.ftVersion || '';
@@ -234,7 +241,7 @@ async function init() {
   // Cache-bust the engine binaries: the emscripten glue fetches the .wasm with no version
   // query, so without this the edge serves a previously cached engine indefinitely and no
   // engine change can ever reach a returning browser.
-  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=23' : path) });
+  Module = await factory({ locateFile: (path) => asset(path) });
   api = Module;
   // deterministic viewport: engine computes from margins; init with full logical
   api._ko_init(464, 778); // will be fixed up by ko_set_margins on first spec
