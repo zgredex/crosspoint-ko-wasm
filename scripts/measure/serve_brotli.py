@@ -47,6 +47,12 @@ def brotli_bytes(path, data):
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    # HTTP/1.1 + keep-alive: the browser opens several connections for one page (html, css, app.js,
+    # worker, build info, glue, wasm) and a serial HTTP/1.0 server made the app look ~700 ms slower to
+    # boot than it is. That was harness, not the app — measured, not assumed: the worker's own phases
+    # were 27 ms while navigationStart->ready was 732 ms.
+    protocol_version = 'HTTP/1.1'
+
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=DIRECTORY, **kw)
 
@@ -90,8 +96,9 @@ if __name__ == '__main__':
         sys.exit(2)
     DIRECTORY = os.path.abspath(sys.argv[1])
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8898
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(('127.0.0.1', port), Handler) as httpd:
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    socketserver.ThreadingTCPServer.daemon_threads = True
+    with socketserver.ThreadingTCPServer(('127.0.0.1', port), Handler) as httpd:
         print(f'[serve] {DIRECTORY} on http://127.0.0.1:{port} '
               f'(brotli for {", ".join(BROTLI_TYPES)}, no-store)', file=sys.stderr)
         httpd.serve_forever()
