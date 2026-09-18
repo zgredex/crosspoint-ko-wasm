@@ -23,6 +23,31 @@ constexpr int O_TRUNC = 0x200;
 class HalStorage;
 
 // ---- In-memory file handle ------------------------------------------------
+// One in-memory file. Two shapes, because they have different costs:
+//   * writable  — a std::vector, used by everything the engine GENERATES (section caches, extracted
+//                 HTML, metadata cache). Unchanged from before.
+//   * owned     — a view over a buffer somebody else allocated, with a shared_ptr that frees it. This
+//                 exists for the mounted EPUB: the browser streams it straight into the wasm heap, so
+//                 the bytes the ZIP reader walks ARE the bytes the page wrote, with no C++ copy. A
+//                 100 MB book used to be copied again here (vector<uint8_t>(data, data + size)).
+struct Blob {
+  const uint8_t* data = nullptr;
+  size_t size = 0;
+  std::shared_ptr<void> owner;                     // frees `data` when the last reference goes away
+  std::shared_ptr<std::vector<uint8_t>> writable;  // non-null iff this file may be written/extended
+
+  // A writable file's vector can be reallocated by resize(), so the view is re-derived on demand.
+  // BOTH fields are re-read every time: a vector that grows or shrinks WITHIN ITS CAPACITY keeps the
+  // same data() pointer, so comparing pointers alone leaves `size` stale — and a stale size is read as
+  // real content. That bug was caught by the spine count dropping from 10 to 6 with a parse error,
+  // because reads were running past the bytes actually written.
+  void refresh() {
+    if (!writable) return;
+    data = writable->data();
+    size = writable->size();
+  }
+};
+
 class HalFile : public Print {
   friend class HalStorage;
 
@@ -33,7 +58,7 @@ class HalFile : public Print {
   HalFile& operator=(HalFile&& o) noexcept {
     if (this != &o) {
       path_ = std::move(o.path_);
-      data_ = std::move(o.data_);
+      blob_ = std::move(o.blob_);
       pos_ = o.pos_;
       o.pos_ = 0;
     }
@@ -50,29 +75,29 @@ class HalFile : public Print {
     name[n] = '\0';
     return n;
   }
-  size_t size() const { return data_ ? data_->size() : 0; }
+  size_t size() const { return blob_ ? blob_->size : 0; }
   size_t fileSize() const { return size(); }
   uint64_t fileSize64() const { return size(); }
   bool seek(size_t pos) {
-    if (!data_ || pos > data_->size()) return false;
+    if (!blob_ || pos > blob_->size) return false;
     pos_ = pos;
     return true;
   }
   bool seek64(uint64_t pos) { return seek(static_cast<size_t>(pos)); }
   bool seekCur(int64_t offset) {
-    if (!data_) return false;
+    if (!blob_) return false;
     int64_t np = static_cast<int64_t>(pos_) + offset;
-    if (np < 0 || np > static_cast<int64_t>(data_->size())) return false;
+    if (np < 0 || np > static_cast<int64_t>(blob_->size)) return false;
     pos_ = static_cast<size_t>(np);
     return true;
   }
   bool seekSet(size_t offset) { return seek(offset); }
-  int available() const { return data_ ? static_cast<int>(data_->size() - pos_) : 0; }
+  int available() const { return blob_ ? static_cast<int>(blob_->size - pos_) : 0; }
   size_t position() const { return pos_; }
   int read(void* buf, size_t count) {
-    if (!data_ || pos_ >= data_->size()) return -1;
-    size_t n = std::min(count, data_->size() - pos_);
-    memcpy(buf, data_->data() + pos_, n);
+    if (!blob_ || pos_ >= blob_->size) return -1;
+    size_t n = std::min(count, blob_->size - pos_);
+    memcpy(buf, blob_->data + pos_, n);
     pos_ += n;
     return static_cast<int>(n);
   }
@@ -82,26 +107,29 @@ class HalFile : public Print {
     return b;
   }
   size_t write(const void* buf, size_t count) {
-    if (!data_) return 0;
-    if (pos_ + count > data_->size()) data_->resize(pos_ + count);
-    memcpy(data_->data() + pos_, buf, count);
+    // Read-only files (the mounted EPUB) REFUSE writes rather than silently growing: a write into an
+    // owned view would have to reallocate somebody else's buffer.
+    if (!blob_ || !blob_->writable) return 0;
+    if (pos_ + count > blob_->writable->size()) blob_->writable->resize(pos_ + count);
+    blob_->refresh();
+    memcpy(blob_->writable->data() + pos_, buf, count);
     pos_ += count;
     return count;
   }
   size_t write(uint8_t b) override { return write(&b, 1); }
   bool isDirectory() const { return false; }
   bool close() { return true; }
-  bool isOpen() const { return static_cast<bool>(data_); }
+  bool isOpen() const { return static_cast<bool>(blob_); }
   explicit operator bool() const { return isOpen(); }
 
   const std::string& path() const { return path_; }
 
  private:
-  explicit HalFile(std::string path, std::shared_ptr<std::vector<uint8_t>> data)
-      : path_(std::move(path)), data_(std::move(data)) {}
+  explicit HalFile(std::string path, std::shared_ptr<Blob> blob)
+      : path_(std::move(path)), blob_(std::move(blob)) {}
 
   std::string path_;
-  std::shared_ptr<std::vector<uint8_t>> data_;
+  std::shared_ptr<Blob> blob_;
   size_t pos_ = 0;
 };
 
@@ -112,11 +140,18 @@ class HalStorage {
   bool begin() { return true; }
   bool ready() const { return true; }
 
-  // Inject a whole file blob (e.g. the EPUB) at a virtual path.
+  // Inject a whole file blob at a virtual path, COPYING it. Used for small generated assets (the
+  // .epdfont pack) where a copy costs nothing and the storage owns a writable buffer.
   void mountBlob(const std::string& path, const uint8_t* data, size_t size);
   void mountBlob(const std::string& path, const std::vector<uint8_t>& data) {
     mountBlob(path, data.data(), data.size());
   }
+
+  // Adopt an allocation the caller already owns, WITHOUT copying. The read-only counterpart of
+  // mountBlob, for the mounted EPUB: the bytes the ZIP reader walks are the bytes the page streamed
+  // into the wasm heap, and `owner`'s deleter releases them when the file is dropped (clearAll on the
+  // next book). A whole-book copy used to happen here on every open.
+  void mountOwnedBlob(const std::string& path, uint8_t* data, size_t size);
 
   std::vector<String> listFiles(const char* path = "/", int maxFiles = 200) { (void)path;
     (void)maxFiles;
@@ -174,20 +209,23 @@ class HalStorage {
     std::vector<const void*> seen;
     size_t total = 0;
     for (const auto& kv : files_) {
-      const std::shared_ptr<std::vector<uint8_t>>& blob = kv.second;
+      const std::shared_ptr<Blob>& blob = kv.second;
       if (!blob) continue;
       const void* p = blob.get();
       bool dup = false;
       for (const void* s : seen) { if (s == p) { dup = true; break; } }
       if (dup) continue;
       seen.push_back(p);
-      total += blob->capacity();
+      // capacity() for the writable files (a released vector's slack still occupies the heap) and the
+      // view size for adopted ones, which own exactly what they claim.
+      const_cast<Blob&>(*blob).refresh();
+      total += blob->writable ? blob->writable->capacity() : blob->size;
     }
     return total;
   }
 
  private:
-  std::map<std::string, std::shared_ptr<std::vector<uint8_t>>> files_;
+  std::map<std::string, std::shared_ptr<Blob>> files_;
 };
 
 #define Storage HalStorage::getInstance()

@@ -171,9 +171,29 @@ class EngineDriver {
 
   bool loadEpubFromBlob(const uint8_t* data, size_t size, const std::string& virtualPath) {
     Storage.mountBlob(virtualPath, data, size);
+    return openEpub(virtualPath);
+  }
+
+  // Same, but ADOPTS a caller-owned allocation instead of copying it. The browser streams the EPUB into
+  // the wasm heap and hands that pointer over; the ZIP reader then walks exactly those bytes. The
+  // ownership transfer is the contract: the storage's Blob frees the pointer, and the caller must not.
+  bool loadEpubFromOwnedBlob(uint8_t* data, size_t size, const std::string& virtualPath) {
+    if (!data || size == 0) return false;
+    Storage.mountOwnedBlob(virtualPath, data, size);
+    return openEpub(virtualPath);
+  }
+
+  // Shared tail of both entry points; kept in one place so the two cannot drift apart in what they set
+  // up (image extractor hook, Epub construction, load arguments).
+  bool openEpub(const std::string& virtualPath) {
     epubPath_ = virtualPath;
     epub_.reset(new Epub(virtualPath, "/.crosspoint"));
-    if (!epub_->load(true, false)) return false;
+    if (!epub_->load(true, false)) {
+      // A mounted book that failed to open stays owned by the storage, so a 100 MB adoption would be
+      // held until the next load. Drop it here: for an owned mount that releases the buffer.
+      Storage.remove(virtualPath.c_str());
+      return false;
+    }
     // Lazy image extraction: section builds only header-probe images; the first
     // render of an image page pulls the file out of the EPUB through this hook
     // (mirrors EpubReaderActivity::onEnter).

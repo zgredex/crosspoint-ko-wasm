@@ -59,7 +59,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=74');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=76');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -219,7 +219,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=74');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=76');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -1608,7 +1608,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=74');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=76');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };

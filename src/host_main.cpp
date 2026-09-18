@@ -78,9 +78,55 @@ int main(int argc, char** argv) {
   renderer.insertFont(KOPUB_14_FONT_ID, &kopubFamily);
   renderer.insertFont(RIDIBATANG_14_FONT_ID, &ridibatangFamily);
 
+  // --mount-only: isolate the mount from the parse, so "adopt instead of copy" can be measured for what
+  // it is. Reports both, in this process, on the same bytes.
+  for (int i = 1; i < argc; i++) {
+    if (std::string(argv[i]) == "--mount-only") {
+      std::vector<uint8_t> src(epubBytes.size());
+      for (int rep = 0; rep < 4; rep++) {
+        auto t0 = Clock::now();
+        Storage.mountBlob("/a.epub", epubBytes.data(), epubBytes.size());
+        const double copyMs = msSince(t0);
+        Storage.remove("/a.epub");
+        auto* p = static_cast<uint8_t*>(std::malloc(epubBytes.size()));
+        if (!p) { fprintf(stderr, "oom\n"); return 1; }
+        // the streaming path's write into the heap, which the adopt path also pays for
+        auto t1 = Clock::now();
+        std::memcpy(p, epubBytes.data(), epubBytes.size());
+        const double fillMs = msSince(t1);
+        Storage.mountOwnedBlob("/b.epub", p, epubBytes.size());
+        const double adoptMs = msSince(t1);
+        Storage.remove("/b.epub");
+        fprintf(stderr, "rep %d: copy(alloc+memcpy) %.2f ms | fill+adopt %.2f ms (of which fill %.2f) | "
+                        "storage now %zu bytes\n",
+                rep, copyMs, adoptMs, fillMs, Storage.totalBytes());
+      }
+      return 0;
+    }
+  }
+
   ko::EngineDriver driver(renderer, display);
   auto tLoad0 = Clock::now();
-  if (!driver.loadEpubFromBlob(epubBytes.data(), epubBytes.size(), epubPath)) {
+  // --owned exercises the path the browser now takes: an allocation the storage adopts instead of
+  // copying. Its bytes must be the same bytes, so the container is compared against the copied mount.
+  bool useOwned = false;
+  for (int i = 1; i < argc; i++) {
+    if (std::string(argv[i]) == "--owned") useOwned = true;
+  }
+  bool loaded;
+  if (useOwned) {
+    auto* owned = static_cast<uint8_t*>(std::malloc(epubBytes.size()));
+    if (!owned) {
+      fprintf(stderr, "out of memory for the owned mount\n");
+      return 1;
+    }
+    std::memcpy(owned, epubBytes.data(), epubBytes.size());
+    loaded = driver.loadEpubFromOwnedBlob(owned, epubBytes.size(), epubPath);
+    if (!loaded) std::free(owned);   // on failure the storage never adopted it
+  } else {
+    loaded = driver.loadEpubFromBlob(epubBytes.data(), epubBytes.size(), epubPath);
+  }
+  if (!loaded) {
     fprintf(stderr, "Epub::load failed\n");
     return 1;
   }
@@ -111,6 +157,10 @@ int main(int argc, char** argv) {
       spec.imageToneDepth = 2;   // 1-bit pages are dithered straight to 2 tones
     } else if (flag == "--tone-depth-2") {
       spec.imageToneDepth = 2;
+    } else if (flag == "--image-rendering" && i + 1 < argc) {
+      // 0 = show, 1 = placeholder, 2 = hidden (the UI's image handling). Hidden is how the DECODE cost
+      // of an image page is isolated from everything else the page does.
+      spec.imageRendering = static_cast<uint8_t>(std::atoi(argv[++i]));
     } else if (flag == "--image-dither" && i + 1 < argc) {
       spec.imageDither = std::atoi(argv[++i]);
     } else if (flag == "--image-dither-name" && i + 1 < argc) {

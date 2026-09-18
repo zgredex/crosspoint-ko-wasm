@@ -15,6 +15,7 @@
 // transposes to logical 480x800 + XTH packing.
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <memory>
@@ -356,16 +357,9 @@ KO_EXPORT int ko_logical_height() {
 
 // ---- EPUB loading -----------------------------------------------------------
 
-KO_EXPORT int ko_load_epub(const uint8_t* data, size_t size, const char* virtualPath) {
-  if (!g_driver) return -1;
-  // Fresh in-memory FS per book: section caches from a previous load otherwise
-  // accumulate in the wasm heap and eventually fail section builds.
-  Storage.clearAll();
-  const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
-  if (!g_driver->loadEpubFromBlob(data, size, vp)) {
-    setError("Epub::load failed");
-    return -1;
-  }
+// Shared tail of both load entry points: reset everything that belongs to a previous book. Kept in one
+// place so the copying and adopting paths cannot drift in what they leave behind.
+static int resetForNewBook() {
   g_xtch->reset();
   g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
   g_chapters.clear();
@@ -374,6 +368,42 @@ KO_EXPORT int ko_load_epub(const uint8_t* data, size_t size, const char* virtual
   g_totalPages = 0;
   g_xtchFullReady = 0;
   return g_driver->spineCount();
+}
+
+KO_EXPORT int ko_load_epub(const uint8_t* data, size_t size, const char* virtualPath) {
+  if (!g_driver || !data || size == 0) return -1;
+  // Fresh in-memory FS per book: section caches from a previous load otherwise
+  // accumulate in the wasm heap and eventually fail section builds.
+  Storage.clearAll();
+  const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
+  if (!g_driver->loadEpubFromBlob(data, size, vp)) {
+    setError("Epub::load failed");
+    return -1;
+  }
+  return resetForNewBook();
+}
+
+// Allocate the buffer the caller will stream an EPUB into. It is NOT a general-purpose allocator: pair
+// it with ko_load_epub_owned, which adopts the pointer, and only free it yourself if you never call
+// that (or if the call never happened).
+KO_EXPORT uint8_t* ko_epub_alloc(size_t size) {
+  if (size == 0) return nullptr;
+  return static_cast<uint8_t*>(std::malloc(size));
+}
+
+// Adopt an EPUB that already lives in this heap, instead of copying it in: the bytes the ZIP reader
+// walks are the bytes the page wrote. OWNERSHIP TRANSFERS — the storage frees the pointer when the
+// book is replaced, so the caller must not. A 100 MB book used to be copied twice on the way in (JS
+// ArrayBuffer -> wasm, then wasm -> storage vector).
+KO_EXPORT int ko_load_epub_owned(uint8_t* data, size_t size, const char* virtualPath) {
+  if (!g_driver || !data || size == 0) return -1;
+  Storage.clearAll();
+  const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
+  if (!g_driver->loadEpubFromOwnedBlob(data, size, vp)) {
+    setError("Epub::load failed");
+    return -1;      // the driver already dropped the mounted blob, which freed the buffer
+  }
+  return resetForNewBook();
 }
 
 KO_EXPORT int ko_spine_count() { return g_driver ? g_driver->spineCount() : 0; }
