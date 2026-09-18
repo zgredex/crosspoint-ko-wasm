@@ -872,19 +872,19 @@
     if (book) { invalidateWarm(); refresh(true); scheduleWarm(700); }
   });
 
-  // The AA switch is live in BOTH modes, and it means something real in each:
+  // The AA switch, live in both modes:
   //   2-bit XTCH — text anti-aliasing, exactly as the firmware does it: the grey
   //                (lsb/msb) planes carry 2-bit glyph coverage; off renders text
   //                1-bit (the engine skips the text grey passes).
-  //   1-bit XTC  — the file has no grey planes at all, so the switch controls the
-  //                BLUE-NOISE DITHER instead: on, grey levels are halftoned into the
-  //                1-bit plane (pseudo-grey text and photos); off, they are dropped
-  //                to a hard threshold.
-  // The engine and the mono preview read the same spec switch, so the preview shows
-  // the page the file will carry in either position.
+  //   1-bit XTC  — images are ALWAYS blue-noise halftoned to 2 levels (that is how a
+  //                4-level page becomes a 1-bit one, and photos need it). The switch
+  //                decides whether TEXT is halftoned too (on) or left as crisp 1-bit
+  //                ink (off, which also stops the writer thinning solid ink).
+  // The engine, the writer and the mono preview all read the same spec switch, so the
+  // preview shows the page the file will carry in either position.
   function syncAaToMode() {
     const hint = document.querySelector('.aaHint');
-    if (hint) hint.textContent = state.mode === 0 ? '(blue-noise dither)' : '';
+    if (hint) hint.textContent = state.mode === 0 ? '(text dither; photos always halftoned)' : '';
     const lab = document.getElementById('textAaLab');
     if (lab) lab.classList.remove('disabled');
   }

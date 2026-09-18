@@ -144,8 +144,14 @@ class XtchWriter {
   // pendingPages_ according to mode_.
   // Blue-noise dithering of grey text on 1-bit pages. ON by default: without it every
   // grey edge collapses to a hard threshold and 1-bit output has no anti-aliasing at all.
-  void setMonoGrayDither(bool on) { monoGrayDither_ = on; }
-  bool monoGrayDither() const { return monoGrayDither_; }
+  // The text-AA switch, as it affects a 1-bit page. Grey-bearing pixels are ALWAYS
+  // halftoned (that is how a 4-level page becomes a 1-bit one, and it is what images
+  // depend on - they must be dithered to 2 levels in every mode). This switch adds the
+  // thinning of SOLID ink by the 255 layer, which is the AA-on look; with text AA off
+  // the solid ink stays crisp (text renders as clean 1-bit), while image greys are
+  // still halftoned.
+  void setTextAa(bool on) { textAa_ = on; }
+  bool textAa() const { return textAa_; }
 
   bool addPageFromPlanes(const std::vector<uint8_t>& bw, const std::vector<uint8_t>& lsb,
                          const std::vector<uint8_t>& msb) {
@@ -163,7 +169,7 @@ class XtchWriter {
                    const std::vector<uint8_t>& msb, uint16_t LOGICAL_W, uint16_t LOGICAL_H) {
     std::vector<uint8_t> plane(48000, 0xFF);  // start white (1)
     const bool haveGray = lsb.size() >= 48000 && msb.size() >= 48000;
-    const bool dither = monoGrayDither_ && haveGray;
+    const bool thinSolid = textAa_ && haveGray;  // AA on: solid ink is thinned too
 
     auto physBit = [](const std::vector<uint8_t>& buf, int phyX, int phyY) -> int {
       return (buf[phyY * 100 + (phyX >> 3)] >> (7 - (phyX & 7))) & 1;
@@ -197,16 +203,20 @@ class XtchWriter {
           const int sh = 8 * (7 - b);
           // Transposed byte: bit (7-j) holds the pixel at x = 8k + j of this logical row.
           uint8_t inkBits = static_cast<uint8_t>(~((Tbw >> sh) & 0xFF));  // ink bit = 0
-          if (dither && inkBits) {
+          if (haveGray && inkBits) {
             const uint8_t lBits = static_cast<uint8_t>((Tlsb >> sh) & 0xFF);
             const uint8_t mBits = static_cast<uint8_t>((Tmsb >> sh) & 0xFF);
-            const uint8_t m3 = static_cast<uint8_t>(~lBits & ~mBits);
-            const uint8_t m2 = static_cast<uint8_t>(~lBits & mBits);
+            const uint8_t m3 = static_cast<uint8_t>(~lBits & ~mBits);  // solid ink, no grey
+            const uint8_t m2 = static_cast<uint8_t>(~lBits & mBits);   // light grey
             const uint8_t yc = static_cast<uint8_t>(y & 63);
-            inkBits = static_cast<uint8_t>(
-                inkBits & static_cast<uint8_t>((m3 & nm.m[2][yc][k]) |
-                                               (lBits & nm.m[0][yc][k]) |
-                                               (m2 & nm.m[1][yc][k])));
+            // Grey pixels are halftoned unconditionally: this is the 4-level -> 2-level
+            // step that images (and AA-on text) rely on in every mode.
+            uint8_t keep = static_cast<uint8_t>((lBits & nm.m[0][yc][k]) |
+                                                (m2 & nm.m[1][yc][k]));
+            // Solid ink is thinned only with text AA on; with it off the ink stays
+            // crisp, which is the whole point of that switch position for text.
+            keep |= static_cast<uint8_t>(thinSolid ? (m3 & nm.m[2][yc][k]) : m3);
+            inkBits = static_cast<uint8_t>(inkBits & keep);
           }
           plane[static_cast<size_t>(y) * 60 + k] &= static_cast<uint8_t>(~inkBits);
         }
@@ -379,7 +389,7 @@ class XtchWriter {
   std::string title_, author_, publisher_, language_;
   XtcMode mode_ = XtcMode::Gray2Bit;
   std::vector<std::vector<uint8_t>> pendingPages_;
-  bool monoGrayDither_ = true;
+  bool textAa_ = true;
 };
 
 }  // namespace ko

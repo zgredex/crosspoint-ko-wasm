@@ -82,21 +82,18 @@ int main(int argc, char** argv) {
   ko::XtchWriter writer;
   // Output-mode flags, for verifying the 1-bit path (the web app sets the same mode
   // through ko_set_output_mode).
-  // The text-AA switch is the control for the 1-bit blue-noise dither, matching the
-  // web app: AA on -> the grey levels are halftoned into the 1-bit plane (pseudo
-  // grey / antialiased-looking text and photos), AA off -> hard threshold, no greys.
-  // --mono-dither / --no-mono-dither force the flag for testing that relationship.
-  int monoDitherOverride = -1;  // -1 = follow text AA
+  // Images are dithered to 4 levels in 2-bit output and to 2 levels in 1-bit output in
+  // every configuration. The text-AA switch (--text-aa / --no-text-aa) affects text
+  // only: AA off means the grey passes draw no text greys at all, and in 1-bit output
+  // it also stops the writer from thinning solid ink, so text stays crisp while image
+  // greys are still halftoned.
   for (int i = 1; i < argc; i++) {
     const std::string flag = argv[i];
     if (flag == "--1bit") writer.setMode(ko::XtcMode::Mono1Bit);
     else if (flag == "--no-text-aa") spec.textAntiAliasing = 0;
     else if (flag == "--text-aa") spec.textAntiAliasing = 1;
-    else if (flag == "--mono-dither") monoDitherOverride = 1;
-    else if (flag == "--no-mono-dither") monoDitherOverride = 0;
   }
-  writer.setMonoGrayDither(monoDitherOverride < 0 ? spec.textAntiAliasing != 0
-                                                  : monoDitherOverride != 0);
+  writer.setTextAa(spec.textAntiAliasing != 0);
 
   writer.setMetadata(driver.title(), "unknown", "", "ko");
   int totalPages = 0;

@@ -1,93 +1,93 @@
-# The anti-aliasing switch: firmware text AA in 2-bit, blue-noise dither in 1-bit
+# Image dithering and the anti-aliasing switch
 
-2026-09-18. Code: `src/xtch_writer.h` (dither), `src/ko_engine_driver.h` (AA gating),
-`src/wasm_api.cpp` (`monoDitherEnabled`, 1-bit preview), `web/app.js` + `web/index.html` (the switch).
+2026-09-18. Code: `vendor-lib/Epub/Epub/converters/DitherUtils.h` (4-level image
+quantiser), `src/xtch_writer.h` (4-level → 2-level halftone), `src/ko_engine_driver.h` (AA
+gating), `src/wasm_api.cpp` + `web/app.js` + `web/index.html` (the switch).
 
-## 1. What each position means
+## 1. Images are dithered in EVERY mode. The AA switch is about text.
 
-| output | AA **on** | AA **off** |
+| output | images | what the AA switch changes |
 |---|---|---|
-| 2-bit XTCH (XTH) | text anti-aliased: the grey (lsb/msb) planes carry the 2-bit glyph coverage, exactly as the firmware does it | text renders 1-bit (the grey passes never draw text; only images reach the grey planes) |
-| 1-bit XTC (XTG) | grey levels are **blue-noise halftoned** into the 1-bit plane: pseudo-grey text and photos | greys dropped to a **hard threshold** — no dither (crisper text, harsher photos) |
+| 2-bit XTCH (XTH) | **always** blue-noise dithered to the 4 panel levels | whether the grey planes carry *text* greys (AA on) or text renders 1-bit (off) |
+| 1-bit XTC (XTG) | **always** blue-noise halftoned to 2 levels (ink / no ink) | AA on also halftones text greys and thins solid ink; AA off leaves text as crisp 1-bit ink |
 
-The 2-bit behaviour is the pre-existing firmware-mirroring semantics and is unchanged. The
-1-bit behaviour is new: the blue-noise dither used to be an unconditional default
-(`monoGrayDither_ = true`), switched only by a hidden host flag. It is now driven by the same
-switch the UI exposes, in both the writer and the preview.
+Both dither stages use the same 64×64 `kBlueNoise64` void-and-cluster table, but at
+different points in the pipeline:
 
-## 2. Why the engine had to change for AA off
-
-Under the text-once path the page is rendered once (BW pass) and the grey planes are composed
-from a per-pixel level capture, so `textOnce` alone decided whether text greys existed — which
-silently made AA a no-op for 2-bit output. The capture is now gated on the AA switch as well:
-
-```cpp
-const bool captureText = textOnce && aaOn;   // ko_engine_driver.h
+```
+JPEG/PNG decode ──(applyOrderedDither4Level: blue noise, 4 levels)──▶ 2-bit planes
+2-bit planes ──(mono writer: blue-noise masks at 235/170/255)──▶ 1-bit XTG ink
 ```
 
-so AA off still means "no text greys" (that is what "AA off" is) while AA on keeps the
-single-blit speedup. Gated: with AA off, 0/2,034 pages differ from the pre-stage-A engine; with
-AA on, 0/2,034 as before.
+## 2. Stage 1: 8-bit grey → 4 levels (`DitherUtils.h`, decoders)
 
-## 3. Preview == file (the invariant the site promises)
+`ImageBlock` sets `config.useDithering = true` (default in `ImageToFramebufferDecoder.h` too),
+and both converters call `applyOrderedDither4Level(gray, x, y)`, which is
+`applyOrderedDither(..., DitherMode::BLUE_NOISE, kDefaultProfile)` = the `kofork` profile
+(levels {0, 85, 170, 255}; hard thresholds {45, 70, 140} used only when dithering is off).
 
-A dithered 1-bit page is not a function of the BW plane, so the 1-bit preview could no longer be
-"the BW plane, as-is": it would show un-dithered pages while the file carried halftoned ones.
-`ko_compose_rgba(1)` now applies **the same blue-noise masks** the writer inks with
-(`ko::monoNoiseMasks()`), so the preview shows the page the file will carry:
+Unit-tested with constant-grey 64×64 patches (`DitherUtils.h` still carries the pre-change
+`applyBayerDither4Level` as the A/B anchor, which is the natural positive control):
 
-* dither on: `ink = ~bw_bit`, then kept only where the mask for that pixel's grey level allows —
-  layer 2 (black, 255), layer 0 (dark grey v=1, 235), layer 1 (light grey v=2, 170);
-* dither off: the BW plane verbatim (hard threshold).
+| grey | blue noise: tone | ac lag 1 | ac lag 4 | Bayer 4x4: tone | ac lag 4 |
+|---|---|---|---|---|---|
+| 20 | 7.8% | −0.25 | −0.03 | 0.0% | +0.00 |
+| 60 | 23.6% | −0.24 | −0.04 | 14.6% | **+1.00** |
+| 110 | 43.1% | −0.26 | −0.02 | 41.7% | **+1.00** |
+| 170 | 66.7% | +0.00 | +0.00 | 72.9% | **+1.00** |
+| 220 | 86.3% | −0.26 | −0.04 | 93.8% | **+1.00** |
+| 246 | 96.5% | −0.12 | +0.00 | 100.0% | +0.00 |
 
-Both `ko_export_set_mode`/`ko_export_spine` and `ko_compose_rgba` read one helper,
-`monoDitherEnabled()` = `spec.textAntiAliasing != 0`, so the two cannot drift apart.
+"ac lag 4" is the self-correlation of the pattern at lag 4: **+1.000 for Bayer means the
+pattern is exactly periodic with period 4** — the visible cross-hatch that was replaced. The
+blue-noise field is aperiodic and mildly anti-correlated at short range, and follows the input
+tone over the whole range. With dithering off the hard triples (45/70/140) collapse everything
+above grey 140 to black, which is why dithering is not optional for photos.
 
-Verified with `scripts/verify/mono_preview_vs_file.js`: for a given spine/page it composes the
-preview the worker would blit and compares it, pixel for pixel, against the page inside the real
-exported XTG file, in **both** switch positions. Green on the image book (spine 1) and on the text
-book (cover, spine 3 p2, spine 10 p0, spine 25 p1, spine 59 p0) — e.g. the cover matches at
-112,389 ink px with AA on and 149,626 with AA off, 0 mismatches of 384,000 in each case.
+**"ac lag 4" is the discriminator to reuse**: any future change to the image dither should keep
+this near zero and keep the tone column tracking the grey.
 
-### The pitfall that cost a debugging round (read before touching the compose)
+## 3. Stage 2: 4 levels → 1 bit (the mono writer)
 
-A plane byte holds logical row `y`'s pixels at bit `7 - (y & 7)`, while a **mask** byte holds
-column `x`'s pixel at bit `7 - (x & 7)` — the two bit positions are different. `addMonoPage` gets
-away with a single byte-wise `inkBits & maskByte` only because it first **transposes** the eight
-strided plane bytes into the mask's layout, so in the writer both operands agree per bit. A
-per-pixel compose must therefore select the mask bit per pixel:
+`addMonoPage` inks a pixel by comparing the blue-noise field against the density of its 4-level
+value: layer 0 (dark grey, v=1) 235/255, layer 1 (light grey, v=2) 170/255, layer 2 (black,
+v=3) 255/255; white never inks. Grey pixels are masked **unconditionally** — that is the
+4→2-level halftone that images depend on — while solid ink (no grey at all) is thinned by the
+255 layer **only with text AA on**.
 
-```cpp
-const int l = (lsbByte >> (7 - b)) & 1;      // b = y & 7  -> plane layout
-const int m = (msbByte >> (7 - b)) & 1;
-const uint8_t maskByte = nm.m[l ? 0 : (m ? 1 : 2)][y & 63][x >> 3];
-ink = (maskByte >> (7 - (x & 7))) & 1;       // mask layout
-```
+Measured realised ink density per 4-level value, on both books (`/tmp/ab/image_dither_report.py`
+in the session; the invariant to re-check):
 
-ANDing `~lsb & msb` with the mask byte directly (the obvious mirror of the writer) compares
-unrelated pixels' bits and silently produces a plausible-looking wrong page: no ink added or
-removed wholesale, just ~7% of grey pixels decided by the wrong noise sample. Symptom in the
-verifier: preview ink ≠ file ink by a few hundred pixels, every mismatch confined to grey areas.
+| 4-level value | expected | text book, AA on | text book, AA off | image book, AA off |
+|---|---|---|---|---|
+| white (v=0) | 0.000 | 0.000 | 0.000 | 0.000 |
+| dark grey (v=1) | 0.922 | 0.918–0.920 | 0.920 | 0.923 |
+| light grey (v=2) | 0.667 | 0.664–0.668 | 0.667 | 0.656 |
+| black (v=3) | 1.000 | 0.996 (thinned) | **1.000** (crisp) | **1.000** |
 
-## 4. Gate results (2,034-page Korean text book + 14-page image book)
+So with AA off in 1-bit mode, text pages contain **no greys at all** (dark/light counts are
+literally 0) and every black pixel is ink — crisp text — while image greys still halftone at the
+correct densities. With AA on, text greys are halftoned like everything else and solid ink is
+thinned by 1/256 (the `noise < 255` layer noted in `xtch_writer.h`).
+
+## 4. What the switch is, precisely
+
+* Engine: `captureText = textOnce && aaOn` (`ko_engine_driver.h`) — with AA off the grey passes
+  render images only, so a page carries no text greys. Gated: 0/2,034 pages differ from the
+  pre-stage-A engine with AA off, and 0/2,034 with AA on.
+* Writer + preview: one helper, `textAaEnabled() = spec.textAntiAliasing != 0`, read by
+  `ko_export_set_mode`, re-asserted in `ko_export_spine`, and by `ko_compose_rgba` — the
+  preview shows the page the file will carry in either position.
+* Host flags: `--1bit`, `--text-aa` / `--no-text-aa`. (The old `--mono-dither` /
+  `--no-mono-dither` are gone: there is no separate dither switch to force any more.)
+
+## 5. Gates run
 
 | check | result |
 |---|---|
-| 2-bit XTCH, AA on: new engine vs pre-stage-A reference | **0/2034 differ** |
-| 2-bit XTCH, AA off: new engine vs pre-stage-A reference | **0/2034 differ** |
-| 1-bit XTG, AA on: dither (follows AA) vs dither forced off | 2034/2034 differ — the switch is live |
-| 1-bit XTG, AA off: dither off (follows AA) vs forced on | 2033/2034 differ — thinning only |
-| grey content of the 2-bit file with AA off | 74/2034 pages carry any grey, and only image pages (page 0/6/83 counts are byte-identical to AA on) |
-| 1-bit preview vs exported file, AA on and off | pixel-exact (`scripts/verify/mono_preview_vs_file.js`) |
-
-Host flags for this: `--1bit`, `--text-aa` / `--no-text-aa`, `--mono-dither` /
-`--no-mono-dither` (the last two force the flag to test the AA relationship; without them the
-dither follows AA).
-
-## 5. Known nuance of the dither (pre-existing, not introduced here)
-
-The masks are built as `noise < density` with densities {235, 170, 255} and the table holds all
-256 values, so 1 in 256 *black* pixels is deliberately not inked — that is the "255 layer" noted
-in `xtch_writer.h`. It is why AA-off + dither-on still differs from AA-off + dither-off on pages
-with no greys at all (thinning of solid ink), and why the two are not byte-identical even where
-the grey planes are empty. AA off is the no-thinning mode.
+| 2-bit, AA on: vs pristine reference | 0/2034 pages differ |
+| 2-bit, AA off: vs pre-stage-A engine | 0/2034 pages differ |
+| 1-bit, AA on: vs the previously deployed build | **byte-identical** (0/2034) |
+| 1-bit, AA off: image greys still halftoned, text crisp | densities table above |
+| 1-bit preview vs exported file, both switch positions | pixel-exact on 4 spine/page cases |
+| image quantiser: 4-level dither quality vs the Bayer anchor | unit test, §2 |

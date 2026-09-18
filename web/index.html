@@ -78,7 +78,7 @@
         <span>Paragraph indent <i>들여쓰기</i></span>
       </label>
 
-      <label class="ctrl check" id="textAaLab" title="2-bit XTCH: smooth text edges via grey pixels, exactly as the firmware does it (AA off renders text 1-bit). 1-bit XTC: no grey planes exist in the file, so this switch controls the blue-noise dither instead — on, grey levels are halftoned into the 1-bit plane; off, they are dropped to a hard threshold (crisper text, harsher photos)">
+      <label class="ctrl check" id="textAaLab" title="Text anti-aliasing. 2-bit XTCH: grey planes carry 2-bit glyph coverage, exactly as the firmware does it (off = text renders 1-bit). 1-bit XTC: images are ALWAYS blue-noise halftoned to 2 levels either way; this switch decides whether text is halftoned too (on, smoother text edges) or rendered as crisp 1-bit pixels (off)">
         <input type="checkbox" id="textAa" checked>
         <span>Text anti-aliasing <i>텍스트 안티앨리어싱</i> <em class="aaHint"></em></span>
       </label>
