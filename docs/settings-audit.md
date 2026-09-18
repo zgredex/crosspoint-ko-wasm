@@ -31,22 +31,42 @@ default rendering.
 
 ## Measured effects
 
-| setting change | Korean book | English book | verdict |
+| setting change | Korean book (2034 pp baseline) | English book (14 pp baseline) | verdict |
 |---|---|---|---|
-| `paragraphIndent` 0→1 | differs | 12/14 pages | live |
-| `extraParagraphSpacing` 1→0 | differs | 12/14 (−2 pages) | live |
-| `characterWrap` 1→0 | differs | 12/14 | live |
+| `paragraphIndent` 0→1 | **1 page** (page 1873), count unchanged | 12/14 pages | live, book-dependent — see note |
+| `extraParagraphSpacing` 1→0 | count −94 (→1940) | 12/14, count −2 | live |
+| `characterWrap` 1→0 | count +51 (→2085) | 12/14 | live |
 | **`hyphenation` 0→1, wrap ON** | **0/2034** | **0/14** | **INERT — hidden** |
 | `hyphenation` 0→1, wrap OFF | 1125/2084 pages | 5/14 pages | live |
-| `lineCompression` 1.20→1.00 / 1.40 | differs | 13/14 (−1) / 12/14 | live |
-| `paragraphAlignment` → LEFT/CENTER/RIGHT | differs | 12/14 | live |
-| `paragraphAlignment` → BOOK_STYLE | differs (page count +1) | **0/14** | live, content-dependent |
-| `embeddedStyle` 1→0 | 2003 pages | **0/14** | live, content-dependent |
-| `imageRendering` → PLACEHOLDER / SUPPRESS | 1945 pages | 9–10 pages (−3) | live |
-| `textAntiAliasing` 1→0 | 2026 pages | 12/14 | live |
+| `lineCompression` 1.20→1.00 | count −345 (→1689) | 13/14, count −1 | live |
+| `lineCompression` 1.20→1.40 | count +277 (→2311) | 12/14 | live |
+| `paragraphAlignment` → LEFT | count +51 (→2085) | 12/14 | live |
+| `paragraphAlignment` → CENTER / RIGHT | count +53 (→2087) | 12/14 | live |
+| `paragraphAlignment` → BOOK_STYLE | count +1 (→2035) | **0/14** | live, content-dependent |
+| `embeddedStyle` 1→0 | count −31 (→2003) | **0/14** | live, content-dependent |
+| `imageRendering` → PLACEHOLDER / SUPPRESS | count −9 (→2025) both | 9–10/14, count −3 | live |
+| `textAntiAliasing` 1→0 | 2026 pages differ | 12/14 | live |
 | `screenMargin` 5→35 | viewport 464×778 → 404×718, canvas hash changes | | live |
 | `LZ4 compress` off→on | XTCH 1,345,804 B → XTZ4 322,552 B (24%) | | live |
 | `Focus reading` | not in the UI; `ko_set_focus_reading()` hardcodes 0 (KO build) | | already hidden |
+
+**`paragraphIndent` is the marginal one, and it stays — but read the mechanism before judging it.**
+The engine resolves a paragraph's first-line indent in `ParsedText::resolveFirstLineIndent()`:
+
+```
+if (blockStyle.textIndentDefined)            → use the BOOK's CSS text-indent
+                                               (or 0 when extraParagraphSpacing is on and it is >= 0)
+else if (!extraParagraphSpacing && !paragraphIndent) → 3 spaces
+else                                          → 0, and `applyParagraphIndent()` prefixes U+3000
+```
+
+So a paragraph whose CSS sets `text-indent` (the demo Korean novel: 68 such rules, `p{text-indent:1em}`)
+is indented **independently of this switch** — the switch only adds the U+3000 fallback for
+paragraphs the book's CSS does not cover, which on that book is one page (1873) and no page count.
+On the English image book, whose CSS does not indent, it moves 12 of 14 pages. Verdict: live, but
+book-dependent; reported as 1/2034 rather than "differs" on purpose — a single page of movement
+must not be rounded up to "works", and the tooltip now says the switch applies "where the book's
+CSS does not already indent".
 
 The two "content-dependent" rows are not dead controls: `BOOK_STYLE` means "use the book's
 own alignment", which equals Justified for a book with no alignment CSS, and `embeddedStyle`
