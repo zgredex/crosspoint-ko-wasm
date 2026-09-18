@@ -88,14 +88,14 @@
         <span>Extra paragraph spacing <i>문단 간격</i></span>
       </label>
 
-      <label class="ctrl check">
+      <label class="ctrl check" title="Character wrap (음절 단위 줄바꿈): break a line between characters, not only at spaces. The KO reader default, and what keeps justified Korean from opening huge word gaps. It also OVERRIDES hyphenation — character wrap can already break anywhere, so hyphenation has nothing left to do while this is on (upstream: 'Hyphenation only applies in word-wrap mode').">
         <input type="checkbox" id="characterWrap" checked>
         <span>Character wrap <i>음절 단위 줄바꿈</i> (KO)</span>
       </label>
 
-      <label class="ctrl check">
+      <label class="ctrl check" id="hyphenationLab" title="Break a word that does not fit: language patterns when the book's language has them (en/de/fr/es/it/pl/ru/sv/fi/uk), otherwise fallback word breaks (Korean has no hyphenation patterns upstream — Hangul words break without a visible hyphen). Only reachable with character wrap OFF, and hidden while it is on, because then it changes nothing.">
         <input type="checkbox" id="hyphenation">
-        <span>Hyphenation <i>하이픈</i> (needs word wrap)</span>
+        <span>Hyphenation <i>하이픈</i></span>
       </label>
 
       <label class="ctrl check">
@@ -135,6 +135,10 @@
           <label for="fontFile" class="btn secondary fileBtn small" title="Choose an OTF/TTF font file">Choose…</label>
         </div>
 
+        <!-- Everything below needs a font FILE: runFontConvert() returns early without
+             one, so these knobs are inert until something is loaded. Hidden until then —
+             a control that cannot do anything should not be on screen. -->
+        <div id="fontTuning" class="hidden">
         <label class="ctrl">
           <span>Name <i>이름</i></span>
           <input type="text" id="fontName" value="custom" maxlength="24">
@@ -172,6 +176,8 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
           <input type="range" id="fontSpacePx" min="0" max="30" step="1" value="9">
           <output id="fontSpacePxOut">9 px</output>
         </label>
+
+        </div>
 
         <div id="fontConvStatus" class="fontStatus"></div>
         <p id="fontBackendNote" class="hint backendNote hidden">
@@ -250,6 +256,6 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
   </aside>
 </main>
 
-<script src="app.js?v=12"></script>
+<script src="app.js?v=13"></script>
 </body>
 </html>

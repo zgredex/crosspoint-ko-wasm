@@ -56,7 +56,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=12');
+    const w = new Worker(base + 'ko.worker.js?v=13');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -192,6 +192,10 @@
     els.fontName.value = 'custom';
     syncFontSeg();
     toggleFontPanel();
+    // These assignments do not fire change events, so the dependent-visibility rule has
+    // to be re-applied by hand: resetting to the defaults puts character wrap back ON,
+    // which means the hyphenation row must disappear again.
+    syncDependentControls();
   }
 
   // ---- rendering ----
@@ -773,6 +777,33 @@
     requestRepaint(60);
     scheduleWarm(800);
   }));
+
+  // ---- controls that are inert in the current state are not shown -------------
+  // Two cases, both measured rather than assumed (scripts/verify/settings_effect.js
+  // exports the whole book once per variant and diffs the page payloads):
+  //
+  //  * Hyphenation is masked by the engine while character wrap is on:
+  //    toReaderSpec() sets `hyphenationEnabled && characterWrap == 0`, so with wrap on
+  //    flipping it changes 0 of 2034 page payloads (and 0 of 14 on the image book).
+  //    Upstream states the same rule: "Hyphenation only applies in word-wrap mode:
+  //    character wrap can break anywhere already." So the row is hidden while wrap is
+  //    on, and appears the moment wrap is switched off - when it does something
+  //    (1125/2084 pages on the Korean book, 5/14 on the English one).
+  //  * The custom-font tuning knobs all funnel through runFontConvert(), which returns
+  //    early unless a font FILE is loaded, so they are inert (and now hidden) until one
+  //    is. See #fontTuning in index.html.
+  function syncDependentControls() {
+    const hLab = document.getElementById('hyphenationLab');
+    if (hLab) hLab.classList.toggle('hidden', els.characterWrap.checked);
+    const tuning = document.getElementById('fontTuning');
+    if (tuning) {
+      const hasFile = !!(els.fontFile.files && els.fontFile.files[0]);
+      tuning.classList.toggle('hidden', !hasFile);
+    }
+  }
+  els.characterWrap.addEventListener('change', syncDependentControls);
+  els.fontFile.addEventListener('change', syncDependentControls);
+  syncDependentControls();
   // live slider outputs on input (per-frame); repaint + warm on change
   const SLIDER_ROWS = [
     ['screenMargin', 'screenMarginOut', (v) => v],

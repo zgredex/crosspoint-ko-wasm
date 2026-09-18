@@ -210,7 +210,7 @@ async function init() {
   // Cache-bust the engine binaries: the emscripten glue fetches the .wasm with no version
   // query, so without this the edge serves a previously cached engine indefinitely and no
   // engine change can ever reach a returning browser.
-  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=12' : path) });
+  Module = await factory({ locateFile: (path) => (path.indexOf('.wasm') >= 0 ? path + '?v=13' : path) });
   api = Module;
   // deterministic viewport: engine computes from margins; init with full logical
   api._ko_init(464, 778); // will be fixed up by ko_set_margins on first spec
