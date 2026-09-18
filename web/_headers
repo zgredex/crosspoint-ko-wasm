@@ -45,6 +45,23 @@
 /ft_wasm.*.wasm
   Cache-Control: public, max-age=31536000, immutable
 
+# Externalized reader faces (EPD2). These are the reason this file exists at all now: .epd2 is an
+# unknown extension, Pages serves it as application/octet-stream, and Cloudflare's default compression
+# policy works off content type — so an uncompressed blob would cross the wire at full size (measured:
+# 3,169,108 bytes for KoPub, which made the externalized build worse than embedding it).
+#
+# The package therefore ships these files ALREADY brotli-compressed (build_dist.sh) and this rule
+# labels them. That is the one header this file sets beyond caching/security, and it is safe because
+# the content and the label are produced together by the same step: a raw blob can never be served
+# under this rule, and a br blob without it fails loudly in the font loader rather than rendering
+# garbage. (Do NOT copy this pattern to Content-Type. See the note at the top.)
+/kopub_14.*.epd2
+  Content-Encoding: br
+  Cache-Control: public, max-age=31536000, immutable
+/ridibatang_14.*.epd2
+  Content-Encoding: br
+  Cache-Control: public, max-age=31536000, immutable
+
 # the demo books are content, not code — safe to hold longer than a session
 /*.epub
   Cache-Control: public, max-age=86400

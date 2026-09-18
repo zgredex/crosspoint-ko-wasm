@@ -25,3 +25,14 @@ dist/
 # EPD2 blobs are DERIVED (build/export_external_font). A build that externalizes a face stages the
 # blob into dist/ at package time; git tracks the generator, not 5 MB of output.
 *.epd2
+
+# Generated engine artifacts — NEVER tracked in web/ any more. web/ is source only; dist/ takes the
+# engine straight from build-wasm/ (see scripts/build_dist.sh). The tracked copies that used to live
+# here are exactly what caused the 2026-09-17 stale-wasm deploy: dist/ was refreshed from web/'s
+# older copy while the build directory held a newer one. scripts/stage_dev.sh puts them back locally
+# when you want to serve web/ with a plain static server.
+web/ko_xtch_wasm.js
+web/ko_xtch_wasm.wasm
+web/ko_build_info.js
+web/ft_wasm.js
+web/ft_wasm.wasm

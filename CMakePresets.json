@@ -1,0 +1,44 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "wasm-dev",
+      "displayName": "wasm — dev (both reader faces embedded)",
+      "description": "Local development: the engine carries KoPub and RIDIBatang, so web/ needs no data assets.",
+      "binaryDir": "${sourceDir}/build-wasm",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KO_EMBED_KOPUB": "ON",
+        "KO_EMBED_RIDI": "ON"
+      }
+    },
+    {
+      "name": "wasm-production",
+      "displayName": "wasm — production (no reader face embedded)",
+      "description": "Variant C: the module carries no reader face; packaging ships them as EPD2 data and the worker fetches the default face in parallel with the module. Configured explicitly so a build directory previously set up as dev cannot be deployed as production by accident.",
+      "binaryDir": "${sourceDir}/build-wasm",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KO_EMBED_KOPUB": "OFF",
+        "KO_EMBED_RIDI": "OFF"
+      }
+    },
+    {
+      "name": "wasm-kopub-only",
+      "displayName": "wasm — variant B (KoPub embedded, RIDIBatang external)",
+      "description": "A middle rung: keep KoPub embedded (no fetch on the default path) and externalize only the optional face.",
+      "binaryDir": "${sourceDir}/build-wasm",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KO_EMBED_KOPUB": "ON",
+        "KO_EMBED_RIDI": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "wasm-dev", "configurePreset": "wasm-dev", "jobs": 8 },
+    { "name": "wasm-production", "configurePreset": "wasm-production", "jobs": 8 },
+    { "name": "wasm-kopub-only", "configurePreset": "wasm-kopub-only", "jobs": 8 }
+  ]
+}

@@ -16,7 +16,13 @@ import json
 import os
 import sys
 
-GENERATED = ['ko_xtch_wasm.js', 'ko_xtch_wasm.wasm', 'ft_wasm.js', 'ft_wasm.wasm']
+# ko_build_info.js is REQUIRED, not optional: it is the declaration the worker reads to know which
+# faces the engine carries, and a package that ships an engine without it is a package whose font
+# configuration is unknown. Fingerprinting it also means a content-addressed engine can never be
+# paired with a different build's declaration.
+GENERATED = ['ko_xtch_wasm.js', 'ko_xtch_wasm.wasm', 'ko_build_info.js']
+
+OPTIONAL_GENERATED_BASE = ['ft_wasm.js', 'ft_wasm.wasm']
 
 # Optional: externalized built-in faces. Present only when a build ships a face as data instead of
 # compiling it in, so their absence is not an error — but when present they MUST be fingerprinted,
@@ -39,10 +45,11 @@ def main():
         mapping[name] = hashed
         print('  %-22s -> %s' % (name, hashed))
 
-    # optional artifacts: externalized built-in faces, present only when a build ships a face as
+    # optional artifacts: FreeType's wasm (present when the custom-font path is built) and the
+    # externalized built-in faces, present only when a build ships a face as
     # data. Fingerprinted when present, silently skipped when not — a build that embeds every face
     # legitimately has none, and that must not be an error.
-    for name in OPTIONAL_GENERATED:
+    for name in OPTIONAL_GENERATED_BASE + OPTIONAL_GENERATED:
         path = os.path.join(dist, name)
         if not os.path.exists(path):
             continue
