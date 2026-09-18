@@ -30,7 +30,9 @@ mkdir -p "$OUT"
 # on demand: the blobs are derived artifacts, so the repo tracks the generator rather than 5 MB of
 # output that the default (all-embedded) build would ship to every visitor for nothing.
 declare -A BLOB_FOR=( [kopub]=/tmp/ab/kopub_14.epd2 [ridibatang]=/tmp/ab/ridi_14.epd2 )
-FACE_NAME=( [kopub]=kopub [ridibatang]=ridibatang )
+# declare -A is not optional here: with `set -u`, a bare `NAME=( [kopub]=x )` treats `kopub` as an
+# ARITHMETIC subscript and dies with "kopub: unbound variable" before anything is built.
+declare -A FACE_NAME=( [kopub]=kopub [ridibatang]=ridibatang )
 for _face in kopub ridibatang; do
   _blob="${BLOB_FOR[$_face]}"
   if [ ! -f "$_blob" ]; then

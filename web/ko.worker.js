@@ -452,18 +452,44 @@ const FACE_ASSETS = {
   kopub: 'kopub_14.epd2',
   ridibatang: 'ridibatang_14.epd2',
 };
+const FACE_NAMES = Object.keys(FACE_IDS);
 const embeddedFaces = () => (self.KO_EMBEDDED_FACES || ['kopub', 'ridibatang']);
+const faceNameForFontId = (id) => FACE_NAMES.find((n) => FACE_IDS[n] === id) || null;
 
-// Fetch the EPD2 bytes for every face this build does NOT embed. Returns [{name, bytes}] — no engine
-// involved, so it can run while the module is still being fetched and compiled.
-async function fetchMissingFaces() {
-  const missing = Object.keys(FACE_ASSETS).filter((f) => !embeddedFaces().includes(f));
-  if (missing.length === 0) return [];
-  return Promise.all(missing.map(async (name) => {
-    const r = await fetch(asset(FACE_ASSETS[name]));
-    if (!r.ok) throw new Error(`face ${name}: HTTP ${r.status} for ${FACE_ASSETS[name]}`);
-    return { name, bytes: new Uint8Array(await r.arrayBuffer()) };
-  }));
+// The face the default spec selects. It is prefetched at boot, in parallel with the module, because
+// the first render needs it. Every OTHER non-embedded face is fetched on demand, the first time it is
+// selected — a reader who never picks RIDIBatang never downloads its 236 KB of brotli.
+const DEFAULT_FACE = 'kopub';
+
+// Fetch the EPD2 bytes for a face. No engine involved, so this can run while the module is still
+// being fetched and compiled — that parallelism is the point.
+async function fetchFaceBytes(name) {
+  const r = await fetch(asset(FACE_ASSETS[name]));
+  if (!r.ok) throw new Error(`face ${name}: HTTP ${r.status} for ${FACE_ASSETS[name]}`);
+  return { name, bytes: new Uint8Array(await r.arrayBuffer()) };
+}
+
+// name -> Promise<boolean>, memoised so a face is fetched and registered at most once even if several
+// commands ask for it while the download is still in flight.
+const facePromises = new Map();
+
+// Bring a face into the engine on demand. Resolves true when it is available (embedded, or fetched
+// and registered), and rejects only if the blob could not be fetched or was rejected by the loader —
+// callers must not silently render with a missing face.
+function ensureFace(name) {
+  if (!name) return Promise.resolve(true);
+  if (embeddedFaces().includes(name)) return Promise.resolve(true);
+  if (api && api._ko_has_font(FACE_IDS[name])) return Promise.resolve(true);
+  if (!facePromises.has(name)) {
+    facePromises.set(name, (async () => {
+      const fetched = await fetchFaceBytes(name);
+      registerFaces([fetched]);
+      return true;
+    })());
+    // a failed load must not poison the cache — the next attempt should retry
+    facePromises.get(name).catch(() => facePromises.delete(name));
+  }
+  return facePromises.get(name);
 }
 
 // Copy each fetched blob into the module's heap ONCE and register it. The pointer is deliberately
@@ -493,9 +519,11 @@ async function init() {
   const factory = self.createKoEngine;
   BOOT.glueReady = performance.now();
   BOOT.factoryStart = performance.now();
-  // Start the font fetches BEFORE awaiting the module: these are two independent downloads and the
-  // point is that they overlap.
-  const facesPromise = fetchMissingFaces().catch((e) => { BOOT.faceError = String(e); return []; });
+  // Start the default face's fetch BEFORE awaiting the module: two independent downloads, and the
+  // point is that they overlap. Faces other than the default are left alone — they load on selection.
+  const eagerFaces = embeddedFaces().includes(DEFAULT_FACE) ? [] : [DEFAULT_FACE];
+  const facesPromise = Promise.all(eagerFaces.map(fetchFaceBytes))
+    .catch((e) => { BOOT.faceError = String(e); return []; });
   // Cache-bust the engine binaries: the emscripten glue fetches the .wasm with no version
   // query, so without this the edge serves a previously cached engine indefinitely and no
   // engine change can ever reach a returning browser.
@@ -514,18 +542,16 @@ async function init() {
     BOOT.facesBytes = BOOT.facesRegistered.reduce((n, f) => n + f.bytes, 0);
   }
   // A face that is neither compiled in nor fetched would render as blank pages, and nothing else in
-  // the pipeline would say why. KoPub is the default reader face, so its absence is fatal here;
-  // RIDIBatang and Pretendard degrade specific glyphs instead, so they are recorded, not thrown —
-  // but recorded, because a silently missing fallback is exactly how a build ends up non-conformant
-  // without anybody noticing.
-  if (!api._ko_has_font(FACE_IDS.kopub)) {
-    throw new Error(`reader face missing: kopub is neither embedded nor loaded `
+  // the pipeline would say why. Only the DEFAULT face is a boot requirement: it is needed for the
+  // first render. Every other face is fetched on demand by ensureFace(), so its absence here is the
+  // expected state, not a degradation — reporting it as one would train people to ignore the message.
+  if (!api._ko_has_font(FACE_IDS[DEFAULT_FACE])) {
+    throw new Error(`reader face missing: ${DEFAULT_FACE} is neither embedded nor loaded `
                     + `(embedded: ${embeddedFaces().join(', ') || 'none'})`);
   }
-  BOOT.degraded = Object.keys(FACE_IDS).filter((f) => !api._ko_has_font(FACE_IDS[f]));
-  if (BOOT.degraded.length) {
-    self.postMessage({ id: 0, ok: true, cmd: 'diag', data: { degradedFaces: BOOT.degraded } });
-  }
+  // Faces still absent because they are lazy. Recorded so `bootstats` can state the configuration
+  // rather than leave it to be inferred from which assets happen to be on the server.
+  BOOT.lazyFaces = FACE_NAMES.filter((f) => !api._ko_has_font(FACE_IDS[f]));
   BOOT.engineReady = performance.now();
   BOOT.phases = {
     glue: +(BOOT.glueReady - BOOT.workerStart).toFixed(1),
@@ -685,7 +711,7 @@ function applyFont(name) {
 // §2/§3: one place that turns a spec object into engine state. The per-field setters are cheap
 // (field writes in the engine) and run unconditionally so the spec is always authoritative; only the
 // expensive parts are gated — the font (custom = malloc + copy + reparse) and the margins.
-function applySpec(raw) {
+async function applySpec(raw) {
   const before = currentSpec;
   currentSpec = Object.assign(defaultSpec(), raw || {});
   const lkBefore = before ? layoutKey(before) : null;
@@ -708,6 +734,14 @@ function applySpec(raw) {
   api._ko_set_image_dither(currentSpec.imageDither);
   api._ko_set_image_tone_depth(currentSpec.imageToneDepth);
 
+  // Fetch the face before touching the engine with it: a lazily-loaded face (anything but the
+  // default) may still be in flight, and `applyFont` would otherwise silently fail against a font id
+  // that is not registered yet — rendering with the previous face and reporting success.
+  if (currentSpec.font !== 'custom') {
+    tick('ensureFace');
+    await ensureFace(currentSpec.font);
+    tock('ensureFace');
+  }
   tick('applyFont');
   applyFont(currentSpec.font);            // no-op unless the face or the font stamp changed
   tock('applyFont');
@@ -732,12 +766,12 @@ function viewportInfo(spec) {
 }
 
 // The render path carries the spec, so an unchanged spec costs nothing at all (§2).
-function applySpecIfChanged(raw) {
+async function applySpecIfChanged(raw) {
   if (currentSpec && renderKey(currentSpec) === renderKey(Object.assign(defaultSpec(), raw || {}))) {
     COUNTERS.renderApplies += 1;
     return false;
   }
-  applySpec(raw);
+  await applySpec(raw);
   return true;
 }
 
@@ -774,7 +808,9 @@ self.onmessage = async (ev) => {
           }
         }
         post(id, true, { phases: boot.phases || null, workerStart: boot.workerStart || 0,
-                         engineReadyWall: boot.engineReadyWall || 0, resource });
+                         engineReadyWall: boot.engineReadyWall || 0, resource,
+                         embedded: embeddedFaces(), lazyFaces: boot.lazyFaces || [],
+                         facesRegistered: boot.facesRegistered || [], faceError: boot.faceError || null });
         break;
       }
 
@@ -829,7 +865,7 @@ self.onmessage = async (ev) => {
         tick('spec');
         markInteractive();
         // margins: viewable area + screenMargin on all four sides (no UI reserve)
-        applySpec(ev.data.spec);
+        await applySpec(ev.data.spec);
         const vp = viewportInfo(currentSpec);
         tock('spec');
         post(id, true, {
@@ -874,7 +910,7 @@ self.onmessage = async (ev) => {
           }
           // §3: and it must not change g_spec underneath a running warm either
           if (changesSpec) await stopWarmBeforeMutation();
-          if (applySpecIfChanged(ev.data.spec)) vpInfo = viewportInfo(currentSpec);
+          if (await applySpecIfChanged(ev.data.spec)) vpInfo = viewportInfo(currentSpec);
         }
         const key = layoutKey(currentSpec || {});
         const wantMono = ev.data.mode === 0;   // 1-bit XTC preview (BW plane only)
@@ -1049,7 +1085,7 @@ self.onmessage = async (ev) => {
           tick('warm');
           // §3 of the 1.3 audit: the warm carries the spec it is producing, so it does not depend on
           // a preview render having already applied the same settings.
-          if (ev.data.spec) applySpecIfChanged(ev.data.spec);
+          if (ev.data.spec) await applySpecIfChanged(ev.data.spec);
           // §1 of the 1.4 audit: this local used to be named warmMode, shadowing the module-level
           // metadata variable — the assignment further down then threw "Assignment to constant
           // variable" AFTER the whole book was rendered, so the warm never reported ready.
@@ -1145,7 +1181,7 @@ self.onmessage = async (ev) => {
         // imageToneDepth, which any new export path could forget).
         // §3 of the 1.3 audit: the snapshot is applied AFTER the lock is held, so the settings the
         // file is built from are exactly the settings the caller sent with this one message.
-        if (ev.data.spec) applySpecIfChanged(ev.data.spec);
+        if (ev.data.spec) await applySpecIfChanged(ev.data.spec);
         const exportMode = ev.data.mode === 0 ? 0 : 1;
         api._ko_export_set_mode(exportMode);
         const exportDepth = exportMode === 0 ? 2 : 4;

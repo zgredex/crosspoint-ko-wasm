@@ -18,7 +18,10 @@ import subprocess
 import sys
 import urllib.parse
 
-BROTLI_TYPES = ('.wasm', '.js', '.html', '.css', '.json', '.epub')
+BROTLI_TYPES = ('.wasm', '.js', '.html', '.css', '.json', '.epub', '.epd2')
+# .epd2 belongs here: an EPD2 blob is a header plus 2-bit-packed bitmaps, which compresses hard
+# (ridibatang 2,243,200 -> 236,244). Leaving it out served the raw bytes, which made a lazy face
+# fetch look ~10x more expensive than it is. That is a measurement bug, not a finding.
 COMPRESSIBLE_FLOOR = 1024          # don't bother below a kilobyte
 CACHE = '/tmp/serve-brotli-cache'
 DIRECTORY = '.'                    # set in __main__
