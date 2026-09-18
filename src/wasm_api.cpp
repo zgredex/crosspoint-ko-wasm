@@ -452,6 +452,40 @@ KO_EXPORT int ko_build_spine(int spineIndex) {
 
 // Render page p of current spine (all 3 passes). 0 ok / -1 error.
 // Then ko_plane_ptr(kind): 0=BW 1=LSB(dark grey) 2=MSB(light+dark).
+// ---- progressive section build (open-path latency) ---------------------------
+// Lay out enough of a spine for its first page, then extend in chunks. Without this the browser
+// paginates an entire chapter before it may show page 1.
+KO_EXPORT int ko_start_spine(int spine, int initialPages) {
+  if (!g_driver) return -1;
+  const int n = g_driver->startSection(spine, g_spec, initialPages < 1 ? 1 : initialPages);
+  if (n < 0) {
+    setError("progressive section start failed");
+    return -1;
+  }
+  // Same contract as ko_build_spine: a successful section start makes this the current spine, which is
+  // what ko_render_page checks before rendering. Without this the render is refused with
+  // "page render failed" and nothing says why.
+  g_currentSpine = spine;
+  return n;
+}
+
+KO_EXPORT int ko_build_spine_more(int maxPages) {
+  if (!g_driver) return -1;
+  return g_driver->buildSectionMore(maxPages);
+}
+
+KO_EXPORT int ko_spine_build_complete() {
+  return (g_driver && g_driver->sectionBuildComplete()) ? 1 : 0;
+}
+
+KO_EXPORT int ko_spine_pages_available() {
+  return g_driver ? g_driver->availablePages() : 0;
+}
+
+KO_EXPORT int ko_spine_pages_estimated() {
+  return g_driver ? g_driver->estimatedPages() : 0;
+}
+
 KO_EXPORT int ko_render_page(int pageIndex) {
   if (!g_driver || g_currentSpine < 0) return -1;
   if (!g_driver->renderPage(pageIndex, g_spec, g_page)) {

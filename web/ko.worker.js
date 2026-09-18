@@ -29,7 +29,12 @@ try {
   importScripts(asset('ko_build_info.js') + self.location.search);
 } catch (_) { /* no build info: see embeddedFaces() — it does not guess in a packaged build */ }
 
-importScripts(asset('ko_xtch_wasm.js'));   // defines createKoEngine (MODULARIZE)
+// cache-busted like the two declaration files above, and for the same reason: the engine glue carries
+// the export wrappers, so a stale glue next to a fresh .wasm is a module whose new functions do not
+// exist — which is exactly how this was found ("api._ko_start_spine is not a function" with the rebuilt
+// module sitting on disk). The name is content-addressed in dist/, so the query is only a dev-loop
+// cache-buster there.
+importScripts(asset('ko_xtch_wasm.js') + self.location.search);   // defines createKoEngine (MODULARIZE)
 
 let Module = null;         // wasm module instance
 let api = null;            // C-export surface
@@ -291,7 +296,9 @@ let ftVersionString = '';
 async function getFontConverter() {
   if (fontConv) return fontConv;
   if (typeof EpdFontConverter === 'undefined') {
-    importScripts(asset('ft_wasm.js'), 'epdfont.js?v=' + FT_MODULE_VERSION);
+    // both hops cache-busted: a stale ft_wasm.js next to a fresh .wasm is the same trap the engine
+    // glue taught us, and epdfont.js is versioned against the packer it must match.
+    importScripts(asset('ft_wasm.js') + self.location.search, 'epdfont.js?v=' + FT_MODULE_VERSION);
   }
   fontConv = await EpdFontConverter.load({
     factory: createFtConverter({
@@ -815,6 +822,75 @@ async function applySpecIfChanged(raw) {
   return true;
 }
 
+
+// Load-phase timings for the open path, so window.__koBookOpen can say WHERE the time went rather than
+// only how much there was. Everything here is diagnostic and costs three performance.now() calls.
+let loadTiming = {};
+
+// Per-frame breakdown. `buildMs` is the section layout that has to finish before ANY page exists, which
+// is exactly the number the progressive-layout work is meant to shrink.
+function renderTiming(t0, buildMs, renderMs, composeMs, cached) {
+  return {
+    buildMs: +(buildMs || 0).toFixed(2),
+    renderMs: +(renderMs || 0).toFixed(2),
+    composeMs: +(composeMs || 0).toFixed(2),
+    totalMs: +(performance.now() - t0).toFixed(2),
+    pagesAvailable: currentPages,
+    sectionComplete: true,
+    cached: !!cached,
+  };
+}
+
+function withCString(str, fn) {
+  const bytes = new TextEncoder().encode(str == null ? '' : String(str));
+  const ptr = api._malloc(bytes.length + 1);
+  try {
+    api.HEAPU8.set(bytes, ptr);
+    api.HEAPU8[ptr + bytes.length] = 0;
+    return fn(ptr);
+  } finally {
+    api._free(ptr);
+  }
+}
+
+// ---- progressive section build -------------------------------------------------
+// A spine is laid out one page at a time until the first page exists, then extended in chunks while
+// the reader looks at it. Measured on a 326-page single spine: 48.8 ms of a 68.2 ms first page was
+// section layout, so this is the difference between "wait for the chapter" and "wait for one page".
+const FIRST_PAGES = 1;      // enough for the requested page to exist
+const BUILD_CHUNK = 4;      // pages per continuation tick
+let sectionGen = 0;         // bumped by anything that replaces the live section
+let sectionEstimates = {};
+
+// Anything that mutates the engine's live section must bump this, or a continuation would keep laying
+// out a section nobody is looking at (and could interleave with an export's own buildSection).
+function invalidateSection() { sectionGen += 1; }
+
+function yieldToLoop() { return new Promise((r) => setTimeout(r, 0)); }
+
+async function continueSection(spine, gen, chunk) {
+  while (gen === sectionGen && currentSpine === spine && !foregroundExportRunning && !warmRunning) {
+    if (api._ko_spine_build_complete() === 1) break;
+    const t0 = performance.now();
+    const n = api._ko_build_spine_more(chunk);
+    if (n < 0) break;
+    currentPages = api._ko_spine_pages_available();
+    const est = api._ko_spine_pages_estimated();
+    const done = api._ko_spine_build_complete() === 1;
+    sectionEstimates[spine] = { pages: currentPages, estimated: est, complete: done };
+    // Progress carries no id: the page updates its "x / y" total without a round trip.
+    self.postMessage({ sectionProgress: true, spine, pages: currentPages, estimated: est,
+                       complete: done, ms: +(performance.now() - t0).toFixed(2) });
+    if (done) break;
+    await yieldToLoop();          // let render / navigation / settings messages run between chunks
+  }
+  if (gen === sectionGen && currentSpine === spine && api._ko_spine_build_complete() === 1) {
+    sectionEstimates[spine] = { pages: currentPages, estimated: currentPages, complete: true };
+    self.postMessage({ sectionProgress: true, spine, pages: currentPages, estimated: currentPages,
+                       complete: true, ms: 0 });
+  }
+}
+
 self.onmessage = async (ev) => {
   const { id, cmd } = ev.data;
   try {
@@ -865,22 +941,26 @@ self.onmessage = async (ev) => {
         // handed to one worker is DETACHED by the transfer, so the second engine could never read it,
         // and keeping a second copy in the page would double the book's memory for a 200 MB book.
         // Each worker reads the same Blob instead.
+        const tLoad0 = performance.now();
+        const tRead0 = performance.now();
         const epub = ev.data.epub || await ev.data.blob.arrayBuffer();
+        const blobReadMs = performance.now() - tRead0;
         const bytes = new Uint8Array(epub);
+        const tCopy0 = performance.now();
         const bufPtr = api._malloc(bytes.length);
         api.HEAPU8.set(bytes, bufPtr);
+        const wasmCopyMs = performance.now() - tCopy0;
         dropWarmResult();     // §3: warm bytes belong to the previous book
+        const tEng0 = performance.now();
+        invalidateSection();
         spineCount = api._ko_load_epub(bufPtr, bytes.length, '/book.epub');
+        const engineLoadMs = performance.now() - tEng0;
+        loadTiming = { bookBytes: bytes.length, blobReadMs, wasmCopyMs, engineLoadMs,
+                       heapAfterLoadBytes: api.HEAPU8.buffer.byteLength };
         api._free(bufPtr);
         if (spineCount < 0) {
           post(id, false, { error: 'Epub::load failed' });
           return;
-        }
-        // spine labels
-        const hrefs = [];
-        for (let s = 0; s < spineCount; s++) {
-          const p = api._ko_get_spine_href(s);
-          hrefs.push(api.UTF8ToString(p));
         }
         // title
         const tbuf = api._malloc(512);
@@ -904,7 +984,10 @@ self.onmessage = async (ev) => {
             return;
           }
         }
-        post(id, true, { spineCount, hrefs, title });
+        loadTiming.totalLoadMs = performance.now() - tLoad0;
+        // Spine labels are NOT sent here: one label per spine in front of the first page buys nothing,
+        // and an omnibus has thousands. The page asks for them in batches once the first frame is up.
+        post(id, true, { spineCount, title, timing: loadTiming });
         break;
       }
 
@@ -961,16 +1044,26 @@ self.onmessage = async (ev) => {
           if (changesSpec) await stopWarmBeforeMutation();
           if (await applySpecIfChanged(ev.data.spec)) vpInfo = viewportInfo(currentSpec);
         }
+        const tRender0 = performance.now();
         const key = layoutKey(currentSpec || {});
         const wantMono = ev.data.mode === 0;   // 1-bit XTC preview (BW plane only)
         // rebuild if spine, LAYOUT, OR loaded font changed since the last build
         // (a custom-font swap changes glyphs/metrics but not the worker spec;
         //  pixel-only options like AA/dither/tone depth must not repaginate — §3)
+        let continuation = null;
         if (ev.data.spine !== currentSpine || key !== builtKey ||
             fontStamp !== builtFontStamp) {
           COUNTERS.builds += 1;
           tick('rebuild');
-          const n = api._ko_build_spine(ev.data.spine);
+          let n;
+          if (ev.data.progressive === false) {
+            n = api._ko_build_spine(ev.data.spine);       // one-shot (the gate's reference path)
+          } else {
+            invalidateSection();
+            const gen = sectionGen;
+            n = api._ko_start_spine(ev.data.spine, FIRST_PAGES);
+            if (n >= 0) continuation = { spine: ev.data.spine, gen };
+          }
           tock('rebuild');
           if (n < 0) {
             const ep = api._ko_error();
@@ -982,7 +1075,13 @@ self.onmessage = async (ev) => {
           currentPages = n;
           builtKey = key;
           builtFontStamp = fontStamp;
+          sectionEstimates[ev.data.spine] = {
+            pages: n,
+            estimated: api._ko_spine_pages_estimated(),
+            complete: api._ko_spine_build_complete() === 1,
+          };
         }
+        const buildMs = performance.now() - tRender0;
         let page = ev.data.page;
         if (page < 0) page = 0;
         if (page >= currentPages) page = currentPages - 1;
@@ -996,6 +1095,7 @@ self.onmessage = async (ev) => {
           const reply = new Uint8ClampedArray(cachedFrame.data.length);
           reply.set(cachedFrame.data);
           post(id, true, { page, pages: currentPages, image: reply.buffer, mono: wantMono, cached: true,
+                           timing: renderTiming(tRender0, 0, 0, 0, true),
                            viewport: vpInfo ? vpInfo.viewport : null,
                            margins: vpInfo ? vpInfo.margins : null },
                [reply.buffer]);
@@ -1006,24 +1106,35 @@ self.onmessage = async (ev) => {
 
         tick('renderPage');
         COUNTERS.renders += 1;
+        const tRenderStart = performance.now();
         const rc = api._ko_render_page(page);
         tock('renderPage');
+        const renderMs = performance.now() - tRenderStart;
         if (rc !== 0) { post(id, false, { error: 'render failed' }); return; }
         // No plane copies: the compose runs inside the engine and reads the engine's own
         // planes, so copying 3 x 48 KB out of wasm here was pure waste.
         tick('compose');
         // compose through the SAME quantization the encoder uses for the chosen
         // mode: 1-bit → BW plane only (no AA greys), 2-bit → full 4-level
+        const tCompose0 = performance.now();
         const img = wantMono ? composeMono() : composePage();
+        const composeMs = performance.now() - tCompose0;
         tock('compose');
         frameCachePut(frameKey, img.data);      // copied: this buffer is transferred below
         const tx = img.data.buffer;
         COUNTERS.framesPosted += 1;
         // §2: user-visible work is finished — send it NOW. The prefetch is speculative and must never
         // delay the requested frame (it used to run between compose() and post()).
+        const est = sectionEstimates[currentSpine] || { pages: currentPages, estimated: currentPages, complete: true };
         post(id, true, { page, pages: currentPages, image: tx, mono: wantMono,
+                         // `pages` is what EXISTS (navigation clamps to it); `total` is what to display —
+                         // a giant spine still building knows its estimate, not its final count.
+                         total: est.complete ? currentPages : Math.max(est.estimated || 0, currentPages),
+                         sectionComplete: !!est.complete,
+                         timing: renderTiming(tRender0, buildMs, renderMs, composeMs, false),
                          viewport: vpInfo ? vpInfo.viewport : null,
                          margins: vpInfo ? vpInfo.margins : null }, [tx]);
+        if (continuation) continueSection(continuation.spine, continuation.gen, BUILD_CHUNK);
         schedulePrefetch(currentSpine, page, currentPages, wantMono, rk, builtFontStamp, bookGen);
         break;
       }
@@ -1205,17 +1316,23 @@ self.onmessage = async (ev) => {
 // instead of relying on the JS glue to marshal a string for a char* argument: it is not obvious from
 // the call site whether that conversion happens, and a silently-null path is exactly the kind of thing
 // that would produce a container with missing chapter names and no error.
-function withCString(str, fn) {
-  const bytes = new TextEncoder().encode(str == null ? '' : String(str));
-  const ptr = api._malloc(bytes.length + 1);
-  try {
-    api.HEAPU8.set(bytes, ptr);
-    api.HEAPU8[ptr + bytes.length] = 0;
-    return fn(ptr);
-  } finally {
-    api._free(ptr);
-  }
-}
+      case 'spineHrefs': {
+        // Batched label fetch, so a huge spine list is built behind the visible page.
+        const start = Math.max(0, ev.data.start | 0);
+        const count = Math.max(1, ev.data.count | 0);
+        const end = Math.min(spineCount, start + count);
+        const hrefs = [];
+        for (let s = start; s < end; s++) {
+          hrefs.push(api.UTF8ToString(api._ko_get_spine_href(s)));
+        }
+        post(id, true, { start, hrefs });
+        break;
+      }
+
+      case 'timing': {
+        post(id, true, { load: loadTiming, counters: COUNTERS });
+        break;
+      }
 
       case 'encodeSpine': {
         // ONE spine, laid out + rendered + ENCODED on this engine, returned as a single transferable
@@ -1232,6 +1349,7 @@ function withCString(str, fn) {
           api._ko_set_image_tone_depth(m === 0 ? 2 : 4);
           if (currentSpec) currentSpec.imageToneDepth = m === 0 ? 2 : 4;
           const spine = ev.data.spine | 0;
+          invalidateSection();
           const n = api._ko_encode_spine(spine);
           if (n < 0) { post(id, false, { error: 'encode spine failed: ' + spine }); break; }
           const ptr = api._ko_spine_data_ptr();
@@ -1391,6 +1509,7 @@ function withCString(str, fn) {
         const opts = { xtcz: !!ev.data.xtcz };
           // exportWholeBook owns its own abort cleanup on every abnormal exit (cancel, spine
           // failure, finish failure), so there is no catch here: one owner for cleanup.
+          invalidateSection();
           res = await exportWholeBook(opts, (spine, ofSpines, pages) => {
             self.postMessage({ progress: true, spine, ofSpines, pages });
           });

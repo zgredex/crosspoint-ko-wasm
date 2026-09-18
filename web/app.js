@@ -59,9 +59,22 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=66');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=74');
     w.onmessage = (ev) => {
       const m = ev.data;
+      // Progressive section build: the spine's page count grows while the reader looks at page 1, so
+      // the total on screen follows it. Navigation stays clamped to the pages that EXIST (state.pages);
+      // this only changes what "x / y" says.
+      if (m && m.sectionProgress) {
+        if (m.spine === state.spine) {
+          state.total = m.complete ? m.pages : Math.max(m.estimated || 0, m.pages);
+          updatePager();
+          const chapter = els.spineSel.value ? (Number(els.spineSel.value) + 1) + '장 ' : '';
+          els.pageStatus.textContent = chapter + (state.page + 1) + '/' + state.total +
+                                       (state.mono ? ' · 1-bit' : '');
+        }
+        return;
+      }
       // worker progress reports carry no id — surface them live
       if (m && m.progress && els.exportStatus) {
         els.exportProgress.textContent = '생성 중 ' + m.spine + '/' + m.ofSpines + ' ' +
@@ -206,7 +219,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=66');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=74');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -588,11 +601,15 @@
       const payload = { spine, page, mode: state.mode };
       if (spec) payload.spec = spec;
       const r = await call('render', payload);
+      // The FIRST frame after a book load carries the engine's own breakdown (section layout, glyph
+      // render, compose). Recorded once per book so an open can be explained, not just timed.
+      if (r && r.timing && !window.__koFirstFrame) window.__koFirstFrame = r.timing;
       if (spec) { lastPushedSpecKey = key; showViewport(r); }
       if (tok !== renderToken) return;          // superseded
       state.spine = spine;
       state.page = r.page;
-      state.pages = r.pages;
+      state.pages = r.pages;                       // pages that EXIST (navigation clamps to this)
+      state.total = r.total || r.pages;             // what to display: the estimate while building
       if (els.page.width !== 480 || els.page.height !== 800) {
         els.page.width = 480;
         els.page.height = 800;
@@ -603,7 +620,7 @@
       // Routine navigation must not flood a live region: the page counter is plain text
       // (readable on demand), while #status keeps only meaningful events.
       const chapter = els.spineSel.value ? (Number(els.spineSel.value) + 1) + '장 ' : '';
-      els.pageStatus.textContent = chapter + (r.page + 1) + '/' + r.pages +
+      els.pageStatus.textContent = chapter + (r.page + 1) + '/' + (state.total || r.pages) +
                                    (r.mono ? ' · 1-bit' : '');
       // §15: a screen reader cannot read rasterized text, but it can say what this object is
       els.page.setAttribute('aria-label', '도서 미리보기, ' + chapter + (r.page + 1) + '쪽');
@@ -824,6 +841,44 @@
     await refresh(true, true);
     return r;
   }
+  function spineLabel(h, i) {
+    const label = normalizeDisplayText(h.replace(/\.(xhtml|html|htm)$/i, '')
+                      .replace(/[_]+/g, ' ')) || ('spine ' + i);
+    return (i + 1) + '. ' + label;
+  }
+
+  // Labels arrive in batches AFTER the first page is on screen. Building one <option> per spine in
+  // front of the first frame buys nothing, and an omnibus has thousands of them.
+  let spinePopulateToken = 0;
+  async function populateSpinesLater(spineCount) {
+    const token = ++spinePopulateToken;
+    els.spineSel.innerHTML = '';
+    els.spineSel.disabled = false;
+    const batch = 100;
+    for (let start = 0; start < spineCount; start += batch) {
+      if (token !== spinePopulateToken) return;          // a new book superseded this one
+      let r;
+      try {
+        r = await call('spineHrefs', { start, count: Math.min(batch, spineCount - start) });
+      } catch (_) {
+        return;                                          // labels are cosmetic; the reader keeps working
+      }
+      if (token !== spinePopulateToken) return;
+      const frag = document.createDocumentFragment();
+      r.hrefs.forEach((h, i) => {
+        const opt = document.createElement('option');
+        opt.value = r.start + i;
+        opt.textContent = spineLabel(h, r.start + i);
+        frag.appendChild(opt);
+      });
+      els.spineSel.appendChild(frag);
+      // keep the current position selected as options appear
+      const cur = String(state.spine);
+      if (els.spineSel.querySelector('option[value="' + cur + '"]')) els.spineSel.value = cur;
+      await new Promise((res) => requestAnimationFrame(res));   // never block the frame
+    }
+  }
+
   function populateSpines(hrefs) {
     els.spineSel.innerHTML = '';
     hrefs.forEach((h, i) => {
@@ -842,6 +897,7 @@
     renderToken++;                      // kill in-flight renders
     currentBookBlob = blob;             // rebuildable from here on, whatever its source
     window.__koOpenT0 = performance.now();   // per book, or the timings below lie on the second open
+    window.__koFirstFrame = null;            // per book, ditto
     // §2 of the 1.2 audit: cancel the warm BEFORE asking the engine to load. Cancelling afterwards
     // left the warm free to resume between spines against a book that had already been replaced (the
     // worker also waits for it to stop now, but the request must not be sent first either).
@@ -868,10 +924,15 @@
         stripExt(r.title) || stripExt(name) || '제목 없음'
       );
       bookEpoch++;                 // §3: a new book invalidates any remembered warm key/skip
-      book = { title: canonicalTitle, spineCount: r.spineCount, hrefs: r.hrefs };
+      book = { title: canonicalTitle, spineCount: r.spineCount };
+      // Phase timings for the open path. These say WHERE the time went; a single firstPageMs only says
+      // whether it improved.
+      window.__koOpenPhases = Object.assign({}, r.timing || {});
       currentBookFile = pendingBookFile;   // §8: only a successful load promotes the File
       pendingBookFile = null;
-      populateSpines(r.hrefs);
+      // Labels are NOT built here: they now arrive in batches after the first frame (see below), so
+      // the spine list cannot sit between the user and page 1.
+      els.spineSel.innerHTML = '';
       state = { spine: 0, page: 0, pages: 0, mode: state.mode };  // keep output mode
       els.coverBtn.disabled = false;
       setAppState('loaded');
@@ -894,9 +955,13 @@
       // requestIdleCallback is right here and was wrong for the readiness ping it was once misused on:
       // this is genuinely work nobody is waiting for. The timeout bounds how long the engine may be
       // absent if the page never goes idle.
+      // First useful frame is on screen. NOW build the chapter list, in batches, never blocking a frame.
+      populateSpinesLater(r.spineCount);
       const tFirstPage = performance.now();
       const prepExport = () => {
-        window.__koBookOpen = { firstPageMs: +(tFirstPage - window.__koOpenT0).toFixed(1) };
+        window.__koBookOpen = Object.assign({}, window.__koOpenPhases || {}, {
+          firstPageMs: +(tFirstPage - window.__koOpenT0).toFixed(1),
+        }, window.__koFirstFrame || {});
         loadExportEngine(blob).then(() => {
           window.__koBookOpen.exportReadyMs =
             +(performance.now() - window.__koOpenT0).toFixed(1);
@@ -1543,7 +1608,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=66');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=74');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };

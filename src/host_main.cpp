@@ -229,6 +229,14 @@ int main(int argc, char** argv) {
   // laid out, rendered and encoded on its own into a LOCAL writer; page records are then appended to
   // an assembler in spine order and the container is written once. Comparing this against the serial
   // run is the whole point: same page records, same chapter logic (src/xtch_chapters.h), same bytes.
+  // --chunk N: build each spine incrementally (N pages at a time) instead of one-shot. The pages,
+  // chapter anchors and container must come out identical — this is how the incremental path is gated
+  // against the one-shot path it replaces.
+  int chunkPages = 0;
+  for (int i = 1; i < argc; i++) {
+    if (std::string(argv[i]) == "--chunk" && i + 1 < argc) chunkPages = std::atoi(argv[i + 1]);
+  }
+
   const bool pooled = [] (int argc, char** argv) {
     for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--pool") return true;
     return false;
@@ -252,7 +260,17 @@ int main(int argc, char** argv) {
   for (int spine = 0; spine < spineCount; spine++) {
     const auto tSpine0 = Clock::now();
     auto t0 = Clock::now();
-    const int n = driver.buildSection(spine, spec);
+    int n;
+    if (chunkPages > 0) {
+      n = driver.startSection(spine, spec, chunkPages);
+      while (n >= 0 && !driver.sectionBuildComplete()) {
+        const int more = driver.buildSectionMore(chunkPages);
+        if (more < 0) { n = -1; break; }
+        n = more;
+      }
+    } else {
+      n = driver.buildSection(spine, spec);
+    }
     tBuild += msSince(t0);
     if (n < 0) { fprintf(stderr, "spine %d: build failed\n", spine); continue; }
     fprintf(stderr, "spine %d/%d: %d pages\n", spine, spineCount, n);

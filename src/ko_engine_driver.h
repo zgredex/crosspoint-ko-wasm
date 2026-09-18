@@ -207,6 +207,33 @@ class EngineDriver {
     return pageCount_;
   }
 
+  // Progressive section build: lay out enough of a spine for the first page, render it, then keep
+  // laying out the rest in chunks. A long first chapter otherwise means "paginate the whole chapter
+  // before page 1 exists" — measured at 48.8 ms of a 68.2 ms first page on a 326-page single spine.
+  // The Section API is unchanged; this only stops calling the build-to-completion wrapper.
+  int startSection(int spineIndex, const Spec& spec, int initialPages) {
+    if (!epub_) return -1;
+    section_.reset();
+    ReaderRenderSpec rs = toReaderSpec(spec);
+    section_.reset(new Section(epub_, spineIndex, renderer_));
+    if (!section_->startBuild(rs)) return -1;
+    if (!section_->buildSomeMore(initialPages)) return -1;
+    pageCount_ = section_->pageCount;
+    return pageCount_;
+  }
+
+  // Lay out up to maxPages more pages of the section started above. >0 to completion.
+  int buildSectionMore(int maxPages) {
+    if (!section_) return -1;
+    if (!section_->buildSomeMore(maxPages)) return -1;
+    pageCount_ = section_->pageCount;
+    return pageCount_;
+  }
+
+  bool sectionBuildComplete() const { return section_ && section_->isBuildComplete(); }
+  int availablePages() const { return section_ ? section_->pageCount : 0; }
+  int estimatedPages() const { return section_ ? section_->estimatedTotalPages() : 0; }
+
   // Render one page of the current section into the display's physical planes
   // and return copies (bw / lsb / msb). Mirrors the device's text-settings AA
   // behavior: with AA on (default), all three passes render the full page so
