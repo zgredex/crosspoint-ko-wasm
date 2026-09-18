@@ -82,11 +82,21 @@ int main(int argc, char** argv) {
   ko::XtchWriter writer;
   // Output-mode flags, for verifying the 1-bit path (the web app sets the same mode
   // through ko_set_output_mode).
+  // The text-AA switch is the control for the 1-bit blue-noise dither, matching the
+  // web app: AA on -> the grey levels are halftoned into the 1-bit plane (pseudo
+  // grey / antialiased-looking text and photos), AA off -> hard threshold, no greys.
+  // --mono-dither / --no-mono-dither force the flag for testing that relationship.
+  int monoDitherOverride = -1;  // -1 = follow text AA
   for (int i = 1; i < argc; i++) {
     const std::string flag = argv[i];
     if (flag == "--1bit") writer.setMode(ko::XtcMode::Mono1Bit);
-    else if (flag == "--no-mono-dither") writer.setMonoGrayDither(false);
+    else if (flag == "--no-text-aa") spec.textAntiAliasing = 0;
+    else if (flag == "--text-aa") spec.textAntiAliasing = 1;
+    else if (flag == "--mono-dither") monoDitherOverride = 1;
+    else if (flag == "--no-mono-dither") monoDitherOverride = 0;
   }
+  writer.setMonoGrayDither(monoDitherOverride < 0 ? spec.textAntiAliasing != 0
+                                                  : monoDitherOverride != 0);
 
   writer.setMetadata(driver.title(), "unknown", "", "ko");
   int totalPages = 0;

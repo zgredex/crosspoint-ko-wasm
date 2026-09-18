@@ -872,26 +872,21 @@
     if (book) { invalidateWarm(); refresh(true); scheduleWarm(700); }
   });
 
-  // Text anti-aliasing only exists in the grey (lsb/msb) planes — a 1-bit XTC
-  // file carries the BW plane only, so AA is a no-op there. Disable the knob
-  // (and force it off for the render) when XTC 1-bit is selected.
+  // The AA switch is live in BOTH modes, and it means something real in each:
+  //   2-bit XTCH — text anti-aliasing, exactly as the firmware does it: the grey
+  //                (lsb/msb) planes carry 2-bit glyph coverage; off renders text
+  //                1-bit (the engine skips the text grey passes).
+  //   1-bit XTC  — the file has no grey planes at all, so the switch controls the
+  //                BLUE-NOISE DITHER instead: on, grey levels are halftoned into the
+  //                1-bit plane (pseudo-grey text and photos); off, they are dropped
+  //                to a hard threshold.
+  // The engine and the mono preview read the same spec switch, so the preview shows
+  // the page the file will carry in either position.
   function syncAaToMode() {
-    const disabled = state.mode === 0;
-    els.textAa.disabled = disabled;
-    // hint + dim the row so the disabled state reads as "n/a in 1-bit", not
-    // as a broken control
     const hint = document.querySelector('.aaHint');
-    if (hint) hint.textContent = disabled ? '(only in 2-bit)' : '';
+    if (hint) hint.textContent = state.mode === 0 ? '(blue-noise dither)' : '';
     const lab = document.getElementById('textAaLab');
-    if (lab) lab.classList.toggle('disabled', disabled);
-    if (disabled && els.textAa.checked) {
-      // keep the user's AA preference for when they switch back to 2-bit
-      els.textAa.dataset.aaPref = '1';
-      els.textAa.checked = false;
-    } else if (!disabled && els.textAa.dataset.aaPref === '1') {
-      els.textAa.checked = true;
-      els.textAa.dataset.aaPref = '';
-    }
+    if (lab) lab.classList.remove('disabled');
   }
 
   // ---- whole-book export (1 book → 1 device file) ----
@@ -942,6 +937,11 @@
               ' — re-renders every page with the current settings');
     els.exportStatus.textContent = 'exporting…';
     try {
+      // Push the spec first: the export must use exactly the switch positions on
+      // screen (in 1-bit the AA switch decides the blue-noise dither), and a knob
+      // changed inside the repaint-coalescing window would otherwise not have
+      // reached the engine yet. Idempotent and cheap.
+      await call('spec', { spec: readSpec() });
       const res = await call('exportBook', { mode, xtcz }, null, 600000);
       const u8 = new Uint8Array(res.file);
       const filename = exportFilename(xtcz);

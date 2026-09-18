@@ -78,7 +78,7 @@
         <span>Paragraph indent <i>들여쓰기</i></span>
       </label>
 
-      <label class="ctrl check" id="textAaLab" title="Smooth text edges via grey pixels. Only reachable in 2-bit XTCH files — a 1-bit XTC file carries the BW plane, which has no grey/AA">
+      <label class="ctrl check" id="textAaLab" title="2-bit XTCH: smooth text edges via grey pixels, exactly as the firmware does it (AA off renders text 1-bit). 1-bit XTC: no grey planes exist in the file, so this switch controls the blue-noise dither instead — on, grey levels are halftoned into the 1-bit plane; off, they are dropped to a hard threshold (crisper text, harsher photos)">
         <input type="checkbox" id="textAa" checked>
         <span>Text anti-aliasing <i>텍스트 안티앨리어싱</i> <em class="aaHint"></em></span>
       </label>
@@ -223,7 +223,7 @@ measured ≈ the KO default RIDIBatang's ink coverage. 400 = native face.">
       <div class="seg exportSeg" role="radiogroup" aria-label="Export mode / 출력 모드"
            title="Output depth — the preview re-renders to show exactly this">
         <button type="button" class="segBtn" data-value="0" role="radio" aria-checked="false"
-                title="Fast refresh — 1-bit XTC (XTC magic, XTG pages; BW plane + blue-noise dithered greys)">XTC 1-bit <i>fast</i></button>
+                title="Fast refresh — 1-bit XTC (XTC magic, XTG pages; BW plane, plus blue-noise dithered greys when text anti-aliasing is on)">XTC 1-bit <i>fast</i></button>
         <button type="button" class="segBtn active" data-value="1" role="radio" aria-checked="true"
                 title="High quality — 2-bit XTCH (XTCH magic, XTH pages; full AA greys)">XTCH 2-bit <i>HD</i></button>
       </div>

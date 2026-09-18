@@ -156,27 +156,36 @@ class EngineDriver {
     //     OR-ing the captured text bits in afterwards reproduces the three-pass
     //     planes for image pages too.
     //
+    // AA OFF is a separate, unchanged path (captureText is false): text is 1-bit,
+    // only images reach the gray planes. Gated against the pre-change engine:
+    // 0/2,034 pages differ with AA off, and 0/2,034 with AA on.
+    //
     // Measured on the 2,034-page Korean text book: renderPage 1,370 -> 892 ms
     // (-35%), total 1,521 -> 1,043 ms; 0/2,034 pages differ. Book-wide gates
     // (text book, image book, and real EPUBs) are recorded in the doc above.
     // ---------------------------------------------------------------------
     const bool textOnce = true;
+    // AA OFF means text is drawn in the BW pass only: the reference's gray passes
+    // render images and nothing else, so an AA-off page carries no text greys at
+    // all. The capture must be switched off together with it, or the composed gray
+    // planes would carry text greys that an AA-off page must not have.
+    const bool captureText = textOnce && aaOn;
 
-    if (textOnce) renderer_.beginLevelCapture();
+    if (captureText) renderer_.beginLevelCapture();
     renderPass(false);
-    if (textOnce) renderer_.endLevelCapture();
+    if (captureText) renderer_.endLevelCapture();
     out.bw.assign(display_.getFrameBuffer(), display_.getFrameBuffer() + 48000);
 
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     renderPass(textOnce ? true : !aaOn);
-    if (textOnce) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), true);
+    if (captureText) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), true);
     renderer_.copyGrayscaleLsbBuffers();
 
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
     renderPass(textOnce ? true : !aaOn);
-    if (textOnce) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), false);
+    if (captureText) renderer_.orCapturedGrayInto(display_.getFrameBuffer(), false);
     renderer_.copyGrayscaleMsbBuffers();
 
     renderer_.setRenderMode(GfxRenderer::BW);

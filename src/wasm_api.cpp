@@ -349,8 +349,15 @@ KO_EXPORT size_t ko_plane_size(int kind) {
 
 // Select container mode before export: 0 = 1-bit XTC ("XTC\0", XTG pages),
 // 1 = 2-bit XTCH ("XTCH", XTH pages). Mirrors the device file magics.
+// The text-AA switch is the control for the 1-bit blue-noise dither, so the same
+// spec drives the writer here and the mono preview in ko_compose_rgba - preview and
+// file stay in agreement by construction.
+static bool monoDitherEnabled() { return g_spec.textAntiAliasing != 0; }
+
 KO_EXPORT void ko_export_set_mode(int mode) {
-  if (g_xtch) g_xtch->setMode(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit);
+  if (!g_xtch) return;
+  g_xtch->setMode(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit);
+  g_xtch->setMonoGrayDither(monoDitherEnabled());
 }
 
 KO_EXPORT int ko_export_begin() {
@@ -372,6 +379,10 @@ KO_EXPORT int ko_export_begin() {
 // ranges from this return, so it must reflect real page count.
 KO_EXPORT int ko_export_spine(int spine) {
   if (!g_driver || !g_xtch) return -1;
+  // Re-assert the mode's dither flag here as well: the AA switch can be flipped
+  // between ko_export_set_mode() and the page loop, and this is the only place that
+  // is guaranteed to run for every exported page.
+  g_xtch->setMonoGrayDither(monoDitherEnabled());
   const int n = g_driver->buildSection(spine, g_spec);
   if (n < 0) return -1;
   const int before = g_totalPages;
@@ -550,12 +561,17 @@ KO_EXPORT uint8_t* ko_rgba_ptr() {
   return reinterpret_cast<uint8_t*>(g_rgbaOut.data());
 }
 
-// mono: 0 = 2-bit page (four shades), 1 = 1-bit page (BW plane only).
+// mono: 0 = 2-bit page (four shades), 1 = 1-bit page (the ink the XTG file carries,
+// with the blue-noise halftone applied when the text-AA switch is on).
 KO_EXPORT int ko_compose_rgba(int mono) {
   const uint8_t* bw = ko_plane_ptr(0);
   if (!bw) return -1;
-  const uint8_t* lsb = mono ? nullptr : ko_plane_ptr(1);
-  const uint8_t* msb = mono ? nullptr : ko_plane_ptr(2);
+  // A dithered 1-bit page is not a pure function of the BW plane: grey pixels become
+  // ink dots, so the preview needs the grey planes as well. With the dither off (AA
+  // off) the planes are not read at all - that is the hard-threshold page.
+  const bool dither = mono && monoDitherEnabled();
+  const uint8_t* lsb = (mono && !dither) ? nullptr : ko_plane_ptr(1);
+  const uint8_t* msb = (mono && !dither) ? nullptr : ko_plane_ptr(2);
   if (g_rgbaOut.size() != 480u * 800u) g_rgbaOut.assign(480u * 800u, 0);
   uint32_t* out = g_rgbaOut.data();
 
@@ -563,6 +579,10 @@ KO_EXPORT int ko_compose_rgba(int mono) {
   static constexpr uint32_t kMono32[2] = {0xFF000000u, 0xFFFFFFFFu};  // indexed by plane bit
   static constexpr uint8_t kLevelByMask[4] = {3, 2, 1, 1};
   const int colBytes = 100;  // physical row width in bytes
+  // Same blue-noise masks the XTG writer inks with (ko::monoNoiseMasks): layer 0 =
+  // dark grey v=1, layer 1 = light grey v=2, layer 2 = black v=3. Sharing the table
+  // is what makes the 1-bit preview pixel-exact against the exported file.
+  const MonoNoiseMasks& nm = monoNoiseMasks();
 
   for (int c = 0; c < colBytes; ++c) {
     for (int phyY = 0; phyY < 480; ++phyY) {
@@ -577,8 +597,30 @@ KO_EXPORT int ko_compose_rgba(int mono) {
       // The c * 8 * kW offset is essential: eight consecutive logical rows start at row c*8.
       uint32_t* dst = out + static_cast<size_t>(c) * 8 * 480 + x;
       if (mono) {
+        const int k = x >> 3;
+        const int jshift = 7 - (x & 7);  // the pixel's bit position inside a mask byte
         for (int b = 0; b < 8; ++b, dst += 480) {
-          dst[0] = kMono32[(bwByte >> (7 - b)) & 1];
+          if (!dither) {
+            dst[0] = kMono32[(bwByte >> (7 - b)) & 1];
+            continue;
+          }
+          // Mirror of addMonoPage. NOTE the two different bit layouts: a plane byte
+          // holds this pixel at bit (7 - (y & 7)) = (7 - b), while the mask byte holds
+          // it at bit (7 - (x & 7)) = jshift, because the writer transposes the plane
+          // bytes into the mask's layout before ANDing. So the level's mask bit must be
+          // selected per pixel, not ANDed byte-wise.
+          int ink = ((bwByte >> (7 - b)) & 1) ^ 1;  // bw bit 0 = ink
+          if (ink) {
+            const int pshift = 7 - b;
+            const uint8_t l = (lsbByte >> pshift) & 1;
+            const uint8_t m = (msbByte >> pshift) & 1;
+            // Mutually exclusive: lsb set = dark grey (layer 0, density 235), only msb
+            // set = light grey (layer 1, 170), neither = black (layer 2, 255).
+            const uint8_t yc = static_cast<uint8_t>((c * 8 + b) & 63);
+            const uint8_t maskByte = nm.m[l ? 0 : (m ? 1 : 2)][yc][k];
+            ink = (maskByte >> jshift) & 1;
+          }
+          dst[0] = ink ? kMono32[0] : kMono32[1];
         }
       } else {
         for (int b = 0; b < 8; ++b, dst += 480) {
