@@ -31,6 +31,7 @@
 #include "ko_engine_driver.h"
 #include "external_font_loader.h"   // §6: lossless EPD2 built-in font blobs
 #include "xtch_writer.h"
+#include "xtch_chapters.h"
 
 // Global instances (module-lifetime)
 static HalDisplay* g_display = nullptr;
@@ -565,39 +566,178 @@ KO_EXPORT int ko_export_spine(int spine) {
 // Chapters are assembled from the EPUB TOC (device-true chapter list, official
 // converter caps at 100 entries, end page = next chapter start − 1). Books
 // without a usable TOC fall back to per-spine chapters.
+
 KO_EXPORT int ko_export_finish() {
   if (!g_xtch) return -1;
-  g_chapters.clear();
-  const uint32_t lastPage = g_totalPages > 0 ? static_cast<uint32_t>(g_totalPages) - 1 : 0;
-
-  // Keep the first 100 TOC entries in TOC order (official MAX_TOC_EXPORT),
-  // then sort by page so chapter ranges are monotone, dropping same-page
-  // duplicates (a sub-entry that aliases its parent's heading).
-  std::vector<ko::ChapterCandidate> cand = g_chapterCandidates;
-  if (cand.size() > 100) cand.resize(100);
-  std::stable_sort(cand.begin(), cand.end(),
-                   [](const ko::ChapterCandidate& a, const ko::ChapterCandidate& b) {
-                     return a.page < b.page;
-                   });
-  std::vector<ko::ChapterCandidate> uniq;
-  for (const auto& c : cand) {
-    if (uniq.empty() || uniq.back().page != c.page) uniq.push_back(c);
-  }
-
-  if (!uniq.empty()) {
-    for (size_t i = 0; i < uniq.size(); i++) {
-      ko::XtchChapter ch;
-      ch.name = uniq[i].title.empty() ? ("Chapter " + std::to_string(i + 1)) : uniq[i].title;
-      ch.startPage = uniq[i].page;
-      ch.endPage = (i + 1 < uniq.size()) ? uniq[i + 1].page - 1 : lastPage;
-      if (ch.endPage < ch.startPage) ch.endPage = ch.startPage;
-      if (ch.startPage <= lastPage) g_chapters.push_back(ch);
-    }
-  } else if (!g_spineFallback.empty()) {
-    g_chapters = g_spineFallback;
-  }
+  g_chapters = buildChapters(g_chapterCandidates, g_spineFallback,
+                             static_cast<uint32_t>(g_totalPages));
   g_xtchOut = g_xtch->finish(g_chapters);
   g_xtchFullReady = 1;
+  return g_totalPages;
+}
+
+
+// ---- spine pool: per-spine encoded results ----------------------------------
+//
+// A spine can be laid out, rendered and ENCODED on its own, and its page records appended to the
+// container later in spine order by a single assembler. Nothing here re-implements page encoding:
+// each spine uses the same ko::XtchWriter the serial path uses, and the assembler appends those
+// records verbatim. Rendering is ~85% of export time and it is per-spine work, so this is the unit
+// worth parallelising; the container is not, which is why assembly stays centralised.
+namespace {
+struct SpineTocEntry {
+  int tocIndex = 0;
+  int localPage = 0;
+  std::string title;
+};
+struct EncodedSpine {
+  std::vector<std::vector<uint8_t>> pages;   // encoded records, page order
+  std::vector<uint8_t> flat;                 // the same records concatenated: one transfer to JS
+  std::vector<uint32_t> offsets, lengths;    // into flat
+  std::vector<SpineTocEntry> toc;            // anchors resolved while the section was still built
+  std::string fallbackName;
+  std::string titleBuf;                      // stable storage for the const char* accessors
+  int count() const { return static_cast<int>(pages.size()); }
+  void reset() { pages.clear(); flat.clear(); offsets.clear(); lengths.clear(); toc.clear();
+                 fallbackName.clear(); titleBuf.clear(); }
+};
+}  // namespace
+
+static EncodedSpine g_enc;
+static std::unique_ptr<ko::XtchWriter> g_asm;          // the assembler's writer
+static std::vector<ko::ChapterCandidate> g_asmCandidates;
+static std::vector<ko::XtchChapter> g_asmFallback;
+
+// Layout+render+encode one spine into g_enc. Returns the page count, or -1.
+KO_EXPORT int ko_encode_spine(int spine) {
+  if (!g_driver || !g_xtch) return -1;
+  g_enc.reset();
+  // A local writer: a worker's spine must not touch any shared writer state.
+  ko::XtchWriter w(g_xtch->mode());
+  w.setTextAa(textAaEnabled());
+  const int n = g_driver->buildSection(spine, g_spec);
+  if (n < 0) return -1;
+  int rendered = 0;
+  for (int p = 0; p < n; p++) {
+    ko::RenderedPage rp;
+    if (!g_driver->renderPage(p, g_spec, rp)) continue;
+    w.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
+    rendered++;
+  }
+  const int pages = static_cast<int>(w.pageCount());
+  if (pages != rendered) {
+    // The serial path counts a page for every successful render and trusts the writer to have made
+    // the same number of records. If those disagree the container would already be malformed, so
+    // fail loudly here rather than assemble a file whose index disagrees with its records.
+    return -1;
+  }
+  // Move the records into g_enc and build the transferable layout.
+  size_t total = 0;
+  for (size_t i = 0; i < static_cast<size_t>(pages); i++) total += w.page(i).size();
+  g_enc.flat.reserve(total);
+  for (size_t i = 0; i < static_cast<size_t>(pages); i++) {
+    const std::vector<uint8_t>& rec = w.page(i);
+    g_enc.offsets.push_back(static_cast<uint32_t>(g_enc.flat.size()));
+    g_enc.lengths.push_back(static_cast<uint32_t>(rec.size()));
+    g_enc.flat.insert(g_enc.flat.end(), rec.begin(), rec.end());
+  }
+  // TOC anchors, resolved while this spine's section is still the built one.
+  const int tocN = g_driver->tocCount();
+  for (int t = 0; t < tocN; t++) {
+    if (g_driver->tocSpine(t) != spine) continue;
+    const std::string anchor = g_driver->tocAnchor(t);
+    int local = anchor.empty() ? -1 : g_driver->anchorLocalPage(anchor);
+    if (local < 0 || local >= pages) local = 0;      // out-of-range anchors start the spine, as serial does
+    SpineTocEntry e;
+    e.tocIndex = t;
+    e.localPage = local;
+    e.title = g_driver->tocTitle(t);
+    g_enc.toc.push_back(e);
+  }
+  // Fallback chapter name, only used when the book has no usable TOC.
+  {
+    std::string href = g_driver->spineHref(spine);
+    const size_t slash = href.find_last_of('/');
+    if (slash != std::string::npos) href = href.substr(slash + 1);
+    const size_t dot = href.find_last_of('.');
+    if (dot != std::string::npos) href = href.substr(0, dot);
+    g_enc.fallbackName = href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href;
+  }
+  return pages;
+}
+
+KO_EXPORT int ko_spine_page_count() { return g_enc.count(); }
+KO_EXPORT const uint8_t* ko_spine_data_ptr() { return g_enc.flat.empty() ? nullptr : g_enc.flat.data(); }
+KO_EXPORT size_t ko_spine_data_size() { return g_enc.flat.size(); }
+KO_EXPORT const uint32_t* ko_spine_page_offsets() { return g_enc.offsets.empty() ? nullptr : g_enc.offsets.data(); }
+KO_EXPORT const uint32_t* ko_spine_page_lengths() { return g_enc.lengths.empty() ? nullptr : g_enc.lengths.data(); }
+KO_EXPORT int ko_spine_toc_count() { return static_cast<int>(g_enc.toc.size()); }
+KO_EXPORT int ko_spine_toc_index(int i) {
+  return (i >= 0 && i < static_cast<int>(g_enc.toc.size())) ? g_enc.toc[i].tocIndex : -1;
+}
+KO_EXPORT int ko_spine_toc_local_page(int i) {
+  return (i >= 0 && i < static_cast<int>(g_enc.toc.size())) ? g_enc.toc[i].localPage : -1;
+}
+KO_EXPORT const char* ko_spine_toc_title(int i) {
+  return (i >= 0 && i < static_cast<int>(g_enc.toc.size())) ? g_enc.toc[i].title.c_str() : "";
+}
+KO_EXPORT const char* ko_spine_fallback_name() { return g_enc.fallbackName.c_str(); }
+
+// ---- spine pool: centralised assembly ---------------------------------------
+// Workers hand back page records; ONE assembler appends them in spine order and writes the container.
+// Chapter candidates are added in SPINE order, and within a spine in TOC order, because that is the
+// order the serial path accumulates them in — the shared buildChapters() then caps and stable-sorts
+// exactly as before. Assembly order must not depend on which worker finished first.
+KO_EXPORT int ko_assemble_begin(int mode) {
+  if (!g_xtch) return -1;
+  g_asm.reset(new ko::XtchWriter(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit));
+  g_asm->setTextAa(textAaEnabled());
+  g_asm->adoptMetadataFrom(*g_xtch);      // the header carries the book's title/author
+  g_asmCandidates.clear();
+  g_asmFallback.clear();
+  return 0;
+}
+
+// Append one spine's page records (flat buffer + per-page offsets/lengths).
+KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCount,
+                                    const uint32_t* offsets, const uint32_t* lengths) {
+  if (!g_asm) return -1;
+  if (pageCount <= 0) return static_cast<int>(g_asm->pageCount());
+  if (data == nullptr || offsets == nullptr || lengths == nullptr) return -1;
+  for (int i = 0; i < pageCount; i++) {
+    const uint64_t off = offsets[i];
+    const uint64_t len = lengths[i];
+    if (off + len > size) return -1;              // a truncated record must never be assembled
+    if (!g_asm->addRawPage(data + off, static_cast<size_t>(len))) return -1;
+  }
+  return static_cast<int>(g_asm->pageCount());
+}
+
+// One TOC anchor for a spine. spineBase is the spine's first global page.
+KO_EXPORT void ko_assemble_add_toc(int spineBase, const char* title, int localPage) {
+  ko::ChapterCandidate c;
+  c.title = title ? title : "";
+  c.page = static_cast<uint32_t>(spineBase + (localPage < 0 ? 0 : localPage));
+  g_asmCandidates.push_back(c);
+}
+
+// The per-spine fallback chapter, used only when the book has no usable TOC.
+KO_EXPORT void ko_assemble_add_fallback(int spineBase, const char* name, int pages) {
+  if (pages <= 0) return;
+  ko::XtchChapter ch;
+  ch.name = name ? name : "";
+  ch.startPage = static_cast<uint16_t>(spineBase);
+  ch.endPage = static_cast<uint16_t>(spineBase + pages - 1);
+  g_asmFallback.push_back(ch);
+}
+
+KO_EXPORT int ko_assemble_finish() {
+  if (!g_asm) return -1;
+  const uint32_t total = static_cast<uint32_t>(g_asm->pageCount());
+  g_chapters = buildChapters(g_asmCandidates, g_asmFallback, total);
+  g_xtchOut = g_asm->finish(g_chapters);
+  g_xtchFullReady = 1;
+  g_totalPages = static_cast<int>(total);   // the container is now the assembler's
   return g_totalPages;
 }
 

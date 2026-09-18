@@ -296,6 +296,34 @@ class XtchWriter {
 
  public:
   // Finalize container bytes: 56B header + 256B metadata + chapters + index + data
+  // ---- pooling support -------------------------------------------------------
+  // A spine is the unit of parallel work. Workers encode spines into page records; ONE assembler
+  // appends those records in spine order and writes the container. Nothing here re-encodes a page:
+  // addRawPage takes the bytes the same proven encoder produced, and takePagesFrom moves them.
+  const std::vector<uint8_t>& page(size_t i) const { return pendingPages_[i]; }
+
+  // Append an already-encoded page record verbatim.
+  bool addRawPage(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 22) return false;   // every record carries its 22-byte header
+    pendingPages_.emplace_back(data, data + size);
+    return true;
+  }
+
+  // Move every page out of another writer into this one, preserving order.
+  void takePagesFrom(XtchWriter& other) {
+    for (auto& p : other.pendingPages_) pendingPages_.push_back(std::move(p));
+    other.pendingPages_.clear();
+  }
+
+  void clearPages() { std::vector<std::vector<uint8_t>>().swap(pendingPages_); }
+
+  // The container header carries the book's metadata, so an assembler writer — constructed fresh, with
+  // no book of its own — has to adopt it from the engine's writer or the file loses its title.
+  void adoptMetadataFrom(const XtchWriter& other) {
+    title_ = other.title_; author_ = other.author_;
+    publisher_ = other.publisher_; language_ = other.language_;
+  }
+
   std::vector<uint8_t> finish(const std::vector<XtchChapter>& chapters) {
     const size_t pageCount = pendingPages_.size();
     const size_t chapterCount = chapters.size();

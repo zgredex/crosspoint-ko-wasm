@@ -17,6 +17,7 @@
 #include "ko_engine_driver.h"
 #include "external_font_loader.h"   // §7 gate: register KoPub from an EPD2 blob
 #include "xtch_writer.h"
+#include "xtch_chapters.h"
 
 // Phase profiling: where does whole-book conversion actually spend its time?
 // Layout (parse + paginate) and rasterize (glyphs + quantize) have completely
@@ -224,8 +225,30 @@ int main(int argc, char** argv) {
   std::vector<ko::ManifestPage> manifestPages;
   const bool dumpPlanes = !planesDir.empty();
   if (dumpPlanes) mkdir(planesDir.c_str(), 0755);
+  // --pool: the reference implementation of the JS pool coordinator, in one process. Each spine is
+  // laid out, rendered and encoded on its own into a LOCAL writer; page records are then appended to
+  // an assembler in spine order and the container is written once. Comparing this against the serial
+  // run is the whole point: same page records, same chapter logic (src/xtch_chapters.h), same bytes.
+  const bool pooled = [] (int argc, char** argv) {
+    for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--pool") return true;
+    return false;
+  } (argc, argv);
+
+  std::vector<uint8_t> out_override;   // pooled assembly, when --pool
+  std::vector<ko::ChapterCandidate> tocCandidates;
+  std::vector<ko::XtchChapter> spineFallback;
   std::vector<double> spineMs;
   std::vector<int> spinePages;
+  struct PoolSpine {
+    std::vector<uint8_t> flat;
+    std::vector<uint32_t> off, len;
+    struct Anchor { std::string title; int localPage; };
+    std::vector<Anchor> toc;
+    std::string fallback;
+    int pages = 0;
+  };
+  std::vector<PoolSpine> pool;
+
   for (int spine = 0; spine < spineCount; spine++) {
     const auto tSpine0 = Clock::now();
     auto t0 = Clock::now();
@@ -233,6 +256,9 @@ int main(int argc, char** argv) {
     tBuild += msSince(t0);
     if (n < 0) { fprintf(stderr, "spine %d: build failed\n", spine); continue; }
     fprintf(stderr, "spine %d/%d: %d pages\n", spine, spineCount, n);
+    PoolSpine ps;                       // only filled when --pool
+    ko::XtchWriter local(writer.mode());
+    local.setTextAa(spec.textAntiAliasing != 0);
     for (int p = 0; p < n; p++) {
       if (maxPages >= 0 && p >= maxPages) break;
       ko::RenderedPage rp;
@@ -247,6 +273,7 @@ int main(int argc, char** argv) {
       t0 = Clock::now();
       writer.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
       tWrite += msSince(t0);
+      if (pooled) local.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
       if (dumpPlanes) {
         char base[512];
         snprintf(base, sizeof(base), "%s/p%05d_%05d", planesDir.c_str(), spine, p);
@@ -258,12 +285,57 @@ int main(int argc, char** argv) {
       if (totalPages % 25 == 0) fprintf(stderr, "  ...%d\n", totalPages);
     }
     if (n > 0) {
+      // Candidates in SPINE order, then TOC order within the spine — the order the product's export
+      // accumulates them in, and the order the pooled assembler must reproduce.
+      for (int t = 0; t < driver.tocCount(); t++) {
+        if (driver.tocSpine(t) != spine) continue;
+        const std::string anchor = driver.tocAnchor(t);
+        int local_ = anchor.empty() ? -1 : driver.anchorLocalPage(anchor);
+        if (local_ < 0 || local_ >= n) local_ = 0;
+        tocCandidates.push_back({driver.tocTitle(t),
+                                 static_cast<uint32_t>(chapterStart + local_)});
+      }
+      std::string href = driver.spineHref(spine);
+      const size_t slash = href.find_last_of('/');
+      if (slash != std::string::npos) href = href.substr(slash + 1);
+      const size_t dot = href.find_last_of('.');
+      if (dot != std::string::npos) href = href.substr(0, dot);
       ko::XtchChapter ch;
-      ch.name = "Chapter " + std::to_string(spine + 1);
+      ch.name = href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href;
       ch.startPage = static_cast<uint16_t>(chapterStart);
       ch.endPage = static_cast<uint16_t>(chapterStart + n - 1);
-      chapters.push_back(ch);
+      spineFallback.push_back(ch);
       chapterStart += n;
+    }
+    if (pooled) {
+      const int made = static_cast<int>(local.pageCount());
+      if (made != n - (maxPages >= 0 && n > maxPages ? n - maxPages : 0) && maxPages < 0) {
+        fprintf(stderr, "pool: spine %d encoded %d pages but rendered %d\n", spine, made, n);
+      }
+      ps.pages = made;
+      for (int i = 0; i < made; i++) {
+        const std::vector<uint8_t>& rec = local.page(static_cast<size_t>(i));
+        ps.off.push_back(static_cast<uint32_t>(ps.flat.size()));
+        ps.len.push_back(static_cast<uint32_t>(rec.size()));
+        ps.flat.insert(ps.flat.end(), rec.begin(), rec.end());
+      }
+      // anchors, resolved while this spine's section is the built one
+      for (int t = 0; t < driver.tocCount(); t++) {
+        if (driver.tocSpine(t) != spine) continue;
+        const std::string anchor = driver.tocAnchor(t);
+        int local_ = anchor.empty() ? -1 : driver.anchorLocalPage(anchor);
+        if (local_ < 0 || local_ >= made) local_ = 0;
+        ps.toc.push_back({driver.tocTitle(t), local_});
+      }
+      {   // fallback name, exactly as the serial path derives it
+        std::string href = driver.spineHref(spine);
+        const size_t slash = href.find_last_of('/');
+        if (slash != std::string::npos) href = href.substr(slash + 1);
+        const size_t dot = href.find_last_of('.');
+        if (dot != std::string::npos) href = href.substr(0, dot);
+        ps.fallback = href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href;
+      }
+      pool.push_back(std::move(ps));
     }
     spineMs.push_back(msSince(tSpine0));
     spinePages.push_back(n);
@@ -305,7 +377,43 @@ int main(int argc, char** argv) {
           totalPages ? (tBuild + tRender + tWrite) / totalPages : 0.0);
 
   auto tFin0 = Clock::now();
-  std::vector<uint8_t> out = writer.finish(chapters);
+  // Pooled: assemble from the per-spine records. The chapter logic is the SHARED buildChapters() the
+  // serial finalizer uses, and candidates are added in spine order — worker completion order must not
+  // reach this code, which in the host means plain spine order.
+  if (pooled) {
+    ko::XtchWriter asmW(writer.mode());
+    asmW.setTextAa(spec.textAntiAliasing != 0);
+    asmW.adoptMetadataFrom(writer);
+    std::vector<ko::ChapterCandidate> cands;
+    std::vector<ko::XtchChapter> fallback;
+    int base = 0;
+    for (const PoolSpine& ps : pool) {
+      if (ps.pages <= 0) continue;
+      for (int i = 0; i < ps.pages; i++) {
+        if (!asmW.addRawPage(ps.flat.data() + ps.off[static_cast<size_t>(i)], ps.len[static_cast<size_t>(i)])) {
+          fprintf(stderr, "pool: refused page %d of the spine at base %d\n", i, base);
+          return 1;
+        }
+      }
+      for (const PoolSpine::Anchor& a : ps.toc) cands.push_back({a.title, static_cast<uint32_t>(base + a.localPage)});
+      ko::XtchChapter ch;
+      ch.name = ps.fallback;
+      ch.startPage = static_cast<uint16_t>(base);
+      ch.endPage = static_cast<uint16_t>(base + ps.pages - 1);
+      fallback.push_back(ch);
+      base += ps.pages;
+    }
+    const uint32_t total = static_cast<uint32_t>(asmW.pageCount());
+    std::vector<ko::XtchChapter> asmChapters = ko::buildChapters(cands, fallback, total);
+    std::vector<uint8_t> pooledOut = asmW.finish(asmChapters);
+    fprintf(stderr, "POOL     %d spines, %u pages assembled, %zu chapters\n",
+            static_cast<int>(pool.size()), total, asmChapters.size());
+    out_override = std::move(pooledOut);
+  }
+
+  // One chapter table for both paths: the shared builder, fed in spine order.
+  chapters = ko::buildChapters(tocCandidates, spineFallback, static_cast<uint32_t>(totalPages));
+  std::vector<uint8_t> out = out_override.empty() ? writer.finish(chapters) : std::move(out_override);
   const double tFinish = msSince(tFin0);
   FILE* o = fopen(outPath.c_str(), "wb");
   if (!o) { fprintf(stderr, "cannot write %s\n", outPath.c_str()); return 1; }
