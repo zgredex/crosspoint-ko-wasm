@@ -89,6 +89,19 @@ def check_blob_encoding(face, path):
     return []
 
 
+PAGES_FILE_LIMIT = 25 * 1024 * 1024   # Cloudflare Pages rejects any single file above 25 MiB
+
+
+def oversized(dist):
+    bad = []
+    for root, _dirs, files in os.walk(dist):
+        for f in files:
+            p = os.path.join(root, f)
+            if os.path.getsize(p) > PAGES_FILE_LIMIT:
+                bad.append((os.path.relpath(p, dist), os.path.getsize(p)))
+    return bad
+
+
 def main(argv):
     if '--' not in argv:
         print(__doc__)
@@ -99,6 +112,12 @@ def main(argv):
     external = argv[cut + 1:]
 
     problems = check(dist, embedded, external)
+    # A file the host will not accept must fail here, not at the edge during a deploy: Cloudflare
+    # Pages rejects any single file above 25 MiB, and an oversized fixture in web/ reached it once
+    # ("Pages only supports files up to 25 MiB in size: demo-large.epub is 80 MiB") after every local
+    # check had passed, because nothing local knew about the host's limit.
+    for name, size in oversized(dist):
+        problems.append(f'{name} is {size / 1048576:.1f} MiB, above the host limit of 25 MiB')
     if problems:
         print('FAIL: the package does not describe itself consistently:', file=sys.stderr)
         for p in problems:

@@ -60,6 +60,7 @@ mkdir -p "$OUT"
 
 rsync -a \
   --exclude 'demo.epub' \
+  --exclude 'demo-large.epub' \
   --exclude '.DS_Store' \
   --exclude '.*' \
   --exclude 'ko_xtch_wasm.js' \
