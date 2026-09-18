@@ -371,7 +371,12 @@ class XtchWriter {
     return out;
   }
 
-  void reset() { pendingPages_.clear(); }
+  // §4 of the 1.2 audit: clear() destroys the page vectors but the OUTER vector keeps its
+  // allocation, so a cancelled export of a big book could stay resident at ~100 MB. swap() hands the
+  // allocation back to the allocator immediately.
+  void reset() {
+    std::vector<std::vector<uint8_t>>().swap(pendingPages_);
+  }
   size_t pageCount() const { return pendingPages_.size(); }
 
  private:

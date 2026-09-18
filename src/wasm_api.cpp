@@ -550,6 +550,20 @@ KO_EXPORT void ko_xtch_release() {
   g_xtchFullReady = 0;
 }
 
+// Abort an export in progress: drop the partially accumulated container AND the page buffers the
+// writer is holding, so a cancelled warm/export releases its wasm heap now instead of waiting for the
+// next ko_export_begin(). §3 of the 1.2 audit. Safe to call anytime (the next begin() re-inits).
+KO_EXPORT void ko_export_abort() {
+  if (g_xtch) g_xtch->reset();
+  g_chapters.clear();
+  g_spineFallback.clear();
+  g_chapterCandidates.clear();
+  g_totalPages = 0;
+  g_spinePageStart = 0;
+  g_xtchFullReady = 0;
+  ko_xtch_release();
+}
+
 // Preview compose: three packed 1-bpp planes -> 480x800 RGBA in ONE call, so the JS side
 // never touches a pixel. Byte-verified against the frozen JS implementation over identical
 // planes; scripts/preview-compose/compose_rgba.cpp holds the standalone, native-tested copy

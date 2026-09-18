@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=37');
+    const w = new Worker(base + 'ko.worker.js?v=38');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -644,6 +644,10 @@
 
   async function loadBook(buf, name) {
     renderToken++;                      // kill in-flight renders
+    // §2 of the 1.2 audit: cancel the warm BEFORE asking the engine to load. Cancelling afterwards
+    // left the warm free to resume between spines against a book that had already been replaced (the
+    // worker also waits for it to stop now, but the request must not be sent first either).
+    invalidateWarm();
     setStatus('EPUB 분석 중…');
     busy('EPUB 분석 중');
     try {
@@ -786,6 +790,16 @@
   // stale (worker aborts between spines) and will be re-fired after settling.
   let warmVersion = 0;
   let warmSettleTimer = null;
+  // §1 of the 1.2 audit: 'exporting' only guarded a few knob handlers in JS and disabled nothing, so
+  // the sidebar stayed fully operable during a foreground export. Disable the mutating controls for
+  // real. The worker enforces the same invariant independently — this is a courtesy, not the guarantee.
+  function setExportLocked(locked) {
+    exporting = locked;
+    document.querySelectorAll('#sidebar input, #sidebar select, #sidebar button, #bookChange')
+      .forEach((el) => { if (el !== els.downloadBtn) el.disabled = locked; });
+    els.downloadBtn.disabled = locked || !book;
+  }
+
   function scheduleWarm(delayMs) {
     if (!book || exporting) return;
     clearTimeout(warmSettleTimer);
@@ -1220,7 +1234,7 @@
     const key = outputKey();
     if (warmSpecKey === key) {
       // warm bytes match the current settings → instant, zero re-render
-      exporting = true;
+      setExportLocked(true);
       els.downloadBtn.disabled = true;
       try {
         const res = await call('fetchWarm', {}, null, 60000);
@@ -1237,12 +1251,12 @@
         els.exportStatus.textContent = '✗ 미리 변환본을 불러오지 못했습니다. 미리보기를 한 번 넘긴 뒤 다시 시도해 주세요.';
         setStatus('✗ 내보내기에 실패했습니다. 미리보기를 한 번 넘긴 뒤 다시 시도해 주세요.', true);
       } finally {
-        exporting = false;
+        setExportLocked(false);
         els.downloadBtn.disabled = !book;
       }
       return;
     }
-    exporting = true;
+    setExportLocked(true);
     els.downloadBtn.disabled = true;
     busy((mode === 0 ? 'XTC' : 'XTCH') + ' 생성 중 (책 전체)');
     const depthLabel = mode === 0 ? 'XTC 1-bit' : 'XTCH 2-bit';
@@ -1272,7 +1286,7 @@
       els.exportStatus.textContent = '✗ ' + describeError(e, '내보내기');
       setStatus('✗ ' + describeError(e, '내보내기'), true);
     } finally {
-      exporting = false;
+      setExportLocked(false);
       els.downloadBtn.disabled = !book;
       idle();
     }

@@ -113,6 +113,23 @@ let warmXtcz = false;
 let warmToken = 0;
 let warmRunning = false;
 
+// §1/§2 of the 1.2 audit: the worker yields between export spines, so another message can run while a
+// foreground export is mid-flight. A spec change there would produce ONE FILE containing TWO layouts
+// (and a book or font swap would be worse). The UI disable is a courtesy; this flag is the invariant.
+const MUTATING_COMMANDS = ['spec', 'load', 'loadFile', 'loadFont', 'clearFont', 'convertFont'];
+let foregroundExportRunning = false;
+
+// A background warm shares the engine and the C export buffer, so anything that replaces engine state
+// has to stop it and wait until it has actually stopped: bumping the token only asks it to abort at
+// its next spine yield, and the handler is suspended at that yield.
+async function stopWarmBeforeMutation() {
+  if (!warmRunning) return;
+  warmToken++;
+  let spins = 0;
+  while (warmRunning && spins++ < 4000) await new Promise((r) => setTimeout(r, 0));
+  dropWarmResult();
+}
+
 // per-command wall-clock timing (ms) — n = cumulative invocations
 let cmdTimes = {};
 function tick(cmd) {
@@ -227,7 +244,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '37';
+const FT_MODULE_VERSION = '38';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
@@ -390,7 +407,12 @@ async function exportWholeBook(opts, onProgress) {
     // of export work).
     COUNTERS.warmYields += 1;
     await yieldToLoop();
-    if (cancelCheck && cancelCheck()) return { cancelled: true, pages: total };
+    if (cancelCheck && cancelCheck()) {
+      // §3: release this export's accumulated pages NOW instead of at the next ko_export_begin()
+      api._ko_export_abort();
+      invalidateSectionTracking();
+      return { cancelled: true, pages: total };
+    }
     if (cooloff) {
       // and if the user just turned a page, keep standing aside until they are idle again — this is
       // speculative work, so interactive latency wins.
@@ -530,7 +552,12 @@ self.onmessage = async (ev) => {
       }
 
       case 'load': {
+        if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); break; }
         if (!api) await init();
+        // §2: stop the warm and WAIT for it before the engine's EPUB is replaced. Bumping the token
+        // alone only asks it to abort at its next spine yield, and the suspended warm handler would
+        // then resume its spine loop against the NEW book.
+        await stopWarmBeforeMutation();
         const epub = ev.data.epub;               // ArrayBuffer
         const bytes = new Uint8Array(epub);
         const bufPtr = api._malloc(bytes.length);
@@ -568,6 +595,7 @@ self.onmessage = async (ev) => {
       }
 
       case 'spec': {
+        if (foregroundExportRunning) { post(id, false, { error: 'settings locked during export' }); break; }
         tick('spec');
         markInteractive();
         // margins: viewable area + screenMargin on all four sides (no UI reserve)
@@ -605,7 +633,16 @@ self.onmessage = async (ev) => {
         // §2/§8: the spec travels with the render, so an ordinary page turn is one request and a
         // settings change is one request too. When it has not changed, this does nothing at all.
         let vpInfo = null;
-        if (ev.data.spec && applySpecIfChanged(ev.data.spec)) vpInfo = viewportInfo(currentSpec);
+        if (ev.data.spec) {
+          // §1: a render carrying a CHANGED spec mutates engine state, so it is refused during a
+          // foreground export. Navigation with an unchanged (or absent) spec stays fully allowed.
+          if (foregroundExportRunning &&
+              renderKey(currentSpec || {}) !== renderKey(Object.assign(defaultSpec(), ev.data.spec))) {
+            post(id, false, { error: 'settings locked during export' });
+            break;
+          }
+          if (applySpecIfChanged(ev.data.spec)) vpInfo = viewportInfo(currentSpec);
+        }
         const key = layoutKey(currentSpec || {});
         const wantMono = ev.data.mode === 0;   // 1-bit XTC preview (BW plane only)
         // rebuild if spine, LAYOUT, OR loaded font changed since the last build
@@ -690,6 +727,7 @@ self.onmessage = async (ev) => {
       }
 
       case 'convertFont': {
+        if (foregroundExportRunning) { post(id, false, { error: 'font locked during export' }); break; }
         // TTF/OTF -> .epdfont, in this worker. This is the ONLY conversion path on the
         // hosted build (no backend there), and app.js prefers it locally too: the font
         // bytes never leave the tab and a full Hangul font lands in ~150-400 ms.
@@ -723,6 +761,7 @@ self.onmessage = async (ev) => {
       }
 
       case 'loadFont': {
+        if (foregroundExportRunning) { post(id, false, { error: 'font locked during export' }); break; }
         // ev.data.epdfont: ArrayBuffer, ev.data.name: string
         tick('loadFont');
         customFontBytes = new Uint8Array(ev.data.epdfont);
@@ -743,6 +782,7 @@ self.onmessage = async (ev) => {
       }
 
       case 'clearFont': {
+        if (foregroundExportRunning) { post(id, false, { error: 'font locked during export' }); break; }
         customFontBytes = null;
         fontStamp++;
         clearFrameCache();    // §6: frames keyed by the old stamp can never hit again
@@ -826,6 +866,13 @@ self.onmessage = async (ev) => {
         // A background warm may be driving the engine: it shares the C export
         // buffer, so supersede it and wait for it to stop (it polls the token
         // between spines and aborts within a few yields).
+        if (foregroundExportRunning) {
+          post(id, false, { error: 'export already running' });
+          break;
+        }
+        // §1: from here to the finally, the engine state is frozen: any mutating command that arrives
+        // in a yield window is rejected rather than silently changing what the file contains.
+        foregroundExportRunning = true;
         if (warmRunning) {
           warmToken++;
           while (warmRunning) await new Promise((r) => setTimeout(r, 15));
@@ -841,9 +888,17 @@ self.onmessage = async (ev) => {
         api._ko_set_image_tone_depth(exportDepth);
         if (currentSpec) currentSpec.imageToneDepth = exportDepth;
         const opts = { xtcz: !!ev.data.xtcz };
-        const res = await exportWholeBook(opts, (spine, ofSpines, pages) => {
-          self.postMessage({ progress: true, spine, ofSpines, pages });
-        });
+        let res;
+        try {
+          res = await exportWholeBook(opts, (spine, ofSpines, pages) => {
+            self.postMessage({ progress: true, spine, ofSpines, pages });
+          });
+        } catch (e) {
+          api._ko_export_abort();     // §3: release partial pages on failure too
+          throw e;
+        } finally {
+          foregroundExportRunning = false;
+        }
         // the export loop built+rendered every spine through the engine, so
         // per-spine engine state is undefined afterwards — force a rebuild on
         // the next engine render (keeps page flips after export safe)
