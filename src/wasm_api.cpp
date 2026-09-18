@@ -591,15 +591,16 @@ struct SpineTocEntry {
   std::string title;
 };
 struct EncodedSpine {
-  std::vector<std::vector<uint8_t>> pages;   // encoded records, page order
-  std::vector<uint8_t> flat;                 // the same records concatenated: one transfer to JS
-  std::vector<uint32_t> offsets, lengths;    // into flat
+  // The records live in `flat` (what crosses to JS in one transfer) with `offsets`/`lengths` indexing
+  // it. There is deliberately no per-page vector here: an earlier version had one that the encode path
+  // never filled, which made count() — and so ko_spine_page_count() — report 0 while the real count sat
+  // in lengths. Deriving the count from lengths makes the accessor truthful by construction.
+  std::vector<uint8_t> flat;
+  std::vector<uint32_t> offsets, lengths;
   std::vector<SpineTocEntry> toc;            // anchors resolved while the section was still built
   std::string fallbackName;
-  std::string titleBuf;                      // stable storage for the const char* accessors
-  int count() const { return static_cast<int>(pages.size()); }
-  void reset() { pages.clear(); flat.clear(); offsets.clear(); lengths.clear(); toc.clear();
-                 fallbackName.clear(); titleBuf.clear(); }
+  int count() const { return static_cast<int>(lengths.size()); }
+  void reset() { flat.clear(); offsets.clear(); lengths.clear(); toc.clear(); fallbackName.clear(); }
 };
 }  // namespace
 
@@ -740,6 +741,72 @@ KO_EXPORT int ko_assemble_finish() {
   g_totalPages = static_cast<int>(total);   // the container is now the assembler's
   return g_totalPages;
 }
+
+
+// ---- spine pool: prefix-only assembly ---------------------------------------
+//
+// For an uncompressed container the page records do not need to pass through an engine at all. The
+// header, metadata, chapter table and page index are functions of the page SIZES and the chapters —
+// every index entry is (running offset, size, 480, 800) — so the pool can ask for the prefix alone and
+// the browser composes [prefix][records…] as a Blob.
+//
+// This removes the whole-container copies that the full assembler performs after encoding: 162 MB
+// transferred to an assembler, copied into its heap, copied into page vectors, copied again by
+// finish(), and copied back out to JS. What crosses now is the page SIZES and ~10 KB of prefix.
+// The format still has one implementation: buildPrefix() is the same code finish() uses.
+//
+// XTCZ (LZ4) deliberately keeps the full assembler: compression consumes the logical byte stream, so it
+// needs the bytes. Streaming XTZ4 over Blob parts is a later step, not this one.
+static std::vector<uint32_t> g_planSizes;
+static std::vector<ko::ChapterCandidate> g_planCandidates;
+static std::vector<ko::XtchChapter> g_planFallback;
+static std::vector<uint8_t> g_planPrefix;
+static int g_planMode = 1;
+
+KO_EXPORT int ko_plan_begin(int mode) {
+  g_planSizes.clear();
+  g_planCandidates.clear();
+  g_planFallback.clear();
+  g_planPrefix.clear();
+  g_planMode = mode;
+  return 0;
+}
+
+// One spine's page SIZES, in page order. Add spines in spine order.
+KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
+  if (count < 0 || (count > 0 && lengths == nullptr)) return -1;
+  for (int i = 0; i < count; i++) g_planSizes.push_back(lengths[i]);
+  return static_cast<int>(g_planSizes.size());
+}
+
+KO_EXPORT void ko_plan_add_toc(int spineBase, const char* title, int localPage) {
+  ko::ChapterCandidate c;
+  c.title = title ? title : "";
+  c.page = static_cast<uint32_t>(spineBase + (localPage < 0 ? 0 : localPage));
+  g_planCandidates.push_back(c);
+}
+
+KO_EXPORT void ko_plan_add_fallback(int spineBase, const char* name, int pages) {
+  if (pages <= 0) return;
+  ko::XtchChapter ch;
+  ch.name = name ? name : "";
+  ch.startPage = static_cast<uint16_t>(spineBase);
+  ch.endPage = static_cast<uint16_t>(spineBase + pages - 1);
+  g_planFallback.push_back(ch);
+}
+
+KO_EXPORT int ko_plan_finish() {
+  if (!g_xtch) return -1;
+  ko::XtchWriter w(g_planMode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit);
+  w.adoptMetadataFrom(*g_xtch);          // the header carries the book's title/author
+  const uint32_t total = static_cast<uint32_t>(g_planSizes.size());
+  g_chapters = ko::buildChapters(g_planCandidates, g_planFallback, total);
+  g_planPrefix = w.buildPrefix(g_chapters, g_planSizes);
+  return static_cast<int>(total);
+}
+
+KO_EXPORT const uint8_t* ko_plan_prefix_ptr() { return g_planPrefix.empty() ? nullptr : g_planPrefix.data(); }
+KO_EXPORT size_t ko_plan_prefix_size() { return g_planPrefix.size(); }
 
 // One-shot convenience: whole book in a single call (used by host/tests).
 KO_EXPORT int ko_render_xtch() {

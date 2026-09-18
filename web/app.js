@@ -59,7 +59,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=64');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=65');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -103,6 +103,10 @@
     // the export engine holds the same book and must go with it, or it would convert a book the reader
     // has already replaced
     killExportEngine();
+    // Release the previous pool NOW rather than at the next ensurePool(): that path only refused to
+    // REUSE a stale pool (bookEpoch is part of the identity), so eight engines each holding a 162 MB
+    // book — ~1.3 GB measured — stayed resident while the user read the replacement book.
+    killPool();
     killPool();                       // a new book invalidates every pooled engine's heap too
     // kill worker + reject in-flight calls so no promise hangs forever
     try { worker.terminate(); } catch (_) {}
@@ -199,7 +203,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=64');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=65');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -1513,6 +1517,15 @@
     return [bookEpoch, customFontAsset ? customFontAsset.generation : 0, engineCount].join(':');
   }
 
+  // The FOREGROUND decision, deliberately conservative: 4 measured best on the small book and within
+  // ~16% of 8 on the large one while costing half the resident memory. 8 stays opt-in until the
+  // memory table exists (docs/ko-spine-pool.md).
+  function chooseForegroundPoolSize() {
+    const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+    if (!book || book.spineCount < 4) return 1;         // too few spines to be worth a pool at all
+    return Math.min(4, Math.max(1, hw - 1), book.spineCount);
+  }
+
   function poolSize(spineCount) {
     const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
     // One engine fewer than the machine has, so the reader's own engine and the compositor keep a
@@ -1527,7 +1540,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=64');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=65');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };
@@ -1567,6 +1580,14 @@
         const bytes = customFontAsset.bytes.slice(0);
         await engine.call('loadFont', { epdfont: bytes, name: customFontAsset.name }, [bytes], 120000);
       }
+      // What this member costs resident: the wasm heap high-water mark and what HalStorage holds. The
+      // pool-size decision is a memory decision (4 vs 8 engines on the large book is ~0.65 GB vs
+      // ~1.3 GB), so the number has to be measured rather than assumed.
+      try {
+        const st = await engine.call('stats', {}, null, 30000);
+        engine.heapBytes = st.heapBytes || 0;
+        engine.storageBytes = st.storageBytes || 0;
+      } catch (_) { /* stats is diagnostic; a member that cannot report is still usable */ }
       return engine;
     })().catch((e) => { engine.kill('load failed'); throw e; });
     return engine;
@@ -1606,39 +1627,87 @@
     const results = new Array(spineCount);
     let next = 0;
     let done = 0;
+    let completedPages = 0;
     const pull = async (engine) => {
       for (;;) {
         const spine = next++;
         if (spine >= spineCount) return;
+        const tSpine = performance.now();
         const r = await engine.call('encodeSpine', { spine, spec, mode }, null, 300000);
+        // Measured HERE, at the dispatcher: a pooled result used to report ms: 0 for every spine, which
+        // threw away the distribution the sizing policy needs. The worker cannot time itself usefully —
+        // rAF and the RPC round trip sit outside its loop.
+        const ms = performance.now() - tSpine;
+        r.ms = ms;
         results[spine] = r;
         engine.spines++;
+        engine.busyMs = (engine.busyMs || 0) + ms;
         done++;
-        if (onProgress) onProgress(done, spineCount, r.pageCount);
+        completedPages += r.pageCount;
+        if (onProgress) onProgress(done, spineCount, completedPages, r.pageCount);
       }
     };
-    await Promise.all(engines.map(pull));
+    // item 3: a failed pooled transaction has no reusable state, and siblings can still be rendering
+    // spines the page has already given up on. Terminate all of them, not just the one that threw.
+    try {
+      await Promise.all(engines.map(pull));
+    } catch (e) {
+      killPool();
+      throw e;
+    }
     const encodeMs = performance.now() - t0;
 
-    // Central assembly, in SPINE order. One worker writes the container: page records are appended as
-    // encoded, and the chapter candidates go in the order the serial path accumulates them (spine, then
-    // TOC index), so the shared builder in the engine produces the same table either way.
+    // Central assembly, in SPINE order, and the chapter candidates go in the order the serial path
+    // accumulates them (spine, then TOC index) — worker completion order never reaches this code.
+    //
+    // Two strategies, because only one of them needs the bytes:
+    //   XTCZ      the LZ4 wrapper consumes the logical stream, so one assembler ingests the records.
+    //   ordinary  the container's fixed region is a function of the page SIZES, so ask for the prefix
+    //             (~10 KB) and compose [prefix][records…] as a Blob. Nothing copies 162 MB.
     const tAsm = performance.now();
-    const transfer = [];
-    for (const r of results) if (r && r.bytes) transfer.push(r.bytes);
-    const asm = await engines[0].call('assembleSpines',
-      { mode, xtcz, spines: results.map((r) => (r ? r : { pageCount: 0 })) }, transfer, 600000);
+    const spineMeta = results.map((r, i) => ({
+      spine: i,
+      pageCount: r ? r.pageCount : 0,
+      lengths: r ? r.lengths : [],
+      toc: r ? r.toc : [],
+      fallbackName: r ? r.fallbackName : '',
+    }));
+    let asm;
+    let file;
+    if (xtcz) {
+      const transfer = [];
+      for (const r of results) if (r && r.bytes) transfer.push(r.bytes);
+      asm = await engines[0].call('assembleSpines',
+        { mode, xtcz: true, spines: results.map((r) => (r ? r : { pageCount: 0 })) }, transfer, 600000);
+      asm.assembled = true;
+      file = asm.bytes;
+    } else {
+      asm = await engines[0].call('planPrefix', { mode, spines: spineMeta }, null, 600000);
+      asm.assembled = false;
+      const parts = [asm.prefix];
+      for (const r of results) if (r && r.bytes) parts.push(r.bytes);
+      file = new Blob(parts, { type: 'application/octet-stream' });
+    }
     const assembleMs = performance.now() - tAsm;
+    // Record buffers have been handed to the Blob (or transferred); holding them here would keep a
+    // second copy of every encoded page alive for the life of the page.
+    for (const r of results) if (r) r.bytes = null;
 
     return {
-      file: asm.bytes,
+      file,
       pages: asm.pages,
       xtcz: asm.xtcz,
       rawBytes: asm.rawBytes,
       mode,
       // Reported so the pool's cost is attributable: encode (the parallel part) vs assembly (serial).
-      pool: { engines: engines.length, encodeMs, assembleMs, recordBytes: asm.recordBytes },
-      spineTimes: results.map((r, i) => ({ spine: i, ms: 0 })),
+      pool: { engines: engines.length, encodeMs, assembleMs,
+              recordBytes: asm.recordBytes, bytes: (file.size !== undefined ? file.size : new Uint8Array(file).length),
+              heapBytes: engines.reduce((n, e) => n + (e.heapBytes || 0), 0),
+              storageBytes: engines.reduce((n, e) => n + (e.storageBytes || 0), 0),
+              maxSpineMs: Math.max(0, ...results.map((r) => (r && r.ms) || 0)),
+              spineMs: results.map((r) => (r && r.ms) || 0),
+              prefixBytes: asm.prefixBytes || 0, assembled: asm.assembled !== false },
+      spineTimes: results.map((r, spine) => ({ spine, ms: +((r && r.ms) || 0).toFixed(1), pages: (r && r.pageCount) || 0 })),
     };
   }
 
@@ -1697,7 +1766,38 @@
       } else {
         try { await exportLoaded; } catch (_) {}
       }
-      const res = await exportCall('exportBook', { spec: readSpec(), mode, xtcz }, null, 600000);
+      // No warm result exists (the branch above returns early when one does), so this is a real
+      // conversion now. Prefer the pool: it is measurably faster on every book shape measured, and it
+      // uses 4 engines rather than 8 because the deciding cost is memory, not CPU.
+      const poolEngines = chooseForegroundPoolSize();
+      let res;
+      if (poolEngines >= 2) {
+        // Stop the speculative serial warm first: it would otherwise compete with the pool for both CPU
+        // and RAM, which is exactly the resource the pool size was chosen to conserve.
+        killExportEngine();
+        warmSpecKey = null;
+        try {
+          res = await pooledExportBook(mode, xtcz, (doneSpines, totalSpines, pages) => {
+            els.exportProgress.textContent = '생성 중 ' + doneSpines + '/' + totalSpines +
+              ' (' + pages + '쪽 완료)…';
+            if (els.exportStatus.textContent !== '기기 파일 생성 중…') els.exportStatus.textContent = '기기 파일 생성 중…';
+          }, poolEngines);
+        } finally {
+          // Foreground pools are expensive and disposable. Setup is cheap relative to holding hundreds
+          // of MB (or >1 GB for 8 engines on the large book) resident with no guaranteed next use.
+          killPool();
+        }
+        if (!res) {                                   // the pool declined (too few spines): serial path
+          if (!exportLoaded) {
+            const src = currentBookBlob || currentBookFile || (els.file.files && els.file.files[0]) || null;
+            if (src) { try { await loadExportEngine(src); } catch (_) {} }
+          }
+          res = await exportCall('exportBook', { spec: readSpec(), mode, xtcz }, null, 600000);
+        }
+      } else {
+        const ser = await exportCall('exportBook', { spec: readSpec(), mode, xtcz }, null, 600000);
+        res = ser;
+      }
       // Export cost, on the page, for measurement: per-spine ms proves where the time goes and how
       // unevenly it is distributed, which is the input a spine pool needs.
       if (res && res.spineTimes) {
@@ -1714,12 +1814,18 @@
           preflight: res.preflight,
         };
       }
-      const u8 = new Uint8Array(res.file);
+      // res.file is an ArrayBuffer on the serial path and a Blob on the prefix-only pooled path.
+      const outBytes = (res.file instanceof Blob) ? res.file.size : new Uint8Array(res.file).byteLength;
       const filename = exportFilename(xtcz);
-      const ratio = xtcz && res.rawBytes ? ' (원본의 ' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '%)' : '';
+      const ratio = xtcz && res.rawBytes ? ' (원본의 ' + (100 * outBytes / res.rawBytes).toFixed(0) + '%)' : '';
       els.exportStatus.textContent = '✓ ' + filename + ' — ' + res.pages + '쪽, ' +
-        (u8.byteLength / 1048576).toFixed(1) + ' MB' + ratio;
-      saveBlob(u8, filename);
+        (outBytes / 1048576).toFixed(1) + ' MB' + ratio;
+      if (res.pool) {
+        // How the pool spent its time, for the sizing policy: encode is the parallel part, assembly is
+        // the serial floor, and the memory figures come from the members themselves.
+        window.__koPoolStats = res.pool;
+      }
+      saveBlob(res.file, filename);
       setStatus('✓ 내보내기 완료 — ' + filename);   // §4: otherwise desktop says "생성 중" forever
       // The export ran on its OWN engine: the preview's section_ and frame cache are untouched, so
       // there is nothing to refresh here.
@@ -1739,7 +1845,9 @@
     }
   }
   function saveBlob(u8, filename) {
-    const blob = new Blob([u8], { type: 'application/octet-stream' });
+    // A pooled uncompressed export hands over a Blob already composed of [prefix][records…]; the serial
+    // path hands over one ArrayBuffer. Both are downloadable without being concatenated first.
+    const blob = (u8 instanceof Blob) ? u8 : new Blob([u8], { type: 'application/octet-stream' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = filename;

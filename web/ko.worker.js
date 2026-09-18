@@ -1257,6 +1257,47 @@ function withCString(str, fn) {
         break;
       }
 
+      case 'planPrefix': {
+        // Prefix-only assembly: the records never enter an engine. The container's fixed region is a
+        // function of the page SIZES and the chapters, so this returns ~10 KB of header/metadata/
+        // chapter-table/index and the caller composes [prefix][records…] in the browser. Uncompressed
+        // XTC/XTCH only — XTCZ needs the byte stream, so it uses assembleSpines.
+        const mode = ev.data.mode === 0 ? 0 : 1;
+        if (api._ko_plan_begin(mode) < 0) { post(id, false, { error: 'plan begin failed' }); break; }
+        let base = 0;
+        let recordBytes = 0;
+        let bad = null;
+        for (const sp of (ev.data.spines || [])) {
+          const pages = sp.pageCount | 0;
+          if (pages <= 0) continue;                       // matches the serial path's `if (added > 0)`
+          const lengths = Uint32Array.from(sp.lengths || []);
+          if (lengths.length !== pages) { bad = 'spine ' + sp.spine + ': ' + lengths.length + ' lengths for ' + pages + ' pages'; break; }
+          const lptr = api._malloc(pages * 4);
+          try {
+            new Uint32Array(api.HEAPU8.buffer, lptr, pages).set(lengths);
+            if (api._ko_plan_add_spine(lptr, pages) < 0) { bad = 'plan add spine failed'; break; }
+          } finally {
+            api._free(lptr);
+          }
+          for (const t of (sp.toc || [])) {
+            withCString(t.title, (tp) => api._ko_plan_add_toc(base, tp, t.localPage | 0));
+          }
+          withCString(sp.fallbackName, (fp) => api._ko_plan_add_fallback(base, fp, pages));
+          for (let i = 0; i < pages; i++) recordBytes += lengths[i];
+          base += pages;
+        }
+        if (bad) { post(id, false, { error: bad }); break; }
+        const total = api._ko_plan_finish();
+        if (total < 0) { post(id, false, { error: 'plan finish failed' }); break; }
+        const pptr = api._ko_plan_prefix_ptr();
+        const psize = api._ko_plan_prefix_size();
+        const prefix = api.HEAPU8.slice(pptr, pptr + psize);
+        post(id, true, { pages: total, spinePages: base, prefix: prefix.buffer,
+                         prefixBytes: psize, recordBytes, rawBytes: psize + recordBytes },
+             [prefix.buffer]);
+        break;
+      }
+
       case 'assembleSpines': {
         // ONE assembler writes the container. The records arrive already encoded; this only appends
         // them in the order the caller sent (spine order) and builds the chapter table with the same
@@ -1300,12 +1341,16 @@ function withCString(str, fn) {
         if (bad) { post(id, false, { error: bad }); break; }
         const total = api._ko_assemble_finish();
         if (total < 0) { post(id, false, { error: 'assemble finish failed' }); break; }
+        // rawBytes is the UNCOMPRESSED container — header, metadata, chapters, index and records. It
+        // used to be the sum of the page records, which made the UI divide by a number that excluded
+        // everything but the records. recordBytes keeps the old figure as an assembly diagnostic.
+        const rawBytes = api._ko_xtch_size();
         if (ev.data.xtcz) api._ko_xtcz_wrap();
         const p2 = api._ko_xtch_ptr();
         const sz = api._ko_xtch_size();
         const out = api.HEAPU8.slice(p2, p2 + sz);
         post(id, true, { pages: total, spinePages: base, recordBytes: raw,
-                         xtcz: !!ev.data.xtcz, rawBytes: raw,
+                         xtcz: !!ev.data.xtcz, rawBytes,
                          bytes: out.buffer }, [out.buffer]);
         break;
       }

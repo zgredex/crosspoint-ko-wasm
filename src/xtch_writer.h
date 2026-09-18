@@ -324,22 +324,52 @@ class XtchWriter {
     publisher_ = other.publisher_; language_ = other.language_;
   }
 
-  std::vector<uint8_t> finish(const std::vector<XtchChapter>& chapters) {
-    const size_t pageCount = pendingPages_.size();
+  // The container's fixed-layout prefix: 56-byte header, 256-byte metadata, the chapter table, and the
+  // 16-byte-per-page index. Everything in it is a function of the page SIZES and the chapters — each
+  // index entry is (running offset, size, 480, 800) — so it can be produced without ever holding the
+  // page bytes. That is what lets the pool assemble a file as [prefix][records…] in the browser, with
+  // no whole-container copy after encoding. finish() below is this same code plus the records, so the
+  // format still has exactly one implementation.
+  std::vector<uint8_t> buildPrefix(const std::vector<XtchChapter>& chapters,
+                                   const std::vector<uint32_t>& pageSizes) const {
+    const size_t pageCount = pageSizes.size();
     const size_t chapterCount = chapters.size();
     const uint64_t metadataOffset = 56;
     const uint64_t chapterOffset = metadataOffset + 256;
     const uint64_t indexOffset = chapterOffset + chapterCount * 96;
-    // data area: 16B/page index then pages
-    uint64_t totalData = 0;
-    for (const auto& p : pendingPages_) totalData += p.size();
     const uint64_t dataOffset = indexOffset + pageCount * 16;
 
-    // Pre-reserve exact final size: avoids realloc doubling that can spike peak
-    // memory past the wasm heap on multi-hundred-MB books.
-    std::vector<uint8_t> out;
-    out.reserve(dataOffset + totalData);
-    out.resize(dataOffset, 0);
+    std::vector<uint8_t> out(static_cast<size_t>(dataOffset), 0);
+    writePrefix(out, chapters, pageSizes, metadataOffset, chapterOffset, indexOffset, dataOffset);
+    return out;
+  }
+
+  std::vector<uint8_t> finish(const std::vector<XtchChapter>& chapters) {
+    std::vector<uint32_t> sizes;
+    sizes.reserve(pendingPages_.size());
+    for (const auto& p : pendingPages_) sizes.push_back(static_cast<uint32_t>(p.size()));
+    // buildPrefix reserves the exact final size (it lays out the fixed region itself), so there is no
+    // separate reserve here to double the peak.
+    std::vector<uint8_t> out = buildPrefix(chapters, sizes);
+    const size_t pageCount = pendingPages_.size();
+
+    // --- data ---
+    // Memory-slim streaming: append each page then free its pending buffer, so peak usage stays ~= final
+    // file size instead of 2x (pendingPages + copy). The index entries were already written by
+    // buildPrefix from the sizes.
+    for (size_t i = 0; i < pageCount; i++) {
+      auto& page = pendingPages_[i];
+      out.insert(out.end(), page.begin(), page.end());
+      std::vector<uint8_t>().swap(page);  // release this page's heap now
+    }
+    return out;
+  }
+
+  void writePrefix(std::vector<uint8_t>& out, const std::vector<XtchChapter>& chapters,
+                   const std::vector<uint32_t>& pageSizes, uint64_t metadataOffset,
+                   uint64_t chapterOffset, uint64_t indexOffset, uint64_t dataOffset) const {
+    const size_t pageCount = pageSizes.size();
+    const size_t chapterCount = chapters.size();
     // --- header ---
     if (mode_ == XtcMode::Mono1Bit) {
       out[0] = 'X'; out[1] = 'T'; out[2] = 'C'; out[3] = 0;   // "XTC\0" 1-bit
@@ -386,18 +416,15 @@ class XtchWriter {
     // peak usage stays ~= final file size instead of 2x (pendingPages + copy).
     uint64_t cursor = dataOffset;
     for (size_t i = 0; i < pageCount; i++) {
-      auto& page = pendingPages_[i];
       const uint64_t e = indexOffset + i * 16;
       putU64(out, e + 0x00, cursor);
-      putU32(out, e + 0x08, static_cast<uint32_t>(page.size()));
+      putU32(out, e + 0x08, pageSizes[i]);
       putU16(out, e + 0x0C, 480);
       putU16(out, e + 0x0E, 800);
-      out.insert(out.end(), page.begin(), page.end());
-      cursor += page.size();
-      std::vector<uint8_t>().swap(page);  // release this page's heap now
+      cursor += pageSizes[i];
     }
-    return out;
   }
+
 
   // §4 of the 1.2 audit: clear() destroys the page vectors but the OUTER vector keeps its
   // allocation, so a cancelled export of a big book could stay resident at ~100 MB. swap() hands the

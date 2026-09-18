@@ -124,3 +124,97 @@ tried — passes on the broken build. The byte hash is the only check here that 
 The regression lives in `scripts/verify/split_engine_probe.js` (`poolFontProbe`) and was run against
 both builds: it passes with the fix and reports `B == A (stale pool reproduced)` without it. The static
 half (`scripts/verify/split_engine_gate.py`) fails by name on both removed lines.
+
+# Batch 2: memory, lifecycle, selection, and the assembly tail
+
+## The assembly tail was the right target
+
+After rendering is parallelised, assembly is the serial floor. The old path moved 162 MB through an
+engine and copied it four times (worker→page transfer, `HEAPU8.set` into the assembler heap, `addRawPage`
+into page vectors, `finish()`'s concatenation, then `HEAPU8.slice` back out). None of that is necessary
+for an uncompressed container: the header, metadata, chapter table and page index are functions of the
+page **sizes** — every index entry is `(running offset, size, 480, 800)`.
+
+So the pool now asks for the **prefix only** (`ko_plan_*`, ~33 KB on the 162 MB book) and composes
+`[prefix][records…]` as a Blob. The format still has one implementation: `buildPrefix()` is the code
+`finish()` calls, and `writePrefix()` is the single writer of the fixed region.
+
+`web/demo.epub`, 60 spines, 1,690 pages, 162,310,100 bytes, KoPub, XTCH — measured in the browser:
+
+| engines | encode ms | assembly ms | assembly method | total ms |
+|---:|---:|---:|---|---:|
+| 1 | 1,653 | 93 | full | 1,746 |
+| 2 | 897 | 36 | prefix | 965 |
+| 4 | 507 | 99 | full | 651 |
+| 4 | 568 | **50** | prefix | 697 |
+| 8 | 373 | 114 | full | 561 |
+| 8 | 367 | **20** | prefix | **502** |
+
+At matched engine counts assembly falls **99 → 50 ms** (4 engines) and **114 → 20 ms** (8 engines). The
+remaining cost is the Blob composition of the record buffers — one copy, off the wasm heap, instead of
+four. Per-spine `encode` figures vary by ±10% between runs on this machine; the assembly column is the
+load-bearing comparison because it is the same phase before and after the change.
+
+Output is unchanged: pooled with prefix assembly produces `60aa7b67441725d8ce33` / 162,310,100 bytes,
+identical to serial, to the full assembler and to the host CLI. `pool_gate.py --big` still passes.
+
+## Memory: measured, and my earlier estimate was wrong
+
+Each engine, after loading the 162 MB book and the KoPub face:
+
+```
+wasm heap      64 MB   (INITIAL_MEMORY=64MB, MAXIMUM_MEMORY=2048MB; this is the grown size)
+HalStorage     12 MB   (the parsed book structures — NOT the EPUB bytes)
+```
+
+So the real per-engine cost is ~76 MB, and 8 engines is **~610 MB**, not the ~1.3 GB I wrote in the
+previous batch's commit message. That estimate assumed each engine held a full copy of the EPUB in its
+heap; the high-water mark shows the raw bytes do not survive the parse. The pool is far cheaper than I
+claimed, which is why 8 engines on the large book works at all.
+
+`storageBytes` also settles what "engine state" means: the parsed book is 12 MB, the font is per-engine,
+and everything else is per-call.
+
+## Lifecycle
+
+* **A new book releases the pool immediately** (`loadBook`), not at the next `ensurePool()`. Identity
+  matching only refused to *reuse* a stale pool; the workers and their heaps stayed resident while the
+  user read the replacement book.
+* **A failed pooled transaction terminates every member**, not just the worker that threw. Siblings can
+  still be rendering spines the page has already given up on.
+* **Foreground pools are ephemeral** (`try/finally killPool()`). Setup is cheap next to holding hundreds
+  of MB resident with no guaranteed next use. A reuse TTL is possible later; obvious memory ownership
+  first.
+
+## Production policy shipped
+
+The serial background warm stays exactly as it was. That gives a clean split:
+
+```
+book open
+  -> one export engine warms quietly in the background
+if the warm finished:
+  -> export is instant (no pool at all)
+if export is requested before that:
+  -> 4-engine foreground pool
+     (killExportEngine() first: the speculative serial conversion would otherwise compete with the
+      pool for the CPU and RAM the size was chosen to conserve)
+```
+
+`chooseForegroundPoolSize()` returns `min(4, hw-1, spineCount)`, and 1 (serial) below 4 spines. **4 is
+the shipped size**: it measured best on the small book and within ~16% of 8 on the large one for half
+the memory. 8 stays reachable through the debug hook (`window.__pool.run(mode, xtcz, 8)`) until books
+are graduated individually.
+
+## Instrumentation fixed
+
+A pooled result used to report `ms: 0` for every spine — destroying exactly the distribution the sizing
+policy needs — and progress reported the most recent spine's page count where the serial path reports a
+running total. Both are measured at the dispatcher now (`r.ms`, `engine.busyMs`, cumulative pages), the
+pool's own heap/storage totals ride along in `window.__koPoolStats`, and `assembleSpines` returns
+`rawBytes` as the whole uncompressed container rather than the sum of the page records (the UI divides
+by it to report a compression ratio).
+
+`EncodedSpine::pages` was dead state that the encode path never filled, which made
+`ko_spine_page_count()` report 0 while the real count sat in `lengths`. Removed; the count derives from
+`lengths`, so the accessor is truthful by construction.
