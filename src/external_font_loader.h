@@ -32,6 +32,12 @@ struct ExternalBuiltinFont {
 
   EpdFontData data{};
 
+  // Carried from the header's kExternalFontFlagTwoBit. It is a member rather than a constant
+  // because wireData() runs after parsing and must publish the value the BLOB declares, not the
+  // value this translation unit happens to assume: the format is meant to hold 1-bit faces too,
+  // and a loader that hardcodes 2-bit silently mis-decodes every one of them.
+  bool twoBit = true;
+
   ExternalBuiltinFont() = default;
   ExternalBuiltinFont(const ExternalBuiltinFont&) = delete;
   ExternalBuiltinFont& operator=(const ExternalBuiltinFont&) = delete;
@@ -43,7 +49,7 @@ struct ExternalBuiltinFont {
     data.glyph = glyphs.data();
     data.intervals = intervals.data();
     data.intervalCount = static_cast<uint32_t>(intervals.size());
-    data.is2Bit = true;
+    data.is2Bit = twoBit;
     data.groups = nullptr;
     data.groupCount = 0;
     data.glyphToGroup = nullptr;
@@ -80,6 +86,14 @@ inline bool parseExternalFont(const uint8_t* bytes, size_t len, std::unique_ptr<
   if (h.totalBytes != len) return fail("totalBytes does not match the buffer length");
   if (h.glyphCount == 0 || h.intervalCount == 0 || h.bitmapBytes == 0) return fail("empty font");
 
+  // Reject unknown flags rather than ignoring them. A flag this build does not understand is a
+  // blob written by a newer exporter, and the safe reading of "there is more here than I know
+  // about" is to refuse: silently proceeding means decoding sections whose layout may have moved.
+  constexpr uint16_t kKnownFlags =
+      kExternalFontFlagTwoBit | kExternalFontFlagHasKern | kExternalFontFlagHasLigatures;
+  if ((h.flags & ~kKnownFlags) != 0) return fail("unsupported EPD2 flags");
+
+  const bool isTwoBit = (h.flags & kExternalFontFlagTwoBit) != 0;
   const bool hasKern = (h.flags & kExternalFontFlagHasKern) != 0;
   const bool hasLig = (h.flags & kExternalFontFlagHasLigatures) != 0;
 
@@ -142,6 +156,7 @@ inline bool parseExternalFont(const uint8_t* bytes, size_t len, std::unique_ptr<
   bundle->data.descender = h.descender;
   bundle->data.kernLeftClassCount = h.kernLeftClasses;
   bundle->data.kernRightClassCount = h.kernRightClasses;
+  bundle->twoBit = isTwoBit;
   bundle->wireData();
 
   out = std::move(bundle);

@@ -1,6 +1,6 @@
 # HANDOFF — ko-wasm (Xteink X4 EPUB → XTC/XTCH converter)
 
-**Date:** 2026-09-17 · **Repo:** https://github.com/zgredex/crosspoint-ko-wasm (public, MIT)
+**Date:** 2026-09-18 · **Repo:** https://github.com/zgredex/crosspoint-ko-wasm (public, MIT)
 **Working dir:** `/Users/patryk/krxtc/ko-wasm` · **Branch:** `main`
 
 ---
@@ -8,13 +8,22 @@
 ## 0. TL;DR for the next session
 
 - **Live:** https://crosspoint-ko-wasm.pages.dev — deployment `38f9a63f`, wasm sha256 `eaac8614…`,
-  verified equal to `dist/`.
-- **Tree is clean and green.** Host and wasm both build; every gate passes; nothing is half-applied.
-- **Active task: PNG stage 2** — move the PNG scanline decode from PNGdec to libpng. The design is
-  settled, the script is written, the build works, and the gate fails on **exactly one image**.
-  The next step is **one experiment** (§2.4), not more design.
-- **Parked:** default reader face decision, ED dither wiring, cover-path verification, force-push,
-  SKILL.md size fix, README session note. Rotation 4-mode stays parked — do not resume.
+  verified equal to `dist/`. (Deploy is now **behind** the local `dist/`: the default face and the
+  reference geometry changed after that deployment.)
+- **Tree is clean and green.** Host and wasm both build; every gate passes.
+- **The oracle is enforced, not described.** `crosspoint-reader-ko @ release/korean
+  84a39194dfce1ebd772ac9163df0a59daa0d72dc` is the pinned reference; the gate **compiles it and runs
+  it** on the same books. Conformance is three layers: exact layout, perceptual raster, and
+  plane bytes as a diagnostic only. See `docs/ko-oracle-conformance.md`.
+- **Do NOT externalize KoPub.** The 48% figure that justified it assumed RIDIBatang was the default
+  face. KoPub *is* the default (`getReaderFontId()`), so the split saves 3.4% for an extra request on
+  the critical path. Measured: `docs/ko-font-payload-measurement.md`. **RIDIBatang is the face worth
+  externalizing** (268,627 brotli bytes off every default load, asset 236,244, and its EPD2 path is
+  now proven end-to-end) — but only after a *navigation start → first readable page* benchmark.
+  Nothing is deployed that would need reverting: the shipped worker never fetches a font.
+- **Parked:** ED dither wiring, cover-path verification, force-push, SKILL.md size fix, README
+  session note, rotation 4-mode. Single-giant-XHTML warm preflight still has no stress fixture;
+  `HalStorage::mountBlob()`'s extra copy and the export high-water mark are still open.
 
 ---
 

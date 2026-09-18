@@ -14,7 +14,7 @@ const EPUB = process.argv[2] || '/Users/patryk/krxtc/.hermes/desktop-attachments
   const verPtr = api._ko_version();
   console.log('version:', api.UTF8ToString(verPtr));
 
-  api._ko_init(464, 778);
+  api._ko_init(464, 764); // advisory: geometry is derived from the spec margins (14/8/22/8)
   console.log('logical:', api._ko_logical_width(), 'x', api._ko_logical_height(),
               'viewport:', api._ko_viewport_width(), 'x', api._ko_viewport_height());
 

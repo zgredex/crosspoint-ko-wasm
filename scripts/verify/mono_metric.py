@@ -9,12 +9,16 @@ the metric is block-mean luminance error: downsample both to 4x4 blocks and comp
 reflectance against the reference. Lower = the mono page looks more like the real page.
 A per-pixel comparison would be meaningless here (and would "favour" the hard threshold).
 """
+import os
 import re
 import struct
 import sys
 
 import numpy as np
-from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import container_diff  # noqa: E402  (shared container reader: index-driven, not magic-scanning)
+from PIL import Image  # noqa: E402
 
 # panel's four perceived states, indexed by the 2-bit value (0 white 1 dark 2 light 3 black)
 LUM = np.array([210.0, 30.0, 80.0, 15.0], dtype=np.float32)
@@ -22,15 +26,23 @@ LW, LH = 480, 800
 
 
 def pages(path, magic):
+    """(data, offsets) for the page records in `path`, read through the container's index.
+
+    The previous version searched for the magic bytes and advanced 22 bytes past each hit, which
+    under-reports as soon as a payload contains the magic: the scan consumes the next record's
+    magic and silently skips it. A number measured with that walker was about SOME of the pages,
+    with nothing in the output to say which. Every count here is now the container's own.
+    """
+    records, header = container_diff.container(path)
+    if not records:
+        raise SystemExit(f'{path}: no page records')
     d = open(path, 'rb').read()
-    out, pos = [], 0
-    while True:
-        i = d.find(magic, pos)
-        if i < 0:
-            break
-        out.append(i)
-        pos = i + 22
-    return d, out
+    keep = header['offsets']
+    magics = {rec[:4] for rec in records}
+    if magics != {magic}:
+        raise SystemExit(f'{path}: expected only {magic!r} records, found {sorted(magics)}; '
+                         f'this tool compares one mode at a time')
+    return d, keep
 
 
 def nth_page(d, offs, n, magic):

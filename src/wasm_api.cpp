@@ -39,9 +39,33 @@ static ko::EngineDriver* g_driver = nullptr;
 // §6 of the KoPub groundwork: an externally loaded built-in font. The bundle owns the arrays, the
 // EpdFont/EpdFontFamily own nothing and point into the bundle's EpdFontData, so all three must outlive
 // any renderer reference and are torn down in reverse order in ko_xtch_release().
-static std::unique_ptr<ko::ExternalBuiltinFont> g_externalKopub;
-static std::unique_ptr<EpdFont> g_externalKopubFont;
-static std::unique_ptr<EpdFontFamily> g_externalKopubFamily;
+// An externalized built-in face: the parsed bundle plus the wrappers built on its storage. Kept
+// PER FONT ID because the renderer's registry is keyed by id — a RIDIBatang blob has to replace
+// RIDIBatang, and unloading one face must not disturb the other. The single-slot version of this
+// registered every blob under KOPUB_14_FONT_ID, which was invisible only because KoPub was the only
+// face that could be externalized at the time.
+struct ExternalFace {
+  int fontId = 0;
+  std::unique_ptr<ko::ExternalBuiltinFont> bundle;
+  std::unique_ptr<EpdFont> font;
+  std::unique_ptr<EpdFontFamily> family;
+};
+
+// One slot per id the EPD2 loader accepts (see the switch in ko_load_external_builtin_font).
+static ExternalFace g_externalFaces[2];
+
+static ExternalFace* externalFaceFor(int fontId) {
+  for (auto& face : g_externalFaces) {
+    if (face.fontId == fontId) return &face;
+  }
+  for (auto& face : g_externalFaces) {
+    if (face.fontId == 0) {
+      face.fontId = fontId;
+      return &face;
+    }
+  }
+  return nullptr;
+}
 
 static EpdFont* g_pretendard = nullptr;
 static EpdFontFamily* g_uiFamily = nullptr;
@@ -119,10 +143,19 @@ KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
     g_xtch = new ko::XtchWriter();
   }
   g_spec = ko::Spec();
-  g_spec.viewportWidth = static_cast<uint16_t>(viewportWidth);
-  g_spec.viewportHeight = static_cast<uint16_t>(viewportHeight);
-  // recompute margins so viewport+margin == full logical screen
+  // The width/height arguments are ADVISORY and were, until now, silently discarded: the geometry
+  // is derived from the spec's margins (viewport = screen − margins), so ko_init(464, 778) still
+  // produced a 464x764 layout. Five verification scripts were initialised with the old 778 and
+  // printed nothing about it, which made their own headers wrong about the geometry they measured.
+  // Saying it out loud costs one line and removes that whole class of quiet disagreement.
   ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  if (viewportWidth != g_spec.viewportWidth || viewportHeight != g_spec.viewportHeight) {
+    std::fprintf(stderr,
+                 "[ko] ko_init(%d,%d) ignored: geometry follows the margins, giving %ux%u "
+                 "(margins %d/%d/%d/%d). Pass the derived viewport to silence this.\n",
+                 viewportWidth, viewportHeight, g_spec.viewportWidth, g_spec.viewportHeight,
+                 g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  }
   return 0;
 }
 
@@ -138,12 +171,17 @@ KO_EXPORT void ko_close() {
   delete g_kopubFamily; g_kopubFamily = nullptr;
   delete g_kopub; g_kopub = nullptr;
 #endif
+#if KO_EMBED_RIDI
   delete g_ridibatangFamily; g_ridibatangFamily = nullptr;
-  // reverse order: family, then font, then the arrays they point into
-  g_externalKopubFamily.reset();
-  g_externalKopubFont.reset();
-  g_externalKopub.reset();
   delete g_ridibatang; g_ridibatang = nullptr;
+#endif
+  // Reverse construction order per slot: family, then font, then the bundle they point into.
+  for (auto& face : g_externalFaces) {
+    face.family.reset();
+    face.font.reset();
+    face.bundle.reset();
+    face.fontId = 0;
+  }
   delete g_xtch; g_xtch = nullptr;
 }
 
@@ -185,8 +223,24 @@ KO_EXPORT int ko_load_external_builtin_font(int fontId, uintptr_t ptr, size_t le
     setError("engine not initialised");
     return -1;
   }
-  if (fontId != KOPUB_14_FONT_ID) {
-    setError("external blob is only supported for KoPub");
+  // The EPD2 container is generic; this list is the set of BUILT-IN faces a blob may stand in for.
+  // It is deliberately a positive list: the format carries its own metrics, but the engine still has
+  // to know which family to replace, and a typo'd or unsupported id must fail loudly rather than
+  // register a face under a name nothing will ever ask for. RIDIBatang is here because it is the
+  // optional face a default KoPub build does not need to carry — see docs/ko-font-payload-
+  // measurement.md for the sizes that decide whether it ships embedded or fetched.
+  switch (fontId) {
+    case KOPUB_14_FONT_ID:
+    case RIDIBATANG_14_FONT_ID:
+      break;
+    default:
+      setError("unsupported external built-in font");
+      return -1;
+  }
+
+  ExternalFace* slot = externalFaceFor(fontId);
+  if (slot == nullptr) {
+    setError("no free external font slot");
     return -1;
   }
 
@@ -202,20 +256,26 @@ KO_EXPORT int ko_load_external_builtin_font(int fontId, uintptr_t ptr, size_t le
 
   // Insert the new family BEFORE releasing anything: the renderer must never hold a destroyed family,
   // and a re-load (a second book, a re-fetch) must replace the previous bundle without leaking it.
-  g_renderer->insertFont(KOPUB_14_FONT_ID, family.get());
-  g_externalKopubFamily = std::move(family);
-  g_externalKopubFont = std::move(font);
-  g_externalKopub = std::move(parsed);
+  g_renderer->insertFont(fontId, family.get());
+  slot->family = std::move(family);
+  slot->font = std::move(font);
+  slot->bundle = std::move(parsed);
 
-#if KO_EMBED_KOPUB
-  // A build that still embeds KoPub now has both; the external one is registered, so drop the embedded
-  // wrapper rather than keeping two copies of the font alive. This is what makes the switch to
-  // KO_EMBED_KOPUB=OFF a size change only, with identical rendering either way.
-  delete g_kopub;
-  g_kopub = nullptr;
-  delete g_kopubFamily;
-  g_kopubFamily = nullptr;
-#endif
+  // A build that still embeds this face now has both; the external one is registered, so drop the
+  // embedded wrapper rather than keeping two copies of the font alive. This is what makes the switch
+  // to KO_EMBED_<FACE>=OFF a size change only, with identical rendering either way. Only the face
+  // that was just replaced is dropped — the other embedded face is untouched.
+  if (fontId == KOPUB_14_FONT_ID) {
+    delete g_kopub;
+    g_kopub = nullptr;
+    delete g_kopubFamily;
+    g_kopubFamily = nullptr;
+  } else if (fontId == RIDIBATANG_14_FONT_ID) {
+    delete g_ridibatang;
+    g_ridibatang = nullptr;
+    delete g_ridibatangFamily;
+    g_ridibatangFamily = nullptr;
+  }
   return 0;
 }
 

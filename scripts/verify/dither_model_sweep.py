@@ -78,4 +78,6 @@ def main():
                 print('    identical: %s' % ', '.join(names))
 
 
-main()
+
+if __name__ == '__main__':
+    main()

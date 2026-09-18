@@ -36,15 +36,31 @@ def container(path):
     # seconds, and it must not be reported as a content difference.
     create_time = int.from_bytes(meta[0xF0:0xF4], 'little')
     pages = []
+    offsets = []
     for i in range(page_count):
         e = index_offset + i * 16
         off = int.from_bytes(data[e:e + 8], 'little')
         size = int.from_bytes(data[e + 8:e + 12], 'little')
         w = int.from_bytes(data[e + 12:e + 14], 'little')
         h = int.from_bytes(data[e + 14:e + 16], 'little')
-        pages.append(data[off:off + size])
+        # Validated rather than sliced-and-hoped. A page index that runs past the buffer used to
+        # return a short record, which compares unequal to a full one and reports as a content
+        # difference; the real fault is a broken container, and it should say so.
+        if size <= 0 or off < index_offset + page_count * 16 or off + size > len(data):
+            raise SystemExit(f'{path}: invalid page index {i}: offset {off} size {size} '
+                             f'(container {len(data)} bytes)')
+        rec = data[off:off + size]
+        if rec[:4] not in (b'XTH\x00', b'XTG\x00'):
+            raise SystemExit(f'{path}: page {i} at {off} has magic {rec[:4]!r}, not a page record')
+        pages.append(rec)
+        offsets.append(off)
+    # The count in the header IS the number of records by construction; asserting it keeps that
+    # true for anyone who later edits this loop.
+    if len(pages) != page_count:
+        raise SystemExit(f'{path}: walked {len(pages)} records, header says {page_count}')
     header = {'magic': magic, 'page_count': page_count, 'index_offset': index_offset,
-              'data_offset': data_offset, 'title': title, 'create_time': create_time}
+              'data_offset': data_offset, 'title': title, 'create_time': create_time,
+              'offsets': offsets}
     return pages, header
 
 

@@ -262,7 +262,7 @@ file(MAKE_DIRECTORY ${JPEG_TURBO_INSTALL}/include)
 
 # §5 font-contribution measurement. Temporary measurement switches, not production architecture:
 # flip one off, rebuild, and compare artifact size to see what that font costs the payload.
-option(KO_EMBED_RIDI "Embed RIDIBatang (default reader face)" ON)
+option(KO_EMBED_RIDI "Embed RIDIBatang (optional face; KoPub is the reference default)" ON)
 option(KO_EMBED_KOPUB "Embed KoPub Batang" ON)
 option(KO_EMBED_PRETENDARD "Embed Pretendard (UI fallback)" ON)
 add_compile_definitions(
@@ -308,4 +308,14 @@ if(EMSCRIPTEN)
 else()
   add_executable(ko_xtch_host src/host_main.cpp)
   target_link_libraries(ko_xtch_host PRIVATE koengine)
+
+  # Verification tools as real targets. They used to be built by hand from a clang++ line in a
+  # comment, which meant they could sit in build/ for hours while their sources changed — and did:
+  # a stale verify_external_font reported "IDENTICAL" for a RIDIBatang blob it was silently
+  # comparing against KoPub, because it predated the face argument. A gate that can be an old
+  # binary is not a gate, so nothing here is hand-compiled any more.
+  foreach(tool export_external_font verify_external_font)
+    add_executable(${tool} tools/${tool}.cpp)
+    target_link_libraries(${tool} PRIVATE koengine)
+  endforeach()
 endif()

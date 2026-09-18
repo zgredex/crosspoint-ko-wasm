@@ -137,7 +137,7 @@ function show(m) {
 
 (async () => {
   const api = await createKoEngine();
-  api._ko_init(464, 778);
+  api._ko_init(464, 764); // advisory: geometry is derived from the spec margins (14/8/22/8)
   const buf = fs.readFileSync(book);
   const hp = api._malloc(buf.length);
   api.HEAPU8.set(buf, hp);

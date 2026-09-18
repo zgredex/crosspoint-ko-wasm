@@ -45,19 +45,78 @@ Font glyph data compresses very well, so the three fonts cost **1,201,559 of 1,7
 (69.4%)** while the entire rest of the engine — renderer, layout, EPUB, dithering, the export writer —
 is 530,906 bytes.
 
-Weighted against the decision thresholds:
+## The default face changed, and it inverts the verdict
 
-| removal | brotli saving | verdict |
+The table above was read with RIDIBatang assumed to be the default face. It is not:
+`CrossPointSettings::getReaderFontId()` returns `KOPUB_14_FONT_ID`, so **KoPub Batang is the face every
+reader sees** and RIDIBatang is the optional alternative. That flips both rows:
+
+| removal | brotli in-wasm | corrected verdict |
 |---|---:|---|
-| **KoPub Batang** | **830,470** (>500 KB) | **externalize** — it is optional and not the default face |
-| RIDIBatang | 267,999 (<1 MB) | keep embedded — it IS the default face; externalizing would add a round trip to every first book |
-| Pretendard | 100,977 (<200 KB) | keep embedded — it is the UI fallback and cheap |
+| KoPub Batang | 830,470 | **keep embedded** — it is the default face; externalizing it adds a fetch to every first book |
+| RIDIBatang | 267,999 | **the candidate to externalize** — optional, and most readers never select it |
+| Pretendard | 100,977 | keep embedded — the UI fallback, and cheap |
+
+The arithmetic that kills the old plan, with the EPD2 blobs measured rather than assumed:
+
+```
+engine without KoPub                                    901,995
++ KoPub EPD2, brotli                                    770,874
+= the bytes a default visit actually needs            1,672,869
+  versus embedded                                     1,732,465
+  saving                                                 59,596  ≈ 3.4%
+```
+
+and that 3.4% buys a second request, a parse, and a copy — for a *larger* combined payload than the
+single embedded module. Externalizing KoPub was justified by a 48% figure that only existed while the
+wrong face was the default.
+
+The same arithmetic, for the face that *is* optional. `scripts/verify/font_payload_matrix.sh`
+rebuilds all four combinations with one compiler and one flag set:
+
+| config | raw | brotli | what it removes |
+|---|---:|---:|---|
+| `kopub+ridi` (**shipped**) | 7,025,145 | 1,732,438 | — |
+| `kopub-only` (RIDI out) | 4,799,789 | 1,463,811 | **268,627** |
+| `ridi-only` (KoPub out) | 3,920,690 | 901,818 | **830,620** |
+| `neither` | 1,694,091 | 634,538 | 1,097,900 |
+
+(The per-font savings drift a few hundred bytes from the numbers above, which were measured at an
+earlier commit; the shape is unchanged.)
+
+| face | in-wasm cost (brotli) | its own EPD2 asset (brotli) |
+|---|---:|---:|
+| KoPub Batang 14 | 830,620 | 770,874 |
+| RIDIBatang 14 | 268,627 | 236,244 |
+
+Read those two rows against each other and the decision makes itself:
+
+- **Externalizing KoPub** — the *default* face — leaves a default visit fetching 901,818 + 770,874 =
+  **1,672,692**, a 3.4% saving, paid for with a second request on the critical path.
+- **Externalizing RIDIBatang** — the *optional* face — leaves a default visit at **1,463,811**, a
+  **15.5%** saving, with **no extra request at all**: the face simply is not there, and a reader who
+  selects it pays for it then. The same bytes are re-attributed in the KoPub plan, and saved here.
 
 ## Decision
 
-Externalize **KoPub Batang only**, as a fingerprinted `.epdfont` fetched when the face is selected. The
-expected effect is **brotli 1,732,465 → 901,995 (−48%)** and raw 7.02 → 3.92 MB, with the default face
-and the UI fallback still embedded, so no first-book path gains a network round trip.
+**Keep both faces embedded for now. Do not ship external KoPub.** The published reason for the split
+(48% off the default load) does not survive the corrected default, and the replacement figure (3.4%)
+is inside the noise of a decision that adds a request to the critical path.
+
+**RIDIBatang is the face worth externalizing**, and its EPD2 path is now proven rather than planned: the
+blob reproduces the embedded face bit-for-bit (verified), externalizing it leaves the layout
+byte-identical, and the raster layer finds zero differing pixels — all enforced in
+`scripts/verify/oracle_conformance.sh`. It was not even exportable until the exporter's
+KoPub-only constants (`U+AC00 == 437`, "kerning must be present") were replaced with per-face
+expectations; RIDIBatang's U+AC00 is 444 and it ships no kerning at all (the blob is written with
+`kExternalFontFlagHasKern` clear, and the verifier now checks that the wiring *matches* the embedded
+face rather than that a kern matrix exists).
+
+What still has to be measured before any of this ships is **navigation start → first readable page**,
+not module size. A smaller module that must wait for a second asset can lose; a split that lets the
+browser fetch the font while compiling the module can win. That benchmark has not been run, and the
+splitting architecture does not exist in the shipped worker yet (it never calls
+`ko_load_external_builtin_font`), so nothing is deployed that would need to be reverted.
 
 The loading machinery already exists: runtime custom fonts go through `SdFontFamily`, and the browser
 font converter already emits `.epdfont`, so the work is packaging plus a lazy-load path, not new format

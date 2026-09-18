@@ -154,4 +154,6 @@ def main():
                      if blue_noise_two_tone(0, x, y) == 3) / 4096))
 
 
-main()
+
+if __name__ == '__main__':
+    main()

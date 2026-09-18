@@ -15,27 +15,27 @@ usage: plane_compare.py <ref.xtch> <cand.xtg> [<cand2.xtg> ...] [--pages N]
 """
 import sys
 
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import container_diff  # noqa: E402  (index-driven container reader, shared with the other tools)
+
 W, H = 480, 800
 R = {0: 210, 1: 80, 2: 30, 3: 15}     # level -> reflectance (v = ink amount, 3 = black)
 R_WHITE, R_BLACK = 210, 15
 RANGE = R_WHITE - R_BLACK
-REC_XTH = 22 + 2 * 48000
-REC_XTG = 22 + 48000
 
 
 def pages(path):
-    d = open(path, 'rb').read()
-    out = []
-    for magic, rec in (('XTH', REC_XTH), ('XTG', REC_XTG)):
-        sig = magic.encode() + b'\x00'
-        p = 0
-        while True:
-            q = d.find(sig, p)
-            if q < 0:
-                break
-            out.append(d[q:q + rec])
-            p = q + 22
-    return out
+    """Page records including their 22-byte record headers, read through the container's index.
+
+    The returned shape is unchanged from the version this replaces (`d[q:q+rec]` also spanned the
+    header). What changed is how the records are found: that version searched for the record magic
+    and advanced 22 bytes past each hit, which lands on a false positive whenever a payload contains
+    'XTH\\0' and then skips the records that follow it. The container carries an index; use it, and
+    let the reader throw rather than return fewer records than the writer wrote.
+    """
+    records, _header = container_diff.container(path)
+    return list(records)
 
 
 def bit(plane, x, y):
@@ -134,4 +134,6 @@ def main():
         break   # one candidate at a time keeps the output readable
 
 
-main()
+
+if __name__ == '__main__':
+    main()

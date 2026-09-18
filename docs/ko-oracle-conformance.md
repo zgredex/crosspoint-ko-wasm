@@ -338,16 +338,58 @@ layout coordinates are layer 1. So the test list is a layer list:
 
 | | requirement | how |
 |---|---|---|
-| metrics | **exact** | `build/verify_external_font <blob>`: every `advanceX` bit-identical (`U+AC00` = 437 = 27.3125 px, not 27), full kern matrix, interval/glyph records, bitmap bytes |
-| layer 1 | **exact** | embedded vs `--kopub-external` must produce byte-identical layout manifests |
+| metrics | **exact** | `build/verify_external_font <blob> <face>`: every `advanceX` bit-identical against the *embedded face* (`U+AC00`: KoPub 437 = 27.3125 px, RIDIBatang 444 = 27.75 px), full kern matrix where the face has one, interval/glyph records, bitmap bytes |
+| layer 1 | **exact** | embedded vs `--external-font <face>` must produce byte-identical layout manifests |
 | layer 2 | **perceptual** | raster verdict on the same page set |
 | layer 3 | not required | (in practice it holds too: EPD2 stores no quantized copy, so the containers come out byte-identical) |
 
-All four run inside `oracle_conformance.sh` on every invocation. Measured: 3,169,108-byte blob
-→ 16,220 glyphs + 1,054 kern cells, `IDENTICAL: external blob reproduces the embedded font
-bit-for-bit`, layer 1 identical, layer 2 pass, containers byte-identical.
+Both faces run through it on every invocation of `oracle_conformance.sh`. Measured: KoPub
+3,169,108 bytes → 16,220 glyphs + 1,054 kern cells; RIDIBatang 2,243,200 bytes → 11,739 glyphs
+and **no kern section at all** (that face ships no kerning), both `IDENTICAL`, both layer 1
+exact, both layer 2 pass, both containers byte-identical.
 
-## 8. Not covered
+Two KoPub-only constants had to go before RIDIBatang could even be exported — a per-face
+expectation table replaced `U+AC00 == 437` and "kerning must be present" in both the exporter
+and the verifier. The format always allowed a kern-less face (`kExternalFontFlagHasKern`); the
+tools did not. That is exactly the class of assumption that makes a "generic" format a
+single-font format in practice.
+
+The two tools are now CMake targets. They used to be compiled by hand from a `clang++` line in a
+comment, and they went stale exactly as that implies: a `verify_external_font` from before the
+face argument reported `IDENTICAL` for a RIDIBatang blob it was silently comparing as KoPub.
+
+## 8. Reading a container: the index, never the magic
+
+Four tools in this repo found page records by searching for the record magic and advancing 22 bytes
+past each hit (`settings_effect.js`, `mono_metric.py`, `plane_compare.py`, `preview_fidelity.py`).
+That walk is anchored by content, so it re-anchors on payload bytes: a dithered plane containing
+`XTH\0` within 22 bytes before the next real record makes the walk land on the payload and skip the
+real record.
+
+The symptom is worth stating exactly, because "it reports fewer pages" is the intuitive guess and it
+is not what happens: the count stays the same and the *offsets* are wrong — one bogus hit replacing
+one real one. Downstream that is worse than a missing page. Slicing a record at a bogus offset yields
+garbage that compares unequal to its counterpart, so a run reports a difference that is an artefact of
+the walker; and if both files are mis-anchored the same way, the run reports a pass while never having
+compared the pages it says it compared.
+
+The container has a page index — `pageCount` at 0x06, `indexOffset` at 0x18, 16 bytes per entry
+(u64 offset, u32 length, u32 flags). Both readers now parse it and **throw** rather than
+under-report:
+
+- `scripts/verify/xtc_container.js` — `xtcPageRecords(buffer)` for the JS tools, validating the
+  header, the index extent, every record's bounds and magic, and asserting the walked count
+  equals `pageCount`;
+- `scripts/verify/container_diff.py` — `container(path)` for the Python tools, same validation,
+  now also returning the per-page offsets so callers cannot invent their own walk.
+
+`container_reader_controls.py` proves this rather than asserting it: on a clean container the scan
+and the index agree exactly; on a container with the magic injected into a record's tail the scan
+loses a real offset and gains a bogus one while the index reader is unaffected. The first version of
+that control injected the magic mid-payload — which only *adds* a hit and proves nothing — and
+reported itself void instead of passing.
+
+## 9. Not covered
 
 Stated rather than glossed:
 

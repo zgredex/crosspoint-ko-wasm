@@ -19,6 +19,7 @@
 #include "external_font_loader.h"
 
 #include "builtinFonts/kopub_14_regular.h"
+#include "builtinFonts/ridibatang_14_regular.h"
 
 namespace {
 
@@ -37,7 +38,9 @@ int fnv1a(const uint8_t* p, size_t n) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // usage: verify_external_font <blob.epd2> [kopub|ridibatang]
   const char* blobPath = (argc > 1) ? argv[1] : "/tmp/ab/kopub_14.epd2";
+  const char* face = (argc > 2) ? argv[2] : "kopub";
 
   std::ifstream f(blobPath, std::ios::binary);
   if (!f) { std::fprintf(stderr, "cannot open %s\n", blobPath); return 2; }
@@ -51,7 +54,16 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const EpdFontData& orig = kopub_14_regular;
+  const EpdFontData* origPtr = nullptr;
+  if (std::strcmp(face, "kopub") == 0) {
+    origPtr = &kopub_14_regular;
+  } else if (std::strcmp(face, "ridibatang") == 0) {
+    origPtr = &ridibatang_14_regular;
+  } else {
+    std::fprintf(stderr, "unknown face '%s' (expected kopub or ridibatang)\n", face);
+    return 2;
+  }
+  const EpdFontData& orig = *origPtr;
 
   // ---- intervals ----
   check(ext->intervals.size() == orig.intervalCount, "interval count");
@@ -89,8 +101,11 @@ int main(int argc, char** argv) {
     const EpdGlyph& g = ext->glyphs[uac00];
     std::printf("U+AC00 via blob: advanceX=%u (%.4f px) w=%u h=%u left=%d top=%d len=%u off=%u\n",
                 g.advanceX, g.advanceX / 16.0, g.width, g.height, g.left, g.top, g.dataLength, g.dataOffset);
-    check(g.advanceX == 437, "U+AC00 advanceX == 437");
+    // The check that matters is that the blob agrees with the EMBEDDED face. `== 437` was KoPub's
+    // value written as a rule; RIDIBatang's U+AC00 is 444, equally fractional, and the constant was
+    // the only reason that face could not be verified at all.
     check(g.advanceX == orig.glyph[uac00].advanceX, "U+AC00 advanceX equals the embedded value");
+    check(g.advanceX % 16 != 0, "U+AC00 advanceX is fractional (not a whole pixel count)");
   }
 
   // ---- bitmap ----
@@ -103,18 +118,37 @@ int main(int argc, char** argv) {
   check(std::memcmp(ext->bitmap.data(), orig.bitmap, bitmapBytes) == 0, "bitmap bytes differ");
 
   // ---- kerning: the half of this that .epdfont v1 loses outright ----
+  //
+  // Kerning is optional in the format, so the contract is "the blob reproduces the embedded face's
+  // kerning, including the case where there is none" — not "there must be kerning". Every memcmp
+  // below is guarded on a non-zero length: comparing a null pointer over zero bytes is not
+  // something to rely on, and a kern-less face (RIDIBatang) would otherwise fail on wiring.
+  const bool origHasKern = orig.kernLeftEntryCount > 0 && orig.kernRightEntryCount > 0 &&
+                           orig.kernLeftClasses != nullptr && orig.kernRightClasses != nullptr;
+  const size_t cells = static_cast<size_t>(orig.kernLeftClassCount) * orig.kernRightClassCount;
   check(ext->kernLeft.size() == orig.kernLeftEntryCount, "kern left entry count");
   check(ext->kernRight.size() == orig.kernRightEntryCount, "kern right entry count");
-  check(std::memcmp(ext->kernLeft.data(), orig.kernLeftClasses,
-                    orig.kernLeftEntryCount * sizeof(EpdKernClassEntry)) == 0, "kern left map differs");
-  check(std::memcmp(ext->kernRight.data(), orig.kernRightClasses,
-                    orig.kernRightEntryCount * sizeof(EpdKernClassEntry)) == 0, "kern right map differs");
-  const size_t cells = static_cast<size_t>(orig.kernLeftClassCount) * orig.kernRightClassCount;
+  if (origHasKern && orig.kernLeftEntryCount > 0) {
+    check(std::memcmp(ext->kernLeft.data(), orig.kernLeftClasses,
+                      orig.kernLeftEntryCount * sizeof(EpdKernClassEntry)) == 0, "kern left map differs");
+  }
+  if (origHasKern && orig.kernRightEntryCount > 0) {
+    check(std::memcmp(ext->kernRight.data(), orig.kernRightClasses,
+                      orig.kernRightEntryCount * sizeof(EpdKernClassEntry)) == 0, "kern right map differs");
+  }
   check(ext->kernMatrix.size() == cells, "kern matrix cell count");
-  check(std::memcmp(ext->kernMatrix.data(), orig.kernMatrix, cells) == 0, "kern matrix differs");
+  if (cells > 0 && orig.kernMatrix != nullptr) {
+    check(std::memcmp(ext->kernMatrix.data(), orig.kernMatrix, cells) == 0, "kern matrix differs");
+  }
   check(ext->data.kernLeftClassCount == orig.kernLeftClassCount, "kern left class count");
   check(ext->data.kernRightClassCount == orig.kernRightClassCount, "kern right class count");
-  check(ext->data.kernMatrix != nullptr, "kern matrix pointer wired");
+  std::printf("kern: embedded %s, blob %s\n", origHasKern ? "present" : "absent",
+              ext->data.kernMatrix != nullptr ? "wired" : "absent");
+  // Wiring must MATCH, not merely exist: a face with no kerning must come back with no kerning, and
+  // a face with kerning must come back wired. Requiring wiring unconditionally is what made this
+  // tool unable to verify any kern-less face.
+  check((ext->data.kernMatrix != nullptr) == origHasKern,
+        "kern matrix wiring matches the embedded face");
 
   // ---- metrics + wiring ----
   check(ext->data.advanceY == orig.advanceY, "advanceY");

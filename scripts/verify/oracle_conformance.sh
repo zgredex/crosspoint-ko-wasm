@@ -244,53 +244,69 @@ if [ "$FONT_LAYERS" = 1 ]; then
   #   LAYER 3   not a requirement
   BLOB="${KO_KOPUB_BLOB:-/tmp/ab/kopub_14.epd2}"
   if [ ! -f "$BLOB" ] && [ -x build/export_external_font ]; then
-    build/export_external_font "$BLOB" >/dev/null 2>&1
+    build/export_external_font "$BLOB" kopub >/dev/null 2>&1
     note "exported $BLOB"
   fi
-  if [ ! -f "$BLOB" ]; then
-    bad "no EPD2 blob at $BLOB and no build/export_external_font to make one"
-  else
-    # Layer "metrics exact", first and on its own: the blob must reproduce the embedded font
-    # bit for bit, including U+AC00's 437 (27.3125 px) advance and the full kern matrix. If this
-    # passes, the layers below are a smoke test; if it fails, they are how you find the damage.
+  # Both faces, because the container is generic and the optional face is the one whose
+  # externalization is actually on the table: RIDIBatang costs the default wasm 267,999 Brotli
+  # bytes it does not need to carry, so its EPD2 path has to be as provable as KoPub's. It was not
+  # even exportable until the tool's KoPub-only constants were replaced with per-face expectations.
+  for FACE in kopub ridibatang; do
+    BLOB="${KO_FACE_BLOB_DIR:-/tmp/ab}/${FACE}_14.epd2"
+    [ "$FACE" = "kopub" ] && BLOB="${KO_KOPUB_BLOB:-/tmp/ab/kopub_14.epd2}"
+    [ "$FACE" = "ridibatang" ] && BLOB="${KO_RIDI_BLOB:-/tmp/ab/ridi_14.epd2}"
+    if [ ! -f "$BLOB" ] && [ -x build/export_external_font ]; then
+      build/export_external_font "$BLOB" "$FACE" >/dev/null 2>&1
+      note "exported $BLOB"
+    fi
+    echo "-- $FACE --"
+    if [ ! -f "$BLOB" ]; then
+      bad "$FACE: no EPD2 blob at $BLOB and no build/export_external_font to make one"
+      continue
+    fi
+    # Layer "metrics exact", first and on its own: the blob must reproduce the embedded face bit for
+    # bit — for KoPub including U+AC00's 437 (27.3125 px) advance and the full kern matrix, for
+    # RIDIBatang a kern-less blob that says so. If this passes, the layers below are a smoke test;
+    # if it fails, they are how you find the damage.
     if [ -x build/verify_external_font ]; then
-      if build/verify_external_font "$BLOB" >"$WORK/font-metrics.log" 2>&1; then
-        ok "font: metrics exact — $(tail -1 "$WORK/font-metrics.log")"
+      if build/verify_external_font "$BLOB" "$FACE" >"$WORK/font-$FACE-metrics.log" 2>&1; then
+        ok "font($FACE): metrics exact — $(tail -1 "$WORK/font-$FACE-metrics.log")"
       else
-        bad "font: metrics FAILED — the blob does not reproduce the embedded font"
-        tail -6 "$WORK/font-metrics.log" | sed 's/^/     /'
+        bad "font($FACE): metrics FAILED — the blob does not reproduce the embedded face"
+        tail -6 "$WORK/font-$FACE-metrics.log" | sed 's/^/     /'
       fi
     else
       bad "build/verify_external_font is not built — the metrics layer would go unchecked"
     fi
     FX=oracle/fixtures/ko-text.epub
-    "$PORT_BIN" "$REPO_ROOT/$FX" "$WORK/font-embedded.xtch" --manifest "$WORK/font-embedded.json" \
-      >"$WORK/font-embedded.log" 2>&1
-    if "$PORT_BIN" "$REPO_ROOT/$FX" "$WORK/font-external.xtch" --kopub-external "$BLOB" \
-         --manifest "$WORK/font-external.json" >"$WORK/font-external.log" 2>&1; then
-      note "$(grep -o 'KoPub registered from blob.*' "$WORK/font-external.log" | head -1)"
+    "$PORT_BIN" "$REPO_ROOT/$FX" "$WORK/font-$FACE-embedded.xtch" --font "$FACE" \
+      --manifest "$WORK/font-$FACE-embedded.json" >"$WORK/font-$FACE-embedded.log" 2>&1
+    if "$PORT_BIN" "$REPO_ROOT/$FX" "$WORK/font-$FACE-external.xtch" --font "$FACE" \
+         --external-font "$FACE" "$BLOB" --manifest "$WORK/font-$FACE-external.json" \
+         >"$WORK/font-$FACE-external.log" 2>&1; then
+      note "$(grep -o "$FACE registered from blob.*" "$WORK/font-$FACE-external.log" | head -1)"
     else
-      bad "port failed with --kopub-external (see $WORK/font-external.log)"
+      bad "port failed with --external-font $FACE (see $WORK/font-$FACE-external.log)"
     fi
-    if [ ! -s "$WORK/font-external.json" ]; then
-      bad "no manifest from the externalized run — nothing was compared"
-    elif cmp -s "$WORK/font-embedded.json" "$WORK/font-external.json"; then
-      ok "font: LAYER 1 exact — externalized KoPub lays out identically (metrics survived)"
+    if [ ! -s "$WORK/font-$FACE-external.json" ]; then
+      bad "font($FACE): no manifest from the externalized run — nothing was compared"
+    elif cmp -s "$WORK/font-$FACE-embedded.json" "$WORK/font-$FACE-external.json"; then
+      ok "font($FACE): LAYER 1 exact — externalized face lays out identically (metrics survived)"
     else
-      bad "font: LAYER 1 FAILED — externalizing changed the layout; the blob is lossy"
-      python3 scripts/verify/layout_diff.py "$WORK/font-embedded.json" "$WORK/font-external.json" \
-        | head -8 | sed 's/^/     /'
+      bad "font($FACE): LAYER 1 FAILED — externalizing changed the layout; the blob is lossy"
+      python3 scripts/verify/layout_diff.py "$WORK/font-$FACE-embedded.json" \
+        "$WORK/font-$FACE-external.json" | head -8 | sed 's/^/     /'
     fi
-    if python3 scripts/verify/raster_diff.py "$WORK/font-embedded.xtch" "$WORK/font-external.xtch" \
-         --limit 3 2>&1 | sed 's/^/     /'; then
-      ok "font: LAYER 2 perceptual — externalized rendering is visually identical"
+    if python3 scripts/verify/raster_diff.py "$WORK/font-$FACE-embedded.xtch" \
+         "$WORK/font-$FACE-external.xtch" --limit 3 2>&1 | sed 's/^/     /'; then
+      ok "font($FACE): LAYER 2 perceptual — externalized rendering is visually identical"
     else
-      bad "font: LAYER 2 FAILED — the externalized face renders differently"
+      bad "font($FACE): LAYER 2 FAILED — the externalized face renders differently"
     fi
-    if cmp -s "$WORK/font-embedded.xtch" "$WORK/font-external.xtch"; then
-      note "font: containers byte-identical too (expected — EPD2 stores no quantized copy)"
+    if cmp -s "$WORK/font-$FACE-embedded.xtch" "$WORK/font-$FACE-external.xtch"; then
+      note "font($FACE): containers byte-identical too (expected — EPD2 stores no quantized copy)"
     fi
-  fi
+  done
 fi
 
 echo

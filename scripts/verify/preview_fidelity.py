@@ -16,7 +16,11 @@ the panel's states, so the page's own level mix is the device's tone.
 
 usage: preview_fidelity.py <file.xtch|file.xtc> [...]
 """
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import container_diff  # noqa: E402  (index-driven container reader)
 
 W, H = 480, 800
 R = {0: 210.0, 1: 30.0, 2: 80.0, 3: 15.0}      # ink index v -> panel reflectance
@@ -28,7 +32,6 @@ PALETTES = {
     'bright (was)': {0: 255, 1: 128, 2: 205, 3: 0},
     'raw levels': {0: 255, 1: 170, 2: 85, 3: 0},   # the old 0/85/170/255 nominal palette
 }
-REC = {'XTH': 22 + 2 * 48000, 'XTG': 22 + 48000}
 
 
 def srgb_to_linear(c):
@@ -37,17 +40,18 @@ def srgb_to_linear(c):
 
 
 def pages(path):
-    d = open(path, 'rb').read()
+    """(magic, payload) pairs, read through the container's index.
+
+    The payload shape is unchanged from the version this replaces (`d[q+22:q+rec]`). What changed is
+    how the records are found: searching for the record magic and advancing 22 bytes past each hit
+    lands on a false positive whenever a payload contains 'XTH\\0', and then skips the records after
+    it. The container carries an index; use it.
+    """
+    records, _header = container_diff.container(path)
     out = []
-    for magic, rec in REC.items():
-        sig = magic.encode() + b'\x00'
-        p = 0
-        while True:
-            q = d.find(sig, p)
-            if q < 0:
-                break
-            out.append((magic, d[q + 22:q + rec]))
-            p = q + 22
+    for rec in records:
+        magic = rec[:4].rstrip(b'\x00').decode('ascii')
+        out.append((magic, rec[22:]))
     return out
 
 
@@ -116,4 +120,6 @@ def main():
             print('    preview %-13s %6.1f   error %+6.1f reflectance units' % (name, tone, tone - truth))
 
 
-main()
+
+if __name__ == '__main__':
+    main()

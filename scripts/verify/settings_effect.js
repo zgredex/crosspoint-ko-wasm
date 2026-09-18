@@ -13,6 +13,7 @@
 // usage: settings_effect.js <book.epub> [pages-limit]
 const fs = require('fs');
 const path = require('path');
+const { xtcPageRecords } = require('./xtc_container.js');
 
 const WASM_DIR = path.join(__dirname, '..', '..', 'build-wasm');
 const EPUB = process.argv[2];
@@ -27,7 +28,7 @@ if (!EPUB) {
   const createKoEngine = require(path.join(WASM_DIR, 'ko_xtch_wasm.js'));
   const api = await createKoEngine();
 
-  api._ko_init(464, 778);
+  api._ko_init(464, 764); // advisory: geometry is derived from the spec margins (14/8/22/8)
   const buf = fs.readFileSync(EPUB);
   const p = api._malloc(buf.length);
   api.HEAPU8.set(buf, p);
@@ -75,17 +76,11 @@ if (!EPUB) {
     ['textAntiAliasing      1 -> 0', { textAntiAliasing: 0 }],
   ];
 
-  const xtchPages = (bytes) => {
-    const out = [];
-    let pos = 0;
-    while (true) {
-      const q = bytes.indexOf(Buffer.from('XTH\0'), pos);
-      if (q < 0) break;
-      out.push(bytes.subarray(q + 22, q + 22 + 96000));
-      pos = q + 22;
-    }
-    return out;
-  };
+  // Page records come from the container's own index, NOT from scanning for the magic. The scan
+  // this replaces under-reported (a payload containing 'XTH\0' made it skip the records after it),
+  // which is exactly the failure mode a walker must not have: fewer records than the writer wrote,
+  // reported as a clean run. xtc_container.js throws instead of returning a short list.
+  const xtchPages = (bytes) => xtcPageRecords(bytes).pages;
 
   const run = (spec) => {
     apply(spec);

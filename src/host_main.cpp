@@ -31,7 +31,8 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     fprintf(stderr,
             "usage: %s <book.epub> [out.xtch] [--1bit] [--image-dither N] [--image-dither-name NAME]\n"
-            "          [--text-aa|--no-text-aa] [--font kopub|ridibatang] [--kopub-external blob] [--no-kern]\n"
+            "          [--text-aa|--no-text-aa] [--font kopub|ridibatang] [--kopub-external blob]\n"
+            "          [--external-font kopub|ridibatang blob] [--no-kern]\n"
             "          [--screen-margin N | --margin-bottom N]\n"
             "          [--manifest PATH] [--dump-planes DIR] [--max-pages N]\n",
             argv[0]);
@@ -141,11 +142,27 @@ int main(int argc, char** argv) {
       if (name == "kopub") spec.fontId = KOPUB_14_FONT_ID;
       else if (name == "ridibatang") spec.fontId = RIDIBATANG_14_FONT_ID;
       else { fprintf(stderr, "unknown font '%s' (kopub|ridibatang)\n", name.c_str()); return 2; }
-    } else if (flag == "--kopub-external" && i + 1 < argc) {
-      // §7 acceptance gate: register KoPub from a lossless EPD2 blob through the SAME parser the wasm
-      // uses, instead of the embedded arrays. Any difference in the emitted pages is a parity failure.
-      // Function-local statics on purpose: EpdFont/EpdFontFamily only point into the bundle, so it must
-      // outlive the whole render pass.
+    } else if ((flag == "--kopub-external" || flag == "--external-font") && i + 1 < argc) {
+      // §7 acceptance gate: register a built-in face from a lossless EPD2 blob through the SAME
+      // parser the wasm uses, instead of the embedded arrays. Any difference in the emitted pages
+      // is a parity failure.
+      //
+      //   --kopub-external <blob>        the face this gate has always used (alias)
+      //   --external-font <face> <blob>  face = kopub | ridibatang
+      //
+      // The face argument exists because the container is generic: RIDIBatang is the optional face a
+      // default KoPub build need not carry, and its externalized path has to be testable too.
+      // Function-local statics on purpose: EpdFont/EpdFontFamily only point into the bundle, so it
+      // must outlive the whole render pass.
+      std::string faceName = "kopub";
+      if (flag == "--external-font") {
+        faceName = argv[++i];
+        if (i + 1 >= argc) { fprintf(stderr, "--external-font needs <face> <blob>\n"); return 2; }
+      }
+      int externalFaceId = 0;
+      if (faceName == "kopub") externalFaceId = KOPUB_14_FONT_ID;
+      else if (faceName == "ridibatang") externalFaceId = RIDIBATANG_14_FONT_ID;
+      else { fprintf(stderr, "unknown face '%s' (kopub|ridibatang)\n", faceName.c_str()); return 2; }
       const std::string blobPath = argv[++i];
       FILE* bf = fopen(blobPath.c_str(), "rb");
       if (!bf) { fprintf(stderr, "cannot open %s\n", blobPath.c_str()); return 2; }
@@ -172,10 +189,14 @@ int main(int argc, char** argv) {
         for (size_t k = 0; k < extBundle->kernMatrix.size(); ++k) extBundle->kernMatrix[k] = 0;
         fprintf(stderr, "kern matrix zeroed by --no-kern (control)\n");
       }
-      renderer.insertFont(KOPUB_14_FONT_ID, extFamily.get());
-      fprintf(stderr, "KoPub registered from blob %s (%zu bytes, glyphs %zu, kern %zu cells)\n",
-              blobPath.c_str(), blobBytes.size(), extBundle->glyphs.size(),
-              extBundle->kernMatrix.size());
+      renderer.insertFont(externalFaceId, extFamily.get());
+      fprintf(stderr, "%s registered from blob %s (%zu bytes, glyphs %zu, kern %zu cells, is2Bit %d)\n",
+              faceName.c_str(), blobPath.c_str(), blobBytes.size(), extBundle->glyphs.size(),
+              extBundle->kernMatrix.size(), extBundle->data.is2Bit ? 1 : 0);
+      if (spec.fontId != externalFaceId) {
+        fprintf(stderr, "note: --font is not %s, so the externalized face will not be the one "
+                        "rendered; pass --font %s as well\n", faceName.c_str(), faceName.c_str());
+      }
     }
   }
   writer.setTextAa(spec.textAntiAliasing != 0);
