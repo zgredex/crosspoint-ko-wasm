@@ -29,12 +29,20 @@
 #endif
 #include <SdFontFamily.h>
 #include "ko_engine_driver.h"
+#include "external_font_loader.h"   // §6: lossless EPD2 built-in font blobs
 #include "xtch_writer.h"
 
 // Global instances (module-lifetime)
 static HalDisplay* g_display = nullptr;
 static GfxRenderer* g_renderer = nullptr;
 static ko::EngineDriver* g_driver = nullptr;
+// §6 of the KoPub groundwork: an externally loaded built-in font. The bundle owns the arrays, the
+// EpdFont/EpdFontFamily own nothing and point into the bundle's EpdFontData, so all three must outlive
+// any renderer reference and are torn down in reverse order in ko_xtch_release().
+static std::unique_ptr<ko::ExternalBuiltinFont> g_externalKopub;
+static std::unique_ptr<EpdFont> g_externalKopubFont;
+static std::unique_ptr<EpdFontFamily> g_externalKopubFamily;
+
 static EpdFont* g_pretendard = nullptr;
 static EpdFontFamily* g_uiFamily = nullptr;
 static EpdFont* g_kopub = nullptr;
@@ -131,6 +139,10 @@ KO_EXPORT void ko_close() {
   delete g_kopub; g_kopub = nullptr;
 #endif
   delete g_ridibatangFamily; g_ridibatangFamily = nullptr;
+  // reverse order: family, then font, then the arrays they point into
+  g_externalKopubFamily.reset();
+  g_externalKopubFont.reset();
+  g_externalKopub.reset();
   delete g_ridibatang; g_ridibatang = nullptr;
   delete g_xtch; g_xtch = nullptr;
 }
@@ -164,6 +176,48 @@ KO_EXPORT void ko_set_focus_reading(int v) { (void)v; g_spec.focusReadingEnabled
 // so with the face compiled out (or before a lazy fetch has landed) the JS believed the layout was
 // KoPub while the renderer drew whatever it actually had. A face that is not registered must fail
 // visibly instead.
+// Load a lossless external built-in font (EPD2) and register it under `fontId`.
+// Returns 0 on success, -1 for a bad request, -2 for a blob that failed to parse (the reason is in the
+// error string). Nothing is partially registered on failure: parse first, insert second.
+KO_EXPORT int ko_load_external_builtin_font(int fontId, uintptr_t ptr, size_t len) {
+  if (!g_renderer) {
+    setError("engine not initialised");
+    return -1;
+  }
+  if (fontId != KOPUB_14_FONT_ID) {
+    setError("external blob is only supported for KoPub");
+    return -1;
+  }
+
+  std::unique_ptr<ko::ExternalBuiltinFont> parsed;
+  std::string err;
+  if (!ko::parseExternalFont(reinterpret_cast<const uint8_t*>(ptr), len, parsed, err)) {
+    setError(err.c_str());
+    return -2;
+  }
+
+  auto font = std::make_unique<EpdFont>(&parsed->data);
+  auto family = std::make_unique<EpdFontFamily>(font.get());
+
+  // Insert the new family BEFORE releasing anything: the renderer must never hold a destroyed family,
+  // and a re-load (a second book, a re-fetch) must replace the previous bundle without leaking it.
+  g_renderer->insertFont(KOPUB_14_FONT_ID, family.get());
+  g_externalKopubFamily = std::move(family);
+  g_externalKopubFont = std::move(font);
+  g_externalKopub = std::move(parsed);
+
+#if KO_EMBED_KOPUB
+  // A build that still embeds KoPub now has both; the external one is registered, so drop the embedded
+  // wrapper rather than keeping two copies of the font alive. This is what makes the switch to
+  // KO_EMBED_KOPUB=OFF a size change only, with identical rendering either way.
+  delete g_kopub;
+  g_kopub = nullptr;
+  delete g_kopubFamily;
+  g_kopubFamily = nullptr;
+#endif
+  return 0;
+}
+
 KO_EXPORT int ko_has_font(int fontId) {
   return (g_renderer && g_renderer->hasFont(fontId)) ? 1 : 0;
 }
