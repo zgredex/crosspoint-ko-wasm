@@ -296,29 +296,46 @@ class GfxRenderer {
   void copyGrayscaleLsbBuffers() const;
 
   // ---- text-gray capture (render text ONCE instead of three times) --------
-  // STATUS: prepared but DISABLED — the driver's `textOnce` flag is false, and
-  // the glyph-loop call sites were deliberately removed from renderCharImpl
-  // because the extra (never-taken) branch per glyph pixel cost ~240 ms on a
-  // 2,034-page book. To re-enable: flip the driver flag AND re-add the capture
-  // calls in renderCharImpl (portrait fast path + generic path, 2-bit and 1-bit
-  // forms — noted in references/ko-engine-performance-work.md), then resolve the
-  // correctness blocker documented in src/ko_engine_driver.h.
+  // STATUS: ENABLED. src/ko_engine_driver.h sets `textOnce = true`; the gate and
+  // the measurements are in docs/stage-a-text-once.md. The capture calls sit in the
+  // BW branches of the blit paths only: under this path the gray passes re-draw
+  // images but never text, so the BW pass is the only place a text contribution
+  // can be recorded.
   //
-  // Idea: with AA on, the reference draws the whole page three times (BW, LSB,
-  // MSB) because each mode targets a different buffer. TEXT only ever
-  // contributes a pure per-pixel classification of its coverage level:
-  //     2-bit glyphs:  LSB bit = level==1        MSB bit = level==1 || level==2
-  //     1-bit glyphs:  BW ink clears (no-op on a zeroed gray buffer); a WHITE
-  //                    glyph sets both planes, which is captured as level 1.
-  // so the gray passes could render images only (page->renderImages) and have the
-  // text bits OR'd in from a buffer captured during the BW pass.
-  void beginLevelCapture();   // allocates the scratch once, pre-fills with white (3)
+  // Contract — during the BW pass, record per pixel the two bits the gray passes
+  // would set. Two kinds of writer, two rules:
+  //   1. Mode-DISPATCHED blits (glyph blits) — captureLevel / captureLevelPhysical,
+  //      called beside the blit's own BW branch: the LSB plane takes bit 0
+  //      (level==1, dark gray) and the MSB plane takes bit 0 or bit 1 (level==2,
+  //      light gray). Accumulating (|=) is required because the gray planes OR: two
+  //      overlapping glyphs must keep both plane contributions.
+  //   2. Mode-AGNOSTIC primitives (drawLine, the fillRect/dither templates,
+  //      sup/sub renderCharScaled) — captureAgnostic, which OVERWRITES: drawPixel
+  //      is mode-agnostic, so the same clear happens in the gray passes and must
+  //      take back a level an earlier glyph recorded.
+  // Images need neither: they re-render through DirectPixelWriter in the gray
+  // passes, and image drawing only ever sets plane bits, never clears them.
+  //
+  // A per-glyph-pixel capture branch was recorded as costing ~240 ms on a 2,034-page
+  // book while the path was disabled — that is why the call sites had been removed.
+  // With the path enabled the two skipped layout walks pay for it many times over:
+  // renderPage 1,370 -> 892 ms on the same book.
+  void beginLevelCapture();   // allocates the scratch once, pre-fills with 0 (no contribution)
   void endLevelCapture() { _levelCapture = false; }
   bool levelCaptureActive() const { return _levelCapture; }
   // Logical-coordinate capture (rotates exactly like drawPixel()).
   void captureLevel(int x, int y, uint8_t level) const;
   // Physical-coordinate capture for callers that already have panel coordinates.
   void captureLevelPhysical(int phyX, int phyY, uint8_t level) const;
+  // Capture a MODE-AGNOSTIC primitive write: drawLine, the fillRect / dither
+  // templates, and sup/sub scaled glyphs perform the *same* draw in every pass, so
+  // their effect on a gray plane is decided by `state` alone - true clears the plane
+  // bit, false sets it in both planes. Unlike captureLevel() this overwrites the
+  // recorded level, because the write also clears the bit in the real gray passes.
+  // Required for exactness: an opaque write (a rule, a shaded panel, a frame) drawn
+  // AFTER text must take back the text's captured gray bits.
+  void captureAgnostic(int x, int y, bool state) const;
+  void captureAgnosticPhysical(int phyX, int phyY, bool state) const;
   // OR the captured text level mask into a gray plane buffer (48000 bytes):
   // lsbPlane=true  -> bit set where level == 1
   // lsbPlane=false -> bit set where level == 1 || level == 2

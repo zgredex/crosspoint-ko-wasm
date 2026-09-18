@@ -136,29 +136,31 @@ class EngineDriver {
 
     const bool aaOn = spec.textAntiAliasing != 0;
     // ---------------------------------------------------------------------
-    // TEXT-ONCE PATH — IMPLEMENTED, MEASURED, NOT ENABLED.
+    // TEXT-ONCE PATH - ENABLED, gated byte-identical (docs/stage-a-text-once.md).
     //
-    // Idea: with AA on, the gray passes only contribute the text classification,
-    // so text could be blitted once (BW pass) and its gray bits OR'd in from
-    // `orCapturedGrayInto` instead of re-blitting the whole page twice more.
-    // Measured: renderPage 1,491 -> 1,144 ms (-23%) on a 2,034-page book.
+    // With AA on the gray passes contribute nothing but the text's coverage
+    // classification, so text is blitted ONCE (the BW pass) while its per-pixel
+    // level is recorded, and both gray planes are composed from that recording by
+    // orCapturedGrayInto() instead of re-walking the page layout twice more.
     //
-    // It is NOT byte-exact, so it stays off. Evidence:
-    //   * control (capture enabled, gray passes = reference) -> byte-exact, which
-    //     proves the capture itself is side-effect free;
-    //   * with the path on: 293/2,034 pages of a text book and 4/14 of an image
-    //     book diverge, on pages where Page::hasImages() == false, i.e. pages
-    //     whose gray passes draw nothing but text;
-    //   * the BW (ink) plane ALSO diverges there, and pass 1 is untouched code —
-    //     that is the contradiction. Either the page -> packed-page mapping or
-    //     the assumption that gray-mode text drawing is a pure function of the
-    //     coverage level is incomplete.
-    // Do not flip this on without resolving that first. Diagnostics that localise
-    // it live in the skill: references/ko-engine-performance-work.md (blob-shape
-    // map + per-plane split, which show thin 1px dither-like differences in a
-    // regular grid pattern).
+    // Two invariants make it exact:
+    //   * the capture models BOTH halves of what a gray pass does - the OR of
+    //     set-bits (captureLevel: accumulated, one bit per plane) and the
+    //     mode-agnostic writes of drawLine / the fillRect dither templates /
+    //     sup-sub scaled glyphs, which CLEAR the plane bit and therefore must be
+    //     able to take back a level an earlier glyph blit recorded
+    //     (captureAgnostic: overwriting). Modelling only the OR half left exactly
+    //     the pixels where a rule or panel is drawn over text diverging.
+    //   * everything the gray passes re-draw themselves (images, through
+    //     DirectPixelWriter) only ever sets plane bits, never clears them, so
+    //     OR-ing the captured text bits in afterwards reproduces the three-pass
+    //     planes for image pages too.
+    //
+    // Measured on the 2,034-page Korean text book: renderPage 1,370 -> 892 ms
+    // (-35%), total 1,521 -> 1,043 ms; 0/2,034 pages differ. Book-wide gates
+    // (text book, image book, and real EPUBs) are recorded in the doc above.
     // ---------------------------------------------------------------------
-    const bool textOnce = false;
+    const bool textOnce = true;
 
     if (textOnce) renderer_.beginLevelCapture();
     renderPass(false);

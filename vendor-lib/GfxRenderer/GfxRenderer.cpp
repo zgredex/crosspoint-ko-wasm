@@ -332,6 +332,7 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
           }
         }
         if (maxRaw >= 2 || coverage >= 2) {
+          renderer.captureAgnostic(baseX + dstX, baseY + dstY, pixelState);
           renderer.drawPixel(baseX + dstX, baseY + dstY, pixelState);
         }
       }
@@ -354,6 +355,7 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
           }
         }
         if (hasInk) {
+          renderer.captureAgnostic(baseX + dstX, baseY + dstY, pixelState);
           renderer.drawPixel(baseX + dstX, baseY + dstY, pixelState);
         }
       }
@@ -475,8 +477,12 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
               const uint8_t v = static_cast<uint8_t>(3 - ((b >> ((3 - (pp & 3)) * 2)) & 0x3));
               if (renderMode == GfxRenderer::BW) {
                 if (v < 3) {
+                  renderer.captureLevelPhysical(phyX, phyY0 - gx, v);
                   fb[idx] &= static_cast<uint8_t>(~mask);
-                  if (boldOk) fb[idx - stride] &= static_cast<uint8_t>(~mask);
+                  if (boldOk) {
+                    renderer.captureLevelPhysical(phyX, phyY0 - gx - 1, v);
+                    fb[idx - stride] &= static_cast<uint8_t>(~mask);
+                  }
                 }
               } else if (renderMode == GfxRenderer::GRAYSCALE_MSB) {
                 if (v == 1 || v == 2) {
@@ -532,11 +538,14 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
 
           if (renderMode == GfxRenderer::BW && bmpVal < 3) {
             // Black (also paints over the grays in BW mode)
+            renderer.captureLevel(screenX, screenY, bmpVal);
             renderer.drawPixel(screenX, screenY, pixelState);
             if (syntheticBold) {
               if constexpr (rotation == TextRotation::Rotated90CW) {
+                renderer.captureLevel(screenX, screenY - 1, bmpVal);
                 renderer.drawPixel(screenX, screenY - 1, pixelState);
               } else {
+                renderer.captureLevel(screenX + 1, screenY, bmpVal);
                 renderer.drawPixel(screenX + 1, screenY, pixelState);
               }
             }
@@ -827,6 +836,7 @@ void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const bool state) con
       std::swap(y1, y2);
     }
     for (int y = y1; y <= y2; y++) {
+      captureAgnostic(x1, y, state);
       drawPixel(x1, y, state);
     }
   } else if (y1 == y2) {
@@ -834,6 +844,7 @@ void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const bool state) con
       std::swap(x1, x2);
     }
     for (int x = x1; x <= x2; x++) {
+      captureAgnostic(x, y1, state);
       drawPixel(x, y1, state);
     }
   } else {
@@ -847,6 +858,7 @@ void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const bool state) con
 
     int err = dx - dy;
     while (true) {
+      captureAgnostic(x1, y1, state);
       drawPixel(x1, y1, state);
       if (x1 == x2 && y1 == y2) break;
       int e2 = 2 * err;
@@ -1003,22 +1015,28 @@ void GfxRenderer::drawPixelDither<Color::Clear>(const int x, const int y) const 
 
 template <>
 void GfxRenderer::drawPixelDither<Color::Black>(const int x, const int y) const {
+  captureAgnostic(x, y, true);
   drawPixel(x, y, true);
 }
 
 template <>
 void GfxRenderer::drawPixelDither<Color::White>(const int x, const int y) const {
+  captureAgnostic(x, y, false);
   drawPixel(x, y, false);
 }
 
 template <>
 void GfxRenderer::drawPixelDither<Color::LightGray>(const int x, const int y) const {
-  drawPixel(x, y, x % 2 == 0 && y % 2 == 0);
+  const bool on = x % 2 == 0 && y % 2 == 0;
+  captureAgnostic(x, y, on);
+  drawPixel(x, y, on);
 }
 
 template <>
 void GfxRenderer::drawPixelDither<Color::DarkGray>(const int x, const int y) const {
-  drawPixel(x, y, (x + y) % 2 == 0);  // TODO: maybe find a better pattern?
+  const bool on = (x + y) % 2 == 0;  // TODO: maybe find a better pattern?
+  captureAgnostic(x, y, on);
+  drawPixel(x, y, on);
 }
 
 void GfxRenderer::fillRectDither(const int x, const int y, const int width, const int height, Color color) const {
@@ -2200,9 +2218,10 @@ void GfxRenderer::beginLevelCapture() {
     _levelBuf = static_cast<uint8_t*>(malloc(static_cast<size_t>(rowBytes) * panelHeight));
     if (!_levelBuf) { _levelRowBytes = 0; return; }
   }
-  // Pre-fill with white (level 3): a pixel no glyph touches stays white, and
-  // white sets no gray bit, so untouched pixels need no capture at all.
-  memset(_levelBuf, 0xFF, static_cast<size_t>(_levelRowBytes) * panelHeight);
+  // Pre-fill with "no contribution" (level 0). A pixel no draw touches must add
+  // NO gray bit, because the gray passes only ever OR set-bits into their planes;
+  // an untouched pixel is left exactly as the pass produced it.
+  memset(_levelBuf, 0x00, static_cast<size_t>(_levelRowBytes) * panelHeight);
   _levelCapture = true;
 }
 
@@ -2218,7 +2237,39 @@ void GfxRenderer::captureLevelPhysical(const int phyX, const int phyY, const uin
   if (!_levelBuf || phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) return;
   uint8_t* p = _levelBuf + static_cast<size_t>(phyY) * _levelRowBytes + (phyX >> 2);
   const uint8_t shift = static_cast<uint8_t>((3 - (phyX & 3)) * 2);
-  *p = static_cast<uint8_t>((*p & ~(0x3u << shift)) | ((level & 0x3u) << shift));
+  // ACCUMULATE, never assign. The gray passes OR their set-bits into the plane, so a
+  // pixel drawn twice with different levels ends up with BOTH plane contributions; an
+  // assign would keep only the last one and silently drop the earlier level's plane
+  // (v==1 followed by v==2 lost the LSB). Bit 0 = a draw the LSB pass also makes
+  // (v==1), bit 1 = a draw only the MSB pass makes (v==2). Black (v==0) and white
+  // (v==3) set no plane bit in the gray passes, so they contribute nothing.
+  if (level == 1) *p |= static_cast<uint8_t>(0x1u << shift);
+  else if (level == 2) *p |= static_cast<uint8_t>(0x2u << shift);
+}
+
+void GfxRenderer::captureAgnostic(const int x, const int y, const bool state) const {
+  if (!_levelCapture || !_levelBuf) return;
+  int phyX = 0;
+  int phyY = 0;
+  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
+  captureAgnosticPhysical(phyX, phyY, state);
+}
+
+void GfxRenderer::captureAgnosticPhysical(const int phyX, const int phyY, const bool state) const {
+  if (!_levelBuf || phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) return;
+  uint8_t* p = _levelBuf + static_cast<size_t>(phyY) * _levelRowBytes + (phyX >> 2);
+  const uint8_t shift = static_cast<uint8_t>((3 - (phyX & 3)) * 2);
+  // OVERWRITE, unlike captureLevelPhysical. A mode-agnostic primitive (drawLine,
+  // fillRect / the dither templates, sup/sub scaled glyphs) performs the same draw in
+  // every pass, and drawPixel() is mode-agnostic, so its effect on a gray plane is
+  // whatever its state says: state=true CLEARS the plane bit (the bit is 0 no matter
+  // what an earlier glyph blit set there), state=false SETS it in both planes (which
+  // is level 1's encoding). This is the half of the model that captureLevelPhysical
+  // cannot express: a later opaque write takes back an earlier glyph's level, exactly
+  // as it clears the plane bit in the real gray passes. Without it, a rule or a
+  // shaded panel drawn over text keeps the text's captured gray bits.
+  const uint8_t level = state ? 0u : 0x1u;
+  *p = static_cast<uint8_t>((*p & ~(0x3u << shift)) | (level << shift));
 }
 
 void GfxRenderer::orCapturedGrayInto(uint8_t* planeOut, const bool lsbPlane) const {
@@ -2232,10 +2283,14 @@ void GfxRenderer::orCapturedGrayInto(uint8_t* planeOut, const bool lsbPlane) con
       const uint8_t hi = lrow[b * 2 + 1];  // pixels 4..7
       uint8_t bits = 0;
       for (int i = 0; i < 4; i++) {
+        // Bit test, not equality: bit 0 means "the LSB pass sets this pixel too"
+        // (engine v==1, dark gray), bit 1 means "only the MSB pass does" (v==2,
+        // light gray). The MSB plane therefore takes either bit, the LSB plane
+        // only bit 0.
         const uint8_t lvLo = static_cast<uint8_t>((lo >> ((3 - i) * 2)) & 0x3u);
-        if (lvLo == 1 || (!lsbPlane && lvLo == 2)) bits |= static_cast<uint8_t>(0x80u >> i);
+        if (lvLo & (lsbPlane ? 0x1u : 0x3u)) bits |= static_cast<uint8_t>(0x80u >> i);
         const uint8_t lvHi = static_cast<uint8_t>((hi >> ((3 - i) * 2)) & 0x3u);
-        if (lvHi == 1 || (!lsbPlane && lvHi == 2)) bits |= static_cast<uint8_t>(0x08u >> i);
+        if (lvHi & (lsbPlane ? 0x1u : 0x3u)) bits |= static_cast<uint8_t>(0x08u >> i);
       }
       outRow[b] |= bits;
     }
