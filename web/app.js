@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=33');
+    const w = new Worker(base + 'ko.worker.js?v=34');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -110,12 +110,15 @@
     book = null;
     bootEngine().then(() => {
       respawning = false;
-      if (els.file.files && els.file.files[0]) {
-        els.file.files[0].arrayBuffer().then((buf) => loadBook(buf, els.file.files[0].name));
+      // §8: prefer the remembered File — it survives a cancelled picker and is populated by
+      // drag/drop, neither of which the input's FileList can do.
+      const f = currentBookFile || (els.file.files && els.file.files[0]) || null;
+      if (f) {
+        f.arrayBuffer().then((buf) => { pendingBookFile = f; return loadBook(buf, f.name); });
       } else {
         const q = new URLSearchParams(location.search);
         const auto = q.get('epub');
-        if (auto) fetch(auto).then((r) => r.arrayBuffer()).then((buf) => loadBook(buf, auto.split('/').pop()));
+        if (auto) fetch(auto).then((r) => r.arrayBuffer()).then((buf) => { pendingBookFile = null; return loadBook(buf, auto.split('/').pop()); });
       }
     }).catch(() => { respawning = false; });
   }
@@ -197,7 +200,10 @@
     // long titles truncate in the header — hover reveals the full message
     els.status.title = (msg || '').replace(/\s+/g, ' ').trim();
     els.status.className = 'status' + (isErr ? ' err' : ' ok');
-    document.body.classList.add('status-active');
+    // §7: while the modal drawer is open a toast would sit on top of it (60 over 40).
+    if (!document.body.classList.contains('drawer-open')) {
+      document.body.classList.add('status-active');
+    }
     clearTimeout(statusTimer);
     if (!isErr) {
       statusTimer = setTimeout(() => document.body.classList.remove('status-active'), 4000);
@@ -631,12 +637,24 @@
     busy('EPUB 분석 중');
     try {
       const r = await call('load', { epub: buf }, [buf], 120000);
-      book = { title: r.title, spineCount: r.spineCount, hrefs: r.hrefs };
+      // §5: canonicalize ONCE, here. The header, the export filename and every later comparison
+      // then use one composed string. An NFD metadata title used to reach the filename sanitizer
+      // raw, where only composed syllables ([가-힣]) are allowed, and a book with no metadata title
+      // exported as "book" even though the header showed the filename.
+      // The engine falls back to the FILENAME when the EPUB has no <dc:title>, so strip a trailing
+      // .epub from whichever source won — otherwise "untitled.epub" lands in the export filename.
+      const stripExt = (v) => String(v || '').replace(/\.epub$/i, '').trim();
+      const canonicalTitle = normalizeDisplayText(
+        stripExt(r.title) || stripExt(name) || '제목 없음'
+      );
+      book = { title: canonicalTitle, spineCount: r.spineCount, hrefs: r.hrefs };
+      currentBookFile = pendingBookFile;   // §8: only a successful load promotes the File
+      pendingBookFile = null;
       populateSpines(r.hrefs);
       state = { spine: 0, page: 0, pages: 0, mode: state.mode };  // keep output mode
       els.coverBtn.disabled = false;
       setAppState('loaded');
-      const shownTitle = normalizeDisplayText(r.title || name || '제목 없음');
+      const shownTitle = canonicalTitle;
       els.bookTitle.textContent = shownTitle;
       els.bookTitle.hidden = false;
       els.bookTitle.title = shownTitle;
@@ -653,6 +671,13 @@
   }
 
   // ---- events ----
+  // §8: remember the loaded File here instead of reading it back off <input>. Clearing the input as
+  // the dialog opens (so re-picking the same path fires change) also wipes its FileList when the
+  // user then cancels, and drag/dropped files never populate it at all — both used to break the
+  // worker-respawn recovery, which reloaded from els.file.
+  let pendingBookFile = null;    // the File behind the in-flight load
+  let currentBookFile = null;    // the File behind the book that is actually loaded
+
   function startLoad(f) {
     if (!f) return;
     if (!/\.epub$/i.test(f.name || '') && f.type !== 'application/epub+zip') {
@@ -662,6 +687,7 @@
     // §4: the button label stays "EPUB 파일 선택". It used to be replaced by the filename, which
     // turned the primary action into a multi-line block for a long Korean name — and left it that
     // way permanently if parsing then failed. The name goes in its own one-line ellipsized field.
+    pendingBookFile = f;
     const picked = document.getElementById('pickedFile');
     if (picked) {
       picked.textContent = '선택됨: ' + normalizeDisplayText(f.name);
@@ -970,8 +996,11 @@
       syncExportSeg();
       syncAaToMode();
     }
-    // sliders show their value in an <output>: refresh those after restoring
-    if (els.screenMarginOut) els.screenMarginOut.textContent = els.screenMargin.value;
+    // §6: refresh EVERY slider's <output> with the same formatters the sliders use, so the label
+    // and the value cannot drift. Restoring only the margin meant a saved 18 pt / 600 / 12 px
+    // profile reopened with those values applied while the labels still read 14 pt / 500 / 9 px —
+    // and the margin lost its unit ('5' instead of '5 px').
+    refreshSliderOutputs();
     if (els.zoomOut) els.zoomOut.textContent = els.zoom.value + '%';
     return true;
   }
@@ -1025,6 +1054,14 @@
   els.fontFile.addEventListener('change', syncDependentControls);
   syncDependentControls();
   // live slider outputs on input (per-frame); repaint + warm on change
+  function refreshSliderOutputs() {
+    SLIDER_ROWS.forEach(([id, outId, fmt]) => {
+      const el = els[id] || document.getElementById(id);
+      const out = document.getElementById(outId);
+      if (el && out) out.textContent = fmt(el.value);
+    });
+  }
+
   const SLIDER_ROWS = [
     ['screenMargin', 'screenMarginOut', (v) => v + ' px'],
     ['fontSize', 'fontSizeOut', (v) => v + ' pt'],
@@ -1152,7 +1189,7 @@
   function exportFilename(xtcz) {
     let n = (book ? book.title : 'book').replace(/[^\w\s가-힣\-\[\]]+/g, '').trim();
     if (!n) n = 'book';
-    const pre = (els.exportName.value || '').trim();
+    const pre = normalizeDisplayText((els.exportName.value || '').trim());   // §5: NFC first
     const ext = xtcz ? '.xtcz' : (state.mode === 0 ? '.xtc' : '.xtch');
     // the prefix keeps Hangul (w and the \w class do not cover it) and the result is trimmed,
     // otherwise a prefix made only of non-ASCII characters left a stray leading space
@@ -1180,11 +1217,13 @@
         const ratio = res.xtcz && res.rawBytes ? ' (원본의 ' + (100 * u8.byteLength / res.rawBytes).toFixed(0) + '%)' : '';
         els.exportStatus.textContent = '✓ ' + filename + ' — ' + res.pages + '쪽, ' +
           (u8.byteLength / 1048576).toFixed(1) + ' MB' + ratio + ' (사전 변환)';
+        setStatus('✓ 내보내기 완료 — ' + filename);   // §4: resolve the header, not just the panel
         saveBlob(u8, filename);
         warmSpecKey = null;   // bytes handed over; next warm refills
         refresh(true);        // engine was invalidated by the warm pass
       } catch (e) {
         els.exportStatus.textContent = '✗ 미리 변환본을 불러오지 못했습니다. 미리보기를 한 번 넘긴 뒤 다시 시도해 주세요.';
+        setStatus('✗ 내보내기에 실패했습니다. 미리보기를 한 번 넘긴 뒤 다시 시도해 주세요.', true);
       } finally {
         exporting = false;
         els.downloadBtn.disabled = !book;
@@ -1211,6 +1250,7 @@
       els.exportStatus.textContent = '✓ ' + filename + ' — ' + res.pages + '쪽, ' +
         (u8.byteLength / 1048576).toFixed(1) + ' MB' + ratio;
       saveBlob(u8, filename);
+      setStatus('✓ 내보내기 완료 — ' + filename);   // §4: otherwise desktop says "생성 중" forever
       // the export ran every spine through the engine; the next preview render
       // rebuilds the current spine so the page stays in sync with the book
       refresh(true);
@@ -1218,6 +1258,7 @@
       scheduleWarm(700);
     } catch (e) {
       els.exportStatus.textContent = '✗ ' + describeError(e, '내보내기');
+      setStatus('✗ ' + describeError(e, '내보내기'), true);
     } finally {
       exporting = false;
       els.downloadBtn.disabled = !book;
@@ -1246,8 +1287,19 @@
   window.__exportPeek = null;   // (removed with the file-view mode)
 
   // keyboard paging
+  // §3: the old guard skipped only INPUT/SELECT, so a focused <summary> (the ? help toggles), a
+  // button, or anything inside the settings dialog paged the book at the same time — and with the
+  // modal drawer open the book behind it is inert, so paging it is plainly wrong.
+  const pagingSuppressed = (t) => {
+    if (document.body.classList.contains('drawer-open')) return true;
+    if (!t || !t.tagName) return true;
+    const tag = t.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
+    if (t.isContentEditable) return true;
+    return !!(t.closest && t.closest('button, summary, a, label, [contenteditable], details'));
+  };
   document.addEventListener('keydown', (e) => {
-    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
+    if (pagingSuppressed(e.target)) return;
     if (e.key === 'ArrowLeft') els.prevBtn.click();
     else if (e.key === 'ArrowRight') els.nextBtn.click();
   });
@@ -1264,13 +1316,14 @@
   // visible panel. §5: opened from 내보내기 it focuses the export action, not the first setting.
   // §6: focus returns to whichever control opened it, not always to 설정.
   const drawerOverlay = () => window.matchMedia('(max-width: 1150px)').matches;
-  const drawerFocusables = () => Array.from(els.sidebar.querySelectorAll(
+  const drawerFocusables = (root) => Array.from((root || els.sidebar).querySelectorAll(
     'button:not([disabled]), select:not([disabled]), input:not([disabled]), summary, [href]'
   )).filter((el) => el.offsetParent !== null);
   let drawerReturnFocus = null;
 
-  function setDrawer(open, opener, focusTarget) {
+  function setDrawer(open, opener, focusTarget, opts) {
     const isOpen = !!open;
+    if (isOpen) document.body.classList.remove('status-active');   // §7
     document.body.classList.toggle('drawer-open', isOpen);
     els.drawerToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
     drawerBackdrop.hidden = !isOpen;
@@ -1284,7 +1337,9 @@
         if (appbar) appbar.setAttribute('inert', '');
         if (preview) preview.setAttribute('inert', '');
       }
-      const target = focusTarget || drawerFocusables()[0];
+      // default focus goes to the first SETTING; the close button stays reachable with Shift+Tab
+      // and is part of the Tab wrap below
+      const target = focusTarget || drawerFocusables(els.sidebar.querySelector('.sidebarScroll'))[0];
       if (target) target.focus({ preventScroll: true });
     } else {
       els.sidebar.removeAttribute('role');
@@ -1294,9 +1349,22 @@
       // remove inert before restoring focus, or the opener cannot take it
       const back = drawerReturnFocus || els.drawerToggle;
       drawerReturnFocus = null;
-      back.focus({ preventScroll: true });
+      // opts.keepFocus: normalizing after a breakpoint change must not yank focus around
+      if (!(opts && opts.keepFocus) && back) back.focus({ preventScroll: true });
     }
   }
+
+  // §2: the dialog's own close control
+  const drawerClose = document.getElementById('drawerClose');
+  if (drawerClose) drawerClose.addEventListener('click', () => setDrawer(false));
+
+  // §1: crossing 1150 px with the drawer open used to leave drawer-open, role="dialog",
+  // aria-modal and the inert attributes behind. CSS turns the sidebar back into a desktop column,
+  // but the app bar and preview would stay inert — a dead UI. Normalize on the boundary.
+  const drawerMq = window.matchMedia('(max-width: 1150px)');
+  const onDrawerBoundary = () => { if (!drawerMq.matches) setDrawer(false, null, null, { keepFocus: true }); };
+  if (drawerMq.addEventListener) drawerMq.addEventListener('change', onDrawerBoundary);
+  else if (drawerMq.addListener) drawerMq.addListener(onDrawerBoundary);   // Safari < 14
 
   els.drawerToggle.addEventListener('click', (e) =>
     setDrawer(!document.body.classList.contains('drawer-open'), e.currentTarget));
@@ -1352,7 +1420,10 @@
     const q = new URLSearchParams(location.search);
     const auto = q.get('epub');
     if (auto) {
-      fetch(auto).then((r) => r.arrayBuffer()).then((buf) => loadBook(buf, auto.split('/').pop()));
+      fetch(auto).then((r) => r.arrayBuffer()).then((buf) => {
+        pendingBookFile = null;   // §8: no File behind a fetch-loaded book
+        return loadBook(buf, auto.split('/').pop());
+      });
     }
   });
 })();

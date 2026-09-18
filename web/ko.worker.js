@@ -171,7 +171,7 @@ function post(id, ok, payload, transfer) {
 // first use so a page that never picks a custom font pays nothing. Version-pinned like
 // the engine: emscripten's glue fetches the .wasm with no query, so without ?v= the edge
 // would serve a cached module forever after any rebuild.
-const FT_MODULE_VERSION = '33';
+const FT_MODULE_VERSION = '34';
 let fontConv = null;
 let ftVersionString = '';
 async function getFontConverter() {
