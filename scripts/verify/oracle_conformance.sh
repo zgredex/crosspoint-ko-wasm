@@ -100,6 +100,9 @@ note "port    $(shasum -a 256 "$PORT_BIN" | cut -c1-16)"
 note "oracle  $(shasum -a 256 "$ORACLE_BIN" | cut -c1-16)"
 
 FIXTURES="$FIXTURES_OVERRIDE"
+# Fixtures this repo does not ship: the commercial Korean book used for the end-to-end measurement.
+# Absent from a clone by design, so the gate skips it with a note instead of failing.
+LOCAL_ONLY_FIXTURES="web/demo.epub"
 if [ -z "$FIXTURES" ]; then
   # Text fixtures first (their contract is total), then the image-bearing books: those are
   # where layout has to agree across image blocks and page breaks, and where the pixel
@@ -162,7 +165,19 @@ fi
 
 # --- 4. fixtures --------------------------------------------------------------
 for fx in $FIXTURES; do
-  [ -f "$fx" ] || { bad "missing fixture $fx"; continue; }
+  # A fixture that is absent BY DESIGN (a commercial book this repo does not redistribute) is not a
+  # gate failure; a fixture that should be in the checkout and is not, is. Without this distinction a
+  # fresh clone reported "missing fixture web/demo.epub" as a failure — technically true, and wrong
+  # about what it means, which is the kind of message that teaches people to ignore the gate.
+  if [ ! -f "$fx" ]; then
+    case " $LOCAL_ONLY_FIXTURES " in
+      *" $fx "*)
+        note "skipped $fx — local-only fixture (not redistributable, so not in the repo)"
+        continue ;;
+    esac
+    bad "missing fixture $fx"
+    continue
+  fi
   name="$(basename "$fx" .epub)"
   echo "== $fx =="
   "$PORT_BIN" "$REPO_ROOT/$fx" "$WORK/$name.port.xtch" --manifest "$WORK/$name.port.json" \
