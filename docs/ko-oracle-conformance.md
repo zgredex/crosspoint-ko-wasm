@@ -194,17 +194,25 @@ Following the reader is the requirement; the lane is a **reservation**, never co
 - because the reservation is a constant, a book paginates identically whether or not the
   device happens to have a status bar switched on.
 
-Measured effect of the two default changes (`web/demo.epub`, 60 chapters):
+Measured effect of the two default changes (`web/demo.epub`, 60 chapters) — each knob on its
+own, same binary, flags only:
 
-| configuration | viewport | font | pages | container bytes |
-|---|---|---|---|---|
-| old default (before this pass) | 464×778 | RIDIBatang 14 | 2,034 | 195,347,364 |
-| old default, same binary via flags | 464×778 | RIDIBatang 14 | 2,034 | 195,347,364 |
-| new default | 464×764 | KoPub Batang 14 | **1,690** | **162,310,292** |
+| font | viewport | pages | container bytes |
+|---|---|---|---|
+| RIDIBatang 14 (old default) | 464×778 | 2,034 | 195,347,364 |
+| RIDIBatang 14 | 464×764 | 2,035 | 195,443,402 |
+| KoPub Batang 14 | 464×778 | 1,684 | 161,734,064 |
+| **KoPub Batang 14 (new default)** | **464×764** | **1,690** | **162,310,292** |
+
+The ladder is the interesting part: the face is what moves pagination (−350 pages), the lane
+reservation moves it by a handful (+1 with RIDIBatang, +6 with KoPub) — small, and exactly the
+kind of difference that is invisible until it lands a line on the wrong side of a page break.
 
 The 2,034-page figure reproduces the number recorded in the `getLineHeight()` audit
-(`docs/ko-engine-upstream-parity.md` §3) exactly — the legacy configuration is still
-reachable (`--font ridibatang --margin-bottom 8`) and still behaves as it did.
+(`docs/ko-engine-upstream-parity.md` §3) exactly, and a build of the previous commit at
+`--font ridibatang --margin-bottom 8` produces the same container **byte-identical page for
+page** (2,034 pages, every plane equal — only the wall-clock `createTime` differs). The legacy
+configuration is still reachable and still behaves as it did.
 
 ## 7. Fonts
 
