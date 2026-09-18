@@ -121,9 +121,9 @@ for blob in $(env -i PATH=/opt/homebrew/bin:/usr/bin:/bin /usr/bin/python3 -c \
   RESP=$(curl -sS -H 'Accept-Encoding: br' -D /tmp/edge-headers -o /dev/null \
          -w '%{size_download}' "$HOST/$blob?cb=$CB")
   if grep -qi '^content-encoding: br' /tmp/edge-headers; then
-    echo "br  ${RESP} bytes on the wire (raw ${RAW})"
+    echo "br  ${RESP} bytes on the wire (package ${RAW})"
   else
-    echo "NOT COMPRESSED  ${RESP} bytes on the wire (raw ${RAW})"
+    echo "NOT COMPRESSED  ${RESP} bytes on the wire (package ${RAW})"
     sed -n '1p;/[Cc]ontent-[Tt]ype/p' /tmp/edge-headers | sed 's/^/      /'
     FAILED_COMPRESSION=1
   fi

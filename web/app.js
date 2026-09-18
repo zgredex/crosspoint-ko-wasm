@@ -60,7 +60,7 @@
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=45');
+    const w = new Worker(base + 'ko.worker.js?v=47');
     w.onmessage = (ev) => {
       const m = ev.data;
       // worker progress reports carry no id — surface them live
@@ -157,7 +157,7 @@
 
   function spawnExportWorker() {
     const base = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
-    const w = new Worker(base + 'ko.worker.js?v=45');
+    const w = new Worker(base + 'ko.worker.js?v=47');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -1616,10 +1616,10 @@
     const q = new URLSearchParams(location.search);
     const auto = q.get('epub');
     if (auto) {
-      fetch(auto).then((r) => r.arrayBuffer()).then((buf) => {
-        pendingBookFile = null;   // §8: no File behind a fetch-loaded book
-        return fetch(auto).then((r) => r.blob()).then((b) => loadBook(b, auto.split('/').pop()));
-      });
+      // Blob, not ArrayBuffer: the same object goes to both engines, and a transfer would detach it.
+      // (The previous shape fetched the book twice — the first download was discarded.)
+      pendingBookFile = null;       // §8: no File behind a fetch-loaded book
+      fetch(auto).then((r) => r.blob()).then((b) => loadBook(b, auto.split('/').pop()));
     }
   });
 })();

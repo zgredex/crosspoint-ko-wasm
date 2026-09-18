@@ -455,10 +455,27 @@ const DEFAULT_FACE = 'kopub';
 
 // Fetch the EPD2 bytes for a face. No engine involved, so this can run while the module is still
 // being fetched and compiled — that parallelism is the point.
+//
+// Retried, because an externalized face is on the BOOT-CRITICAL path: the default reader face is a
+// separate request from the module now, so the chance of at least one critical fetch failing is
+// strictly higher than when the font travelled inside the module, and the failure mode is a reader
+// with no font at all. Three attempts with backoff, and `cache: 'reload'` on the retries so a
+// poisoned or half-written cache entry cannot make every attempt fail the same way. A hard failure
+// still throws — a wrong or missing face must never be rendered around.
 async function fetchFaceBytes(name) {
-  const r = await fetch(asset(FACE_ASSETS[name]));
-  if (!r.ok) throw new Error(`face ${name}: HTTP ${r.status} for ${FACE_ASSETS[name]}`);
-  return { name, bytes: new Uint8Array(await r.arrayBuffer()) };
+  const url = asset(FACE_ASSETS[name]);
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch(url, attempt === 0 ? undefined : { cache: 'reload' });
+      if (!r.ok) throw new Error(`face ${name}: HTTP ${r.status} for ${FACE_ASSETS[name]}`);
+      return { name, bytes: new Uint8Array(await r.arrayBuffer()) };
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 2) await new Promise((res) => setTimeout(res, 250 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
 }
 
 // name -> Promise<boolean>, memoised so a face is fetched and registered at most once even if several
