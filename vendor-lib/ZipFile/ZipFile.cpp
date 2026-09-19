@@ -238,7 +238,11 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
 
       if (strcmp(itemName, filename) == 0) {
         // Found it! Update cursor to next entry
-        file.seekCur(m + k);
+        if (!file.seekCur(static_cast<int64_t>(m) + k)) break;
+        // m and k are attacker-controlled: a record whose extra field and comment run past the declared
+        // directory must not be accepted, and lastCentralDirPos must never point outside it — that cursor is
+        // where the NEXT lookup starts.
+        if (file.position() > cdEnd) break;
         lastCentralDirPos = file.position();
         lastCentralDirPosValid = true;
         found = true;
@@ -246,11 +250,12 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
       }
     } else {
       // Name too long, skip it
-      file.seekCur(nameLen);
+      if (!file.seekCur(nameLen)) break;
     }
 
     // Skip extra field + comment
-    file.seekCur(m + k);
+    if (!file.seekCur(static_cast<int64_t>(m) + k)) break;
+    if (file.position() > cdEnd) break;
   }
 
   return found;
@@ -290,6 +295,28 @@ long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
   const uint16_t filenameLength = pLocalHeader[26] + (pLocalHeader[27] << 8);
   const uint16_t extraOffset = pLocalHeader[28] + (pLocalHeader[29] << 8);
 
+  // Encrypted entries: unsupported, and MUST fail explicitly. An encrypted member's "compressed" bytes are
+  // not a deflate stream, so treating them as one is how a hostile archive gets the reader to consume
+  // arbitrary following bytes as entry content.
+  const uint16_t localFlags = le16(pLocalHeader + 6);
+  if (localFlags & 0x0001u) {
+    LOG_ERR("ZIP", "encrypted ZIP entry is not supported");
+    return -1;
+  }
+  // The local and central records must AGREE about the method. A contradiction is malformed input, not
+  // something to interpret: the two records describe the same bytes.
+  if (le16(pLocalHeader + 8) != fileStat.method) {
+    LOG_ERR("ZIP", "local compression method contradicts the central directory");
+    return -1;
+  }
+  // STORED means the member IS its bytes, so the two sizes must be equal. Without this, a record saying
+  // compressed=10, uncompressed=1,000,000 makes the reader consume following ZIP structures as content.
+  if (fileStat.method == ZIP_METHOD_STORED && fileStat.compressedSize != fileStat.uncompressedSize) {
+    LOG_ERR("ZIP", "STORED entry size mismatch (compressed %u != uncompressed %u)",
+            fileStat.compressedSize, fileStat.uncompressedSize);
+    return -1;
+  }
+
   // Validate the DATA RANGE this returns, not merely the 30-byte header it was computed from: a hostile
   // filename/extra length used to push the offset past EOF, where the "data" is whatever follows — and the
   // caller then inflated from there. Every step is a widening, checked addition.
@@ -307,6 +334,15 @@ long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
   if (dataOffset > file.size() || fileStat.compressedSize > file.size() - dataOffset) {
     LOG_ERR("ZIP", "Compressed data lies outside the file");
     return -1;
+  }
+  // Tighter than EOF: entry data must not run into the central directory. Physical EOF is not the real
+  // boundary — the directory is, and an entry that "ends" inside it is overlapping another member's record.
+  if (zipDetails.centralDirSize != 0 || zipDetails.totalEntries != 0) {
+    const size_t cdStart = static_cast<size_t>(zipDetails.centralDirOffset);
+    if (dataOffset > cdStart || fileStat.compressedSize > cdStart - dataOffset) {
+      LOG_ERR("ZIP", "entry data overlaps the central directory");
+      return -1;
+    }
   }
   return static_cast<long>(dataOffset);
 }
@@ -482,12 +518,17 @@ int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<u
         return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);
       });
 
-      while (it != targets.end() && it->hash == hash && it->len == nameLen) {
+      // A bucket of MORE THAN ONE target means the hash+length pair is ambiguous for this name — either a
+      // genuine FNV-1a collision or simply two spine items with the same href. Writing this entry's size
+      // into every candidate would be guessing. Leave them at zero and let the exact per-path lookup
+      // resolve them: hash NARROWS the search, exact bytes DECIDE identity.
+      auto last = it;
+      while (last != targets.end() && last->hash == hash && last->len == nameLen) ++last;
+      if (std::distance(it, last) == 1) {
         if (it->index < sizes.size()) {
           sizes[it->index] = uncompressedSize;
           matched++;
         }
-        ++it;
       }
 
       if (matched >= targetCount) return matched;

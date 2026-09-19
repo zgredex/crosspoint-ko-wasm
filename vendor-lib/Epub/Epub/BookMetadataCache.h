@@ -8,6 +8,12 @@
 #include <memory>
 #include <string>
 
+// The serialized spine/toc index schema stores these as int16, so INT16_MAX+1 items is the hard limit of
+// what the cache can name. Both lookup paths enforce it instead of truncating.
+static constexpr uint32_t MAX_BMC_INDEXED_ITEMS = static_cast<uint32_t>(INT16_MAX) + 1u;
+
+#include <cstdint>
+
 class BookMetadataCache {
  public:
   struct BookMetadata {

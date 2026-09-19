@@ -109,6 +109,14 @@ bool BookMetadataCache::beginTocPass() {
   }
 
   if (spineCount >= LARGE_SPINE_THRESHOLD) {
+    // The on-disk cache schema stores spineIndex/tocIndex as int16. Above that the value would WRAP and
+    // silently name a different spine, so refuse the book instead of truncating it into a book that looks
+    // valid but is not the one that was read.
+    if (spineCount > static_cast<int>(MAX_BMC_INDEXED_ITEMS)) {
+      LOG_ERR("BMC", "spine count %d exceeds the cache schema limit %u", spineCount,
+              static_cast<unsigned>(MAX_BMC_INDEXED_ITEMS));
+      return false;
+    }
     spineHrefIndex.clear();
     spineHrefIndex.resize(spineCount);
     spineFile.seek(0);
@@ -280,7 +288,9 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
       ZipFile::SizeTarget t;
       t.hash = ZipFile::fnvHash64(path.c_str(), path.size());
       t.len = static_cast<uint16_t>(path.size());
-      t.index = static_cast<uint16_t>(i);
+      // uint32_t, not uint16_t: SizeTarget::index was widened precisely because 16 bits wrapped above
+      // 65535 spine items and a wrapped index writes the size into a DIFFERENT spine's slot.
+      t.index = static_cast<uint32_t>(i);
       targets[i] = t;
     }
 
@@ -445,6 +455,12 @@ void BookMetadataCache::createTocEntry(const std::string& title, const std::stri
   } else {
     spineFile.seek(0);
     for (int i = 0; i < spineCount; i++) {
+      if (i > static_cast<int>(MAX_BMC_INDEXED_ITEMS)) {
+        // Same schema limit as the index build: an index that cannot be represented must leave this entry
+        // UNRESOLVED (spineIndex stays -1, the existing "not found" path) rather than wrap to another spine.
+        LOG_ERR("BMC", "TOC lookup truncated: spine index %d exceeds the cache schema limit", i);
+        break;
+      }
       auto spineEntry = readSpineEntry(spineFile);
       if (spineEntry.href == href) {
         spineIndex = static_cast<int16_t>(i);

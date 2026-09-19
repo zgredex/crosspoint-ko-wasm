@@ -7,6 +7,7 @@ control, and the unmutated book has to keep working or the control proves nothin
 
 Usage: /usr/bin/python3 scripts/verify/zip_hardening_gate.py [book.epub]
 """
+import io
 import os
 import shutil
 import struct
@@ -150,6 +151,97 @@ def huge_opf(d):
     raise SystemExit('no OPF entry found to mutate')
 
 mutant('an OPF claiming 2 GiB uncompressed is rejected', huge_opf, 'too large')
+
+# ---- 6. a STORED entry whose two sizes disagree -------------------------------------------------
+# The fixture stores only "mimetype" that way, and the reader never resolves it through the central
+# directory — so the control needs a book whose CONTENT is stored. Built here rather than assumed.
+def make_stored_book():
+    import zipfile
+    src = zipfile.ZipFile(BOOK)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_STORED) as dst:
+        for info in src.infolist():
+            dst.writestr(info.filename, src.read(info.filename))
+    src.close()
+    return out.getvalue()
+
+STORED_BOOK = make_stored_book()
+
+with tempfile.TemporaryDirectory() as td:
+    p = os.path.join(td, 'stored.epub')
+    out = os.path.join(td, 'stored.xtch')
+    open(p, 'wb').write(STORED_BOOK)
+    rc, tail = load(p, out)
+    ok = rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+    results.append((ok, 'control: an all-STORED book loads', f'exit={rc}', tail))
+    if not ok:
+        problems.append('stored control')
+
+def stored_size_mismatch(d):
+    for pos, name, _lho, usz in cd_entries(d):
+        if name.lower().endswith(b'.opf'):
+            struct.pack_into('<I', d, pos + 24, usz + 4096)     # uncompressed != compressed
+            return
+    raise SystemExit('no OPF entry found to mutate')
+
+def run_stored_mutant():
+    data = bytearray(STORED_BOOK)
+    stored_size_mismatch(data)
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, 'm.epub'); out = os.path.join(td, 'm.xtch')
+        open(src, 'wb').write(bytes(data))
+        rc, tail = load(src, out)
+        produced = os.path.exists(out) and os.path.getsize(out) > 0
+        ok = rc != 0 and not produced and 'STORED entry size mismatch' in tail
+        results.append((ok, 'a STORED entry with mismatched sizes is rejected', f'exit={rc} produced={produced}', tail))
+        if not ok:
+            problems.append('stored mismatch')
+
+run_stored_mutant()
+
+# ---- 7. an encrypted member ---------------------------------------------------------------------
+def encrypted_entry(d):
+    for _pos, name, lho, _usz in cd_entries(d):
+        if name.lower().endswith(b'.opf'):
+            flags = struct.unpack_from('<H', d, lho + 6)[0]
+            struct.pack_into('<H', d, lho + 6, flags | 0x0001)   # the encryption bit
+            return
+    raise SystemExit('no OPF entry found to mutate')
+
+mutant('an encrypted entry is rejected', encrypted_entry, 'encrypted')
+
+# ---- 8. local and central records disagreeing about the method ----------------------------------
+def method_contradiction(d):
+    for pos, name, lho, _usz in cd_entries(d):
+        if name.lower().endswith(b'.opf'):
+            # read the central method first, then make the local one CONTRADICT it — writing a constant
+            # here was a no-op whenever the entry already used that method
+            central = struct.unpack_from('<H', d, pos + 10)[0]
+            struct.pack_into('<H', d, lho + 8, 0 if central != 0 else 8)
+            return
+    raise SystemExit('no OPF entry found to mutate')
+
+mutant('a local/central method contradiction is rejected', method_contradiction, 'contradicts')
+
+# ---- 9. entry data running into the central directory -------------------------------------------
+def data_overlaps_cd(d):
+    e = eocd_offset(d)
+    cd_off = struct.unpack_from('<I', d, e + 16)[0]
+    for pos, name, _lho, _usz in cd_entries(d):
+        if name.lower().endswith(b'.opf'):
+            # A member that reaches INTO the directory but stays inside the FILE: claiming the whole
+            # distance to the directory would be caught by the older "outside the file" test instead, and
+            # then this control would prove nothing about the overlap rule.
+            cd_off2 = struct.unpack_from('<I', d, struct.unpack_from('<I', d, 0)[0])[0] if False else cd_off
+            lho_here = struct.unpack_from('<I', d, pos + 42)[0]
+            name_len = struct.unpack_from('<H', d, lho_here + 26)[0]
+            extra_len = struct.unpack_from('<H', d, lho_here + 28)[0]
+            data_off = lho_here + 30 + name_len + extra_len
+            struct.pack_into('<I', d, pos + 20, cd_off2 - data_off + 100)
+            return
+    raise SystemExit('no OPF entry found to mutate')
+
+mutant('entry data overlapping the central directory is rejected', data_overlaps_cd, 'overlaps')
 
 # ---- report -------------------------------------------------------------------------------------
 print(f'zip-hardening gate — {os.path.basename(BOOK)}')
