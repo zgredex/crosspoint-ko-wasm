@@ -22,7 +22,11 @@ namespace {
 constexpr size_t MAX_CONTAINER_XML = 1u * 1024 * 1024;      // META-INF/container.xml
 constexpr size_t MAX_OPF_XML = 16u * 1024 * 1024;           // the OPF package document
 constexpr size_t MAX_TOC_XML = 16u * 1024 * 1024;           // the navigation document (NAV or NCX)
-constexpr size_t MAX_COVER_WRAPPER_XML = 4u * 1024 * 1024;  // the XHTML page wrapping a guide cover
+// NOTE: there is deliberately no ceiling on the guide-cover wrapper XHTML. It cannot take one without
+// rewriting the reference's own read in Epub::load (the item is allocated inside readItemContentsToBytes),
+// and the oracle pin allows only ADDITIVE divergence in pinned engine files — it flagged the attempt as
+// "amended". A pre-allocation ceiling here needs the reference to change first. Recorded as a known gap
+// rather than silently restructured to look covered.
 }  // namespace
 
 bool Epub::findContentOpfFile(std::string* contentOpfFile) const {
