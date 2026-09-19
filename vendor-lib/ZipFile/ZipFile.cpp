@@ -93,44 +93,70 @@ bool ZipFile::loadAllFileStatSlims() {
 
   const size_t cdEnd = static_cast<size_t>(zipDetails.centralDirOffset) + zipDetails.centralDirSize;
 
-  uint32_t sig;
-  char itemName[256];
-  fileStatSlimCache.clear();
-  fileStatSlimCache.reserve(zipDetails.totalEntries);
+  // TRANSACTIONAL: builds a candidate and commits it only after the WHOLE declared directory parsed.
+  // The previous version broke out of the loop on the first bad record and still returned true, so the
+  // cache became authoritative while holding only the entries up to the corruption — every later entry
+  // was then treated as absent, and the failure looked like "this book has no such file" rather than
+  // "this archive is malformed".
+  std::unordered_map<std::string, FileStatSlim> candidate;
+  candidate.reserve(zipDetails.totalEntries);
 
-  // Exactly totalEntries records, every read verified, and never past the directory the EOCD declared.
-  // `while (file.available())` let the archive dictate when its own directory ended.
   for (uint32_t i = 0; i < zipDetails.totalEntries; ++i) {
     const size_t here = file.position();
-    if (here > cdEnd || cdEnd - here < ZIP_CD_MIN_ENTRY) break;   // ran off the declared directory
-    if (file.read(&sig, 4) != 4 || sig != ZIP_SIG_CENTRAL) break;
-
-    FileStatSlim fileStat = {};
-
-    if (!file.seekCur(6)) break;
-    if (file.read(&fileStat.method, 2) != 2) break;
-    if (!file.seekCur(8)) break;
-    if (file.read(&fileStat.compressedSize, 4) != 4) break;
-    if (file.read(&fileStat.uncompressedSize, 4) != 4) break;
-    uint16_t nameLen, m, k;
-    if (file.read(&nameLen, 2) != 2) break;
-    if (file.read(&m, 2) != 2) break;
-    if (file.read(&k, 2) != 2) break;
-    if (!file.seekCur(8)) break;
-    if (file.read(&fileStat.localHeaderOffset, 4) != 4) break;
-
-    if (nameLen < sizeof(itemName)) {
-      if (file.read(itemName, nameLen) != static_cast<int>(nameLen)) break;
-      itemName[nameLen] = '\0';
-      fileStatSlimCache.emplace(itemName, fileStat);
-    } else {
-      // Skip over oversized entry names to avoid writing past fixed buffer.
-      if (!file.seekCur(nameLen)) break;
+    if (here > cdEnd || cdEnd - here < ZIP_CD_MIN_ENTRY) {
+      fileStatSlimCache.clear();
+      return false;                                              // ran off the declared directory
     }
 
-    // Skip the rest of this entry (extra field + comment)
-    if (!file.seekCur(m + k)) break;
+    uint8_t fixed[ZIP_CD_MIN_ENTRY];
+    if (file.read(fixed, sizeof(fixed)) != static_cast<int>(sizeof(fixed))) {
+      fileStatSlimCache.clear();
+      return false;
+    }
+    if (le32(fixed) != ZIP_SIG_CENTRAL) {
+      fileStatSlimCache.clear();
+      return false;
+    }
+
+    FileStatSlim fileStat = {};
+    fileStat.method = le16(fixed + 10);
+    fileStat.compressedSize = le32(fixed + 20);
+    fileStat.uncompressedSize = le32(fixed + 24);
+    fileStat.localHeaderOffset = le32(fixed + 44);
+    const uint16_t nameLen = le16(fixed + 28);
+    const uint16_t m = le16(fixed + 30);
+    const uint16_t k = le16(fixed + 32);
+
+    char itemName[256];
+    if (nameLen < sizeof(itemName)) {
+      if (file.read(itemName, nameLen) != static_cast<int>(nameLen)) {
+        fileStatSlimCache.clear();
+        return false;
+      }
+      itemName[nameLen] = '\0';
+      if (!candidate.emplace(itemName, fileStat).second) {
+        // Two entries with one name would make lookups order-dependent.
+        LOG_ERR("ZIP", "Duplicate entry name in central directory");
+        fileStatSlimCache.clear();
+        return false;
+      }
+    } else if (!file.seekCur(nameLen)) {
+      fileStatSlimCache.clear();
+      return false;
+    }
+
+    if (!file.seekCur(static_cast<int64_t>(m) + k)) {
+      fileStatSlimCache.clear();
+      return false;
+    }
+    if (file.position() > cdEnd) {
+      fileStatSlimCache.clear();
+      return false;
+    }
   }
+
+  // COMMIT — only after every declared record passed.
+  fileStatSlimCache.swap(candidate);
 
   // Set cursor to start of central directory for sequential access
   lastCentralDirPos = zipDetails.centralDirOffset;
@@ -374,43 +400,40 @@ bool ZipFile::getInflatedFileSize(const char* filename, size_t* size) {
 }
 
 int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<uint32_t>& sizes) {
-  if (targets.empty()) {
-    return 0;
-  }
+  if (targets.empty()) return 0;
 
   const ScopedOpenClose zip{*this};
-  if (!zip) return 0;
+  if (!zip) return -1;
 
-  if (!loadZipDetails()) return 0;
+  if (!loadZipDetails()) return -1;
 
-  file.seek(zipDetails.centralDirOffset);
+  if (!file.seek(zipDetails.centralDirOffset)) return -1;
+
+  const size_t cdEnd = static_cast<size_t>(zipDetails.centralDirOffset) + zipDetails.centralDirSize;
 
   int matched = 0;
   const int targetCount = static_cast<int>(targets.size());
-  uint32_t sig;
   char itemName[256];
 
-  while (file.available()) {
-    file.read(&sig, 4);
-    if (sig != 0x02014b50) break;
+  // Same bounds as every other central-directory walker: exactly totalEntries records, never past the
+  // declared directory, every read verified. This loop is NOT dead code — BookMetadataCache uses it for
+  // books at or above LARGE_SPINE_THRESHOLD, so it was the last hostile-metadata path left unchecked, and
+  // a malformed record here used to be indistinguishable from "no match".
+  for (uint32_t i = 0; i < zipDetails.totalEntries; ++i) {
+    const size_t here = file.position();
+    if (here > cdEnd || cdEnd - here < ZIP_CD_MIN_ENTRY) return -1;
 
-    file.seekCur(6);
-    uint16_t method;
-    file.read(&method, 2);
-    file.seekCur(8);
-    uint32_t compressedSize, uncompressedSize;
-    file.read(&compressedSize, 4);
-    file.read(&uncompressedSize, 4);
-    uint16_t nameLen, m, k;
-    file.read(&nameLen, 2);
-    file.read(&m, 2);
-    file.read(&k, 2);
-    file.seekCur(8);
-    uint32_t localHeaderOffset;
-    file.read(&localHeaderOffset, 4);
+    uint8_t fixed[ZIP_CD_MIN_ENTRY];
+    if (file.read(fixed, sizeof(fixed)) != static_cast<int>(sizeof(fixed))) return -1;
+    if (le32(fixed) != ZIP_SIG_CENTRAL) return -1;
 
-    if (nameLen < 256) {
-      file.read(itemName, nameLen);
+    const uint32_t uncompressedSize = le32(fixed + 24);
+    const uint16_t nameLen = le16(fixed + 28);
+    const uint16_t m = le16(fixed + 30);
+    const uint16_t k = le16(fixed + 32);
+
+    if (nameLen < sizeof(itemName)) {
+      if (file.read(itemName, nameLen) != static_cast<int>(nameLen)) return -1;
       itemName[nameLen] = '\0';
 
       uint64_t hash = fnvHash64(itemName, nameLen);
@@ -428,16 +451,16 @@ int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<u
         ++it;
       }
 
-      if (matched >= targetCount) {
-        break;
-      }
-    } else {
-      file.seekCur(nameLen);
+      if (matched >= targetCount) return matched;
+    } else if (!file.seekCur(nameLen)) {
+      return -1;
     }
 
-    file.seekCur(m + k);
+    if (!file.seekCur(static_cast<int64_t>(m) + k)) return -1;
+    if (file.position() > cdEnd) return -1;
   }
 
+  // Fewer matches than targets is legitimate (the caller falls back); a malformed directory is not.
   return matched;
 }
 

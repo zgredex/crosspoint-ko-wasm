@@ -289,7 +289,13 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
     });
 
     spineSizes.resize(spineCount, 0);
-    int matched = zip.fillUncompressedSizes(targets, spineSizes);
+    const int matched = zip.fillUncompressedSizes(targets, spineSizes);
+    if (matched < 0) {
+      // Deliberately NOT "0 matches, fall back": falling back would re-parse the same hostile central
+      // directory through a different code path, and the failure would surface later as a wrong size.
+      LOG_ERR("BMC", "Malformed central directory while batch-reading spine sizes");
+      return false;
+    }
     LOG_DBG("BMC", "Batch lookup matched %d/%d spine items", matched, spineCount);
 
     targets.clear();

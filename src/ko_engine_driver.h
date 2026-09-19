@@ -216,8 +216,13 @@ class EngineDriver {
     epubPath_ = virtualPath;
     epub_.reset(new Epub(virtualPath, "/.crosspoint"));
     if (!epub_->load(true, false)) {
-      // A mounted book that failed to open stays owned by the storage, so a 100 MB adoption would be
-      // held until the next load. Drop it here: for an owned mount that releases the buffer.
+      // Destroy the failed Epub FIRST (while its backing mount still exists, so nothing it holds dangles),
+      // then drop the mount — for an owned mount that releases the adopted buffer.
+      //
+      // This used to leave epub_ non-null after a failed parse, which made hasBook() report true and let
+      // every requireBook() guard pass against a half-initialised Epub. The guards looked right while
+      // their predicate was wrong; spineCount() would even report a stale count.
+      resetBook();
       Storage.remove(virtualPath.c_str());
       return false;
     }

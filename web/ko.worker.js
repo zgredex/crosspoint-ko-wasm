@@ -52,6 +52,7 @@ let frameCacheBytes = 0;
 // A new book reuses spine/page numbers, so frames must not survive a load. The generation counter
 // is part of every frame key (belt and braces next to the explicit clear).
 let bookGen = 0;
+let bookLoaded = false;   // true only between a committed load and the next replacement
 const COUNTERS = {
   epdfontLoads: 0, fontApplies: 0, fontSkips: 0, specApplies: 0, layoutApplies: 0,
   renderApplies: 0, builds: 0, renders: 0, framesPosted: 0, cacheHits: 0, prefetches: 0,
@@ -1187,7 +1188,12 @@ function enqueueBookLoad(fn) {
 // reloading it — leaving the reader rendering with the default face while the page believes otherwise.
 // `sectionEstimates` is cleared for the same reason: it is indexed by spine number alone, so a previous
 // book's spine 0 estimate would otherwise be inherited by the next book's spine 0.
-function resetWorkerStateAfterBookLoad() {
+// Book state is invalidated at replacement BEGIN, not after a successful parse. The old order
+// (loadEngineBook(), then reset) left ALL the JS-side book state describing the previous book when the new
+// one failed to parse — bookGen, currentSpine, builtKey, the frame cache and sectionEstimates still said A
+// while C++ had already destroyed it. A raw render could then be served from the JS frame cache and return
+// A's pixels without ever consulting the now-bookless engine.
+function beginWorkerBookReplacement() {
   currentSpine = -1;
   currentPages = 0;
   builtKey = null;
@@ -1197,9 +1203,41 @@ function resetWorkerStateAfterBookLoad() {
   clearFrameCache();
   appliedFont = null;           // the engine's font state went with the filesystem
   appliedFontStamp = -1;
+  // No book is usable until a load commits. Until then every command that needs one is refused, rather
+  // than silently reading the previous book's cached frames or estimates.
+  bookLoaded = false;
+  }
+
+// The commit half: called only once the new book is parsed AND its reply is ready to be posted.
+function finishWorkerBookLoad() {
+  bookLoaded = true;
+}
+
+function requireWorkerBook(id, op) {
+  if (bookLoaded) return true;
+  post(id, false, { code: 'NO_BOOK', error: op + ': no book loaded' });
+  return false;
+}
+
+// Roll back to "no book" for an open that failed AFTER the EPUB parsed (font re-apply, applySpec,
+// startSpine, first render, compose). Without this the page clears itself while the worker keeps the new
+// book, so the two disagree about what is loaded. openPreview is ONE transaction: either there is a usable
+// first page, or there is no book.
+function abortBookOpen() {
+  try {
+    if (api && api._ko_unload_book) api._ko_unload_book();
+  } catch (_) {}
+  self.__koBookBlob = null;
+  invalidateSection();
+  bookGen += 1;                 // anything already posted for the abandoned attempt is stale now
+  beginWorkerBookReplacement();
 }
 
 async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
+  // ONE transaction: either this book ends up usable, or there is no book. A failure AFTER the
+  // EPUB parsed (font re-apply, spec, startSpine, first render, compose) used to leave the worker
+  // holding the new book while the page had already cleared itself and reported failure.
+  try {
   if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); return; }
   if (!api) await init();
   // §2: stop the warm and WAIT for it before the engine's EPUB is replaced. Bumping the token
@@ -1212,6 +1250,7 @@ async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
   // Each worker reads the same Blob instead.
   dropWarmResult();     // §3: warm bytes belong to the previous book
   invalidateSection();
+  beginWorkerBookReplacement();     // BEFORE the engine is touched, so a failed parse cannot leave A
   loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
   spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
   loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength : (ev.data.blob ? ev.data.blob.size : 0);
@@ -1225,7 +1264,6 @@ async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
   api._ko_get_title(tbuf, 512);
   const title = api.UTF8ToString(tbuf);
   api._free(tbuf);
-  resetWorkerStateAfterBookLoad();
   // a new book cleared the in-memory FS: re-apply the custom font if one
   // is loaded, so the reader face survives chapter navigation
   if (customFontBytes && currentSpec && currentSpec.font === 'custom') {
@@ -1247,15 +1285,26 @@ async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
   // Where the reference reader would open: its own text reference, not always spine 0. The page
   // starts there; the container still holds every spine.
   const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
+  finishWorkerBookLoad();
   post(id, true, { bookGen, spineCount, title, startSpine, timing: loadTiming });
+
+  } catch (e) {
+    abortBookOpen();
+    throw e;
+  }
 }
 
 async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
+  // ONE transaction: either this book ends up usable, or there is no book. A failure AFTER the
+  // EPUB parsed (font re-apply, spec, startSpine, first render, compose) used to leave the worker
+  // holding the new book while the page had already cleared itself and reported failure.
+  try {
   if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); return; }
   if (!api) await init();
   await stopWarmBeforeMutation();
   dropWarmResult();
   invalidateSection();
+  beginWorkerBookReplacement();     // BEFORE the engine is touched, so a failed parse cannot leave A
   loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
   spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
   loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength
@@ -1269,9 +1318,6 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
   api._ko_get_title(titleBuf, 512);
   const openTitle = api.UTF8ToString(titleBuf);
   api._free(titleBuf);
-  // Same invalidation as 'load', through the same function: openPreview used to reset only the first two
-  // of these, which is how a custom face could be believed still applied after the filesystem was gone.
-  resetWorkerStateAfterBookLoad();
   if (ev.data.spec) await applySpec(ev.data.spec);
   const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
   const tBuild0 = performance.now();
@@ -1299,6 +1345,7 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
   const composeMs = performance.now() - tCompose0;
   const gen = sectionGen;
   const tx = frame.data.buffer;
+  finishWorkerBookLoad();
   post(id, true, {
     bookGen,                       // stage 7: the generation of the book this frame belongs to
     title: openTitle,
@@ -1316,21 +1363,29 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
   }, [tx]);
   // The rest of the spine keeps building behind the drawn frame.
   continueSection(startSpine, gen, BUILD_CHUNK);
+
+  } catch (e) {
+    abortBookOpen();
+    throw e;
+  }
 }
 
 self.onmessage = async (ev) => {
   const { id, cmd } = ev.data;
-  const isReplacement = cmd === 'load' || cmd === 'openPreview';
-  let isReplacementDone = false;
+  // ONE owner of the replacement slot. The counter used to be decremented in the case-local `finally`
+  // AND in the outer catch, so a load that threw past its case left it at -1. The guard is
+  // `replacementsPending > 0`, so one malformed EPUB silently disabled the BOOK_REPLACING lock for the
+  // rest of the session — the exact failure the lock exists to prevent.
+  const ownsReplacementSlot = cmd === 'load' || cmd === 'openPreview';
   // Non-replacement work is refused outright while a replacement is running: it would read half-swapped
   // engine state, and "the caller retries later" is a far better outcome than a render against a book
   // that is being torn down. Ping/stats stay allowed so the page can still ask whether the engine is
   // alive while it waits.
-  if (!isReplacement && replacementsPending > 0 && !SAFE_DURING_REPLACEMENT.has(cmd)) {
+  if (!ownsReplacementSlot && replacementsPending > 0 && !SAFE_DURING_REPLACEMENT.has(cmd)) {
     post(id, false, { code: 'BOOK_REPLACING', error: 'book replacement in progress' });
     return;
   }
-  if (isReplacement) replacementsPending++;
+  if (ownsReplacementSlot) replacementsPending++;
   let earlyRead = null;
   const t0Open = performance.now();
   try {
@@ -1404,13 +1459,13 @@ self.onmessage = async (ev) => {
       }
 
 case 'load': {
-  // Queued: a book replacement must not overlap another one (see enqueueBookLoad).
-  try {
-    await enqueueBookLoad(() => handleLoad(ev, id, initWaitMs, earlyRead, t0Open));
-  } finally {
-    replacementsPending--;
-  }
-  isReplacementDone = true;
+
+  // Queued: a book replacement must not overlap another one (see enqueueBookLoad). Nothing is released
+
+  // here — the single owner is the outer finally, which runs exactly once per command.
+
+  await enqueueBookLoad(() => handleLoad(ev, id, initWaitMs, earlyRead, t0Open));
+
   break;
 }
       case 'spec': {
@@ -1434,6 +1489,8 @@ case 'load': {
       }
 
       case 'build': {
+
+        if (!requireWorkerBook(id, 'build')) break;
         tick('build');
         const n = api._ko_build_spine(ev.data.spine);
         tock('build');
@@ -1454,16 +1511,12 @@ case 'load': {
       // and nothing about the first page needs that middle hop. `load` is kept for export/pool workers,
       // which want metadata without a preview frame.
 case 'openPreview': {
-  // Queued for the same reason as 'load' — and it is the same operation plus a first frame.
-  try {
-    await enqueueBookLoad(() => handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open));
-  } finally {
-    replacementsPending--;
-  }
-  isReplacementDone = true;
+  // Same as 'load': the outer finally owns the counter.
+  await enqueueBookLoad(() => handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open));
   break;
 }
       case 'render': {
+        if (!requireWorkerBook(id, 'render')) break;
         // §2/§8: the spec travels with the render, so an ordinary page turn is one request and a
         // settings change is one request too. When it has not changed, this does nothing at all.
         let vpInfo = null;
@@ -1577,6 +1630,8 @@ case 'openPreview': {
       }
 
       case 'cover': {
+
+        if (!requireWorkerBook(id, 'cover')) break;
         // generate cover BMP in the engine and return raw BMP bytes
         const rc = api._ko_generate_cover(ev.data.kind || 0);
         if (rc !== 0) {
@@ -1682,6 +1737,8 @@ case 'openPreview': {
       }
 
       case 'warm': {
+
+        if (!requireWorkerBook(id, 'warm')) break;
         // Background whole-book conversion (settings settled → pre-render the
         // book so the file is ready when the user hits export). Mirrors the
         // exportBook pipeline but WITHOUT transferring megabytes back to the
@@ -1774,6 +1831,7 @@ case 'openPreview': {
 // the call site whether that conversion happens, and a silently-null path is exactly the kind of thing
 // that would produce a container with missing chapter names and no error.
       case 'spineHrefs': {
+        if (!requireWorkerBook(id, 'spineHrefs')) break;
         // On demand again: safe because ko_get_spine_href() copies the href into its own buffer instead of
         // pointing into a by-value temporary (see the note where the snapshot used to be).
         const start = Math.max(0, ev.data.start | 0);
@@ -1793,6 +1851,8 @@ case 'openPreview': {
       }
 
       case 'encodeSpine': {
+
+        if (!requireWorkerBook(id, 'encodeSpine')) break;
         // ONE spine, laid out + rendered + ENCODED on this engine, returned as a single transferable
         // buffer. This is the unit of parallel work: rendering is ~85% of export time and it is
         // per-spine work, while the container is not. Page encoding is unchanged — the same writer
@@ -1834,6 +1894,8 @@ case 'openPreview': {
       }
 
       case 'planPrefix': {
+
+        if (!requireWorkerBook(id, 'planPrefix')) break;
         // Prefix-only assembly: the records never enter an engine. The container's fixed region is a
         // function of the page SIZES and the chapters, so this returns ~10 KB of header/metadata/
         // chapter-table/index and the caller composes [prefix][records…] in the browser. Uncompressed
@@ -1875,6 +1937,8 @@ case 'openPreview': {
       }
 
       case 'assembleSpines': {
+
+        if (!requireWorkerBook(id, 'assembleSpines')) break;
         // ONE assembler writes the container. The records arrive already encoded; this only appends
         // them in the order the caller sent (spine order) and builds the chapter table with the same
         // shared builder the serial path uses. Completion order must never reach this code, so the
@@ -1936,6 +2000,8 @@ case 'openPreview': {
       }
 
       case 'exportBook': {
+
+        if (!requireWorkerBook(id, 'exportBook')) break;
         // whole-book export with the current spec; 1-bit XTC or 2-bit XTCH per
         // mode (xtcz=true wraps in XTZ4/LZ4); progress posts (no op id)
         // A background warm may be driving the engine: it shares the C export
@@ -2020,7 +2086,6 @@ case 'openPreview': {
   } catch (e) {
     // A replacement that threw before its case completed must still release the exclusive state, or every
     // later command would be refused with BOOK_REPLACING forever.
-    if (isReplacement && !isReplacementDone) replacementsPending--;
     // A throw here usually means the wasm runtime aborted (OOM / bad_alloc
     // under -fno-exceptions). The engine is poisoned after an abort — flag
     // fatal so the app respawns the worker instead of retrying a dead engine.
@@ -2030,6 +2095,20 @@ case 'openPreview': {
     if (fatal) {
       // give the reply a moment to flush, then die loudly (app respawns)
       setTimeout(() => { throw new Error('engine aborted: ' + msg); }, 0);
+    }
+  
+  } finally {
+    // The ONE place the replacement slot is released, so it is released exactly once per command no matter
+    // how the command exits — including a throw from a queued handler, which used to leave the counter
+    // negative and silently disable the BOOK_REPLACING lock for the rest of the session.
+    if (ownsReplacementSlot) {
+      replacementsPending--;
+      if (replacementsPending < 0) {
+        // An invariant violation, not a recoverable state: clamp so the lock keeps working, then make the
+        // bug loud instead of letting it quietly disable a correctness guard.
+        replacementsPending = 0;
+        setTimeout(() => { throw new Error('replacement counter underflow'); }, 0);
+      }
     }
   }
 };

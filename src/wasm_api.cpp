@@ -132,6 +132,11 @@ static int g_currentSpine = -1;
 static int g_spinePageStart = 0;
 static int g_totalPages = 0;
 static int g_xtchFullReady = 0;
+
+// Export poisoning: while an export is active, an error marks it failed and it can never be finalized.
+// A partial container must be impossible to obtain, not merely unlikely.
+static bool g_exportActive = false;
+static bool g_exportFailed = false;
 static std::vector<uint8_t> g_xtchOut;      // finished container bytes (ko_xtch_ptr)
 static std::vector<uint8_t> g_coverData;   // cover BMP bytes (ko_generate_cover)
 static std::string g_coverPath;
@@ -620,6 +625,12 @@ KO_EXPORT const char* ko_get_spine_href(int spineIndex) {
 // in-page decoder's RAM cap refuses). Returns bytes via ko_cover_ptr/size.
 // kind: 0 = cropped cover (540x800), 1 = thumb (device-height)
 KO_EXPORT int ko_generate_cover(int kind) {
+  // Drop what is published FIRST, so a failure here can never leave the previous book's cover readable
+  // through ko_cover_ptr(). Everything below works on locals and commits at the end.
+  g_coverData.clear();
+  g_coverPath.clear();
+  g_coverSize = 0;
+
   if (!requireBook("generate_cover")) return -1;
   auto epub = g_driver->epubShared();
   if (!epub) {
@@ -627,30 +638,34 @@ KO_EXPORT int ko_generate_cover(int kind) {
     return -1;
   }
   bool ok;
+  std::string candidatePath;
   if (kind == 0) {
     ok = epub->generateCoverBmp(true);          // cropped
-    g_coverPath = epub->getCoverBmpPath(true);
+    candidatePath = epub->getCoverBmpPath(true);
   } else {
     ok = epub->generateThumbBmp(220);           // device thumb height
-    g_coverPath = epub->getThumbBmpPath(220);
+    candidatePath = epub->getThumbBmpPath(220);
   }
   if (!ok) {
     setError("cover generation failed");
     return -1;
   }
   HalFile f;
-  if (!Storage.openFileForRead("CVR", g_coverPath, f)) {
+  if (!Storage.openFileForRead("CVR", candidatePath, f)) {
     setError("cover bmp missing");
     return -1;
   }
-  g_coverSize = f.size();
-  g_coverData.resize(g_coverSize);
-  if (f.read(g_coverData.data(), g_coverSize) != static_cast<int>(g_coverSize)) {
-    f.close();
+  std::vector<uint8_t> candidate(f.size());
+  const int got = f.read(candidate.data(), candidate.size());
+  f.close();
+  if (got < 0 || static_cast<size_t>(got) != candidate.size()) {
     setError("cover read failed");
     return -1;
   }
-  f.close();
+  // COMMIT.
+  g_coverPath = candidatePath;
+  g_coverData = std::move(candidate);
+  g_coverSize = g_coverData.size();
   return 0;
 }
 
@@ -731,12 +746,24 @@ KO_EXPORT double ko_image_perf(int which) {
 }
 
 KO_EXPORT int ko_render_page(int pageIndex) {
-  if (!requireBook("render_page") || g_currentSpine < 0) return -1;
+  if (!requireBook("render_page") || g_currentSpine < 0) {
+    // No book means no page: clear the output rather than leave the previous book's planes readable
+    // through ko_plane_ptr/ko_compose_rgba.
+    g_page = ko::RenderedPage{};
+    return -1;
+  }
   // (the per-render reset lives in Driver::renderPage, so it covers the preview and both export loops)
-  if (!g_driver->renderPage(pageIndex, g_spec, g_page)) {
+  //
+  // Render into a CANDIDATE and move it in on success. Rendering into g_page passed the persistent output
+  // straight to a fallible operation, so a failed render could leave old or half-written planes behind —
+  // and ko_plane_size() would then report a complete page that was never rendered.
+  ko::RenderedPage candidate;
+  if (!g_driver->renderPage(pageIndex, g_spec, candidate)) {
+    g_page = ko::RenderedPage{};
     setError("page render failed");
     return -1;
   }
+  g_page = std::move(candidate);
   return 0;
 }
 
@@ -787,9 +814,18 @@ KO_EXPORT void ko_export_set_mode(int mode) {
   g_xtch->setTextAa(textAaEnabled());
 }
 
+// Roll the engine back to "no book". Used by abortBookOpen() when an open fails AFTER the EPUB parsed
+// (font re-apply, spec, startSpine, first render, compose) — without it the page clears itself while the
+// worker keeps the new book, and the two disagree about what is loaded.
+KO_EXPORT void ko_unload_book() {
+  beginBookReplacement();
+}
+
 KO_EXPORT int ko_export_begin() {
   if (!requireBook("export_begin")) return -1;
   if (!g_driver || !g_xtch) return -1;
+  g_exportActive = true;
+  g_exportFailed = false;
   g_xtch->reset();
   g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
   g_chapters.clear();
@@ -807,6 +843,13 @@ KO_EXPORT int ko_export_begin() {
 // ranges from this return, so it must reflect real page count.
 KO_EXPORT int ko_export_spine(int spine) {
   if (!requireBook("export_spine") || !g_xtch) return -1;
+  // An index outside the book is a caller bug, and buildSection() clamps it: the export used to "succeed"
+  // with a page built from a DIFFERENT spine. Reject it and poison the export like any other failure.
+  if (spine < 0 || spine >= g_driver->spineCount()) {
+    g_exportFailed = true;
+    setError("export spine " + std::to_string(spine) + " is out of range");
+    return -1;
+  }
   // Re-assert the switch here as well: it can be flipped between
   // ko_export_set_mode() and the page loop, and this is the only place that is
   // guaranteed to run for every exported page.
@@ -824,6 +867,7 @@ KO_EXPORT int ko_export_spine(int spine) {
     // "successful" 99-page book — silently wrong output, which is worse than an error, because nothing
     // downstream can tell the difference. The caller gets an error naming the spine and page instead.
     if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) {
+      g_exportFailed = true;
       setError("render failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
       return -1;
     }
@@ -869,7 +913,15 @@ KO_EXPORT int ko_export_spine(int spine) {
 // without a usable TOC fall back to per-spine chapters.
 
 KO_EXPORT int ko_export_finish() {
+  // A failed export must never be finalized, even if the caller ignored a -1 from ko_export_spine and
+  // called finish anyway: this makes a partial container impossible to obtain rather than merely
+  // discouraged.
+  if (!g_exportActive || g_exportFailed) {
+    setError("cannot finalize failed export");
+    return -1;
+  }
   if (!g_xtch) return -1;
+  if (!requireBook("export_finish")) return -1;
   g_chapters = buildChapters(g_chapterCandidates, g_spineFallback,
                              static_cast<uint32_t>(g_totalPages));
   g_xtchOut = g_xtch->finish(g_chapters);
@@ -1116,11 +1168,19 @@ KO_EXPORT const uint8_t* ko_plan_prefix_ptr() { return g_planPrefix.empty() ? nu
 KO_EXPORT size_t ko_plan_prefix_size() { return g_planPrefix.size(); }
 
 // One-shot convenience: whole book in a single call (used by host/tests).
+// Declared here, defined with the other export teardown further down.
+KO_EXPORT void ko_export_abort();
+
+// The one-shot convenience path. `continue` here meant a render failure produced a "successful" container
+// with a hole in it — silently, which nothing downstream can detect.
 KO_EXPORT int ko_render_xtch() {
   const int spines = ko_export_begin();
   if (spines < 0) return -1;
   for (int s = 0; s < spines; s++) {
-    if (ko_export_spine(s) < 0) continue;
+    if (ko_export_spine(s) < 0) {
+      ko_export_abort();
+      return -1;
+    }
   }
   return ko_export_finish();
 }
@@ -1204,7 +1264,13 @@ KO_EXPORT void ko_xtch_release() {
 // Abort an export in progress: drop the partially accumulated container AND the page buffers the
 // writer is holding, so a cancelled warm/export releases its wasm heap now instead of waiting for the
 // next ko_export_begin(). §3 of the 1.2 audit. Safe to call anytime (the next begin() re-inits).
+//
+// It also clears the export-poison state, so an aborted export can be followed by a good one. A FAILED
+// export is the opposite case: ko_export_finish() refuses to finalize while g_exportFailed is set, so a
+// partial container cannot be obtained even if a caller ignores the -1 from ko_export_spine().
 KO_EXPORT void ko_export_abort() {
+  g_exportActive = false;
+  g_exportFailed = false;
   if (g_xtch) g_xtch->reset();
   g_chapters.clear();
   g_spineFallback.clear();

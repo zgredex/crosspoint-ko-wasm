@@ -50,7 +50,14 @@ def run(book, out_name, extra):
 
 
 def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:24]
+    # createTime is a WALL CLOCK: it is written from the host clock at export, so an unmasked whole-file
+    # hash makes this gate depend on the three mount arms landing in the same second — measured, only byte
+    # 296 moves between two runs a second apart, in BOTH container layouts (XTC and XTCH). That flakiness
+    # is the reason this gate reported a mismatch for one arm while the containers were byte-identical.
+    # Masking the 4-byte field makes the comparison about the mount, which is what it claims to test.
+    raw = bytearray(Path(path).read_bytes())
+    raw[296:300] = b'\0\0\0\0'
+    return hashlib.sha256(bytes(raw)).hexdigest()[:24]
 
 
 def parse_external(stderr):

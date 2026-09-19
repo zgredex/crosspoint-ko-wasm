@@ -64,12 +64,53 @@ def check(dist, embedded, external):
             problems.append(f'{assets[blob]} is named in the manifest but absent from {dist}')
             continue
         problems.extend(check_blob_encoding(face, path))
+        problems.extend(check_header_label(face, dist))
 
     for face, blob in BLOB_FOR.items():
         if face in embedded and blob in assets:
             problems.append(f'face {face} is embedded, yet {blob} was packaged anyway '
                             f'(dead weight on every visit)')
     return problems
+
+
+HEADER_RULE = {'kopub': '/kopub_14.*.epd2', 'ridibatang': '/ridibatang_14.*.epd2'}
+
+
+def check_header_label(face, dist):
+    """Assert the OTHER half of the brotli contract: that dist/_headers actually declares it.
+
+    check_blob_encoding() proves the packaged bytes ARE brotli. That is only safe because _headers labels
+    them Content-Encoding: br, and nothing verified the label until now — which is exactly how a commit
+    that overwrote _headers (dropping the rule) passed this gate and took the site down with
+    'bad magic (expected EPD2)' in the font loader. Both halves must be gated together.
+    """
+    rule = HEADER_RULE.get(face)
+    if rule is None:
+        return []
+    path = os.path.join(dist, '_headers')
+    try:
+        with open(path, encoding='utf-8') as fh:
+            text = fh.read()
+    except OSError as exc:
+        return [f'{face}: cannot read {path}: {exc}']
+    # a rule block is its own line followed by indented header lines
+    lines = text.splitlines()
+    block = None
+    for i, line in enumerate(lines):
+        if line.strip() == rule:
+            block = []
+            for nxt in lines[i + 1:]:
+                if not nxt.startswith(' ') or not nxt.strip():
+                    break
+                block.append(nxt.strip())
+            break
+    if block is None:
+        return [f'{face}: _headers has no rule for {rule}, so the packaged brotli blob would be served '
+                f'with no Content-Encoding and the font loader rejects it']
+    if not any('Content-Encoding: br' in b for b in block):
+        return [f'{face}: _headers rule {rule} does not declare "Content-Encoding: br" — the packaged '
+                f'blob is brotli and would be parsed as raw EPD2']
+    return []
 
 
 def check_blob_encoding(face, path):

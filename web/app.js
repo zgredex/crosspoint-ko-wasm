@@ -74,7 +74,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=101');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=102');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -254,7 +254,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=101');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=102');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -975,6 +975,9 @@
     // immediately so chapter population for the previous book stops now rather than when B commits.
     const token = ++bookLoadToken;
     ++spinePopulateToken;
+    // The worker's generation for the previous book is meaningless from here on: drop it NOW, so a
+    // sectionProgress/sectionError already in flight from A cannot be applied while B is being decided.
+    workerBookGen = -1;
     renderToken++;                      // kill in-flight renders
     window.__koOpenT0 = performance.now();   // per book, or the timings below lie on the second open
     window.__koFirstFrame = null;            // per book, ditto
@@ -1827,7 +1830,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=101');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=102');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };
