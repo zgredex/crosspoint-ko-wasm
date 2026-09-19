@@ -69,6 +69,7 @@ rsync -a \
   --exclude 'ft_wasm.js' \
   --exclude 'ft_wasm.wasm' \
   --exclude '*.epd2' \
+  --exclude '__*.js' \
   "$SRC"/ "$OUT"/
 
 cp "$BUILD/ko_xtch_wasm.js" "$BUILD/ko_xtch_wasm.wasm" "$BUILD/ko_build_info.js" "$OUT/"
@@ -124,6 +125,14 @@ for face in $EXTERNAL; do
 done
 
 # --- 4. the commercial book never ships, even if an exclude is edited wrongly -----------------------
+# Measurement probes are served from web/ so a browser can load them; they are not part of the product.
+# The `--exclude '.*'` pattern above does NOT cover them, because their names start with "__", not "." —
+# which is how one got into a dist/ build. The exclude above handles it; this is the belt.
+if ls "$OUT"/__*.js >/dev/null 2>&1; then
+  echo "ERROR: a dev probe leaked into dist/ — refusing to continue" >&2
+  exit 1
+fi
+
 if [ -e "$OUT/demo.epub" ]; then
   echo "ERROR: demo.epub leaked into dist/ — refusing to continue" >&2
   exit 1
