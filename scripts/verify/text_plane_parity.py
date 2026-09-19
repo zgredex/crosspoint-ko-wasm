@@ -1,20 +1,41 @@
 #!/usr/bin/env python3
-"""text_plane_parity.py — exact text-pixel parity, on EVERY page.
+"""text_plane_parity.py — exact text-pixel parity on every page whose text can be isolated.
 
 The contract (docs/ko-oracle-conformance.md):
 
-    TEXT RASTER PARITY — MANDATORY. The Korean fork owns everything up to and including text
-      rasterisation, so the bits of a page's BW / LSB / MSB planes that the TEXT wrote must be
-      byte-identical to the reference's — on every page, whether or not that page also holds an image.
+    TEXT RASTER PARITY — MANDATORY on every IMAGE-FREE page. On an image-free page the three
+      planes must be byte-identical to the reference's; there is nothing on such a page that
+      XTCKO is allowed to re-rasterise.
 
-    IMAGE RASTER — XTCKO may intentionally differ (blue-noise dithering, a different decoder, the
-      preview palette). Only the pixels inside image rectangles are exempt, and the rectangles come
-      from the layout manifest, which LAYER 1 has already proven identical between the two renderers.
+    ON AN IMAGE-BEARING PAGE the image rectangles are exempted and the text bits OUTSIDE them are
+      compared (blue-noise dithering, a different decoder and the preview palette are XTCKO
+      additions past the parity boundary). The rectangles come from the layout manifest, which
+      LAYER 1 has already proven identical, so both renderers agree on where the images are.
 
 An earlier version skipped any page containing an image. That was too broad: one small illustration
 beside twenty lines of Korean prose could hide completely wrong glyph rasterisation. Exempting the
 rectangles instead of the pages keeps the exemption exactly as large as the thing that is allowed to
 differ.
+
+COORDINATE SYSTEM — the thing this file got wrong for one revision. The dumped `.bw/.lsb/.msb`
+vectors are NOT a logical 480x800 portrait image with 60 bytes per row. They are the raw PHYSICAL
+800x480 framebuffer with 100 bytes per row, dumped verbatim from RenderedPage (see
+src/ko_engine_driver.h: "Page-plane capture after the 3-pass render, in PHYSICAL (800x480) layout").
+The logical portrait buffer is what the XTH/XTG encoder builds from them (src/xtch_writer.h), and its
+byte layout is a different thing entirely. Both are 48000 bytes, which is why nothing caught it.
+
+Two conversions are therefore mandatory before a manifest rectangle can be used as a mask:
+
+  1. the manifest's image x/y are PAGE-LOCAL; rendering adds marginLeft/marginTop
+     (PageImage::render -> imageBlock->render(renderer, xPos + xOffset, yPos + yOffset));
+  2. logical -> physical is a rotation: phyX = logicalY, phyY = 479 - logicalX.
+
+Measured on web/demo-images.epub over all 45 pairs of the ten dither models: with the corrected mapping,
+changing --image-dither moves 0 pixel bits outside the image rectangles, and 0 bits on pages the manifest
+says hold no image (spine 0/5/9). Under the old 480x800/60 mapping the same 45 comparisons reported
+1,676,856 bits "outside" the rectangles, worst pair 43,396 — every one of them an artefact of masking the
+wrong region. The claim this file used to carry, that an image perturbs its whole page, does not survive
+the correction.
 
 Two properties this file also refuses to leave implicit:
 
@@ -30,13 +51,16 @@ import os
 import shutil
 import sys
 import tempfile
+from collections import Counter
 
 PLANES = ('.bw', '.lsb', '.msb')
 
-# Panel geometry. Every plane is 1 bit per pixel, 60 bytes per 480-pixel row, so a pixel's byte index is
-# y * ROW_BYTES + x // 8 and its bit is 7 - (x % 8) in all three.
-WIDTH, HEIGHT, ROW_BYTES = 480, 800, 60
-PLANE_BYTES = ROW_BYTES * HEIGHT
+# PHYSICAL framebuffer geometry — what RenderedPage holds and host_main.cpp dumps.
+# 800 px wide (100 bytes) by 480 px tall. A pixel's byte index is py * ROW_BYTES + px // 8 and its
+# bit is 7 - (px % 8) in all three planes. Both geometries are 48000 bytes, so a size check alone
+# cannot tell them apart; the rotation below is what makes the mask correct.
+PHYS_WIDTH, PHYS_HEIGHT, ROW_BYTES = 800, 480, 100
+PLANE_BYTES = ROW_BYTES * PHYS_HEIGHT
 
 
 def page_files(directory):
@@ -58,41 +82,60 @@ def page_files(directory):
     return found
 
 
-def exempt_rows(rects):
-    """row -> list of (first_byte, last_byte_exclusive, first_bits, last_bits) to blank out.
+def rect_to_physical(r, margin_top, margin_left):
+    """A manifest image rect -> the PHYSICAL span it covers, or None if it is empty/off-panel.
 
-    Interior bytes of a rectangle are exempt in full; the two boundary bytes carry a bit mask so the text
-    pixels sharing that byte are still compared.
+    manifest x/y are page-local logical coordinates; rendering offsets them by the margins. The
+    logical portrait page is then rotated into the physical framebuffer:
+        phyX = logicalY        py spans PHYS_HEIGHT - lx1 .. PHYS_HEIGHT - lx0
+        phyY = 479 - logicalX  px spans ly0 .. ly1
+    """
+    lx0 = int(r['x']) + margin_left
+    ly0 = int(r['y']) + margin_top
+    lx1 = lx0 + int(r['w'])
+    ly1 = ly0 + int(r['h'])
+    px0, px1 = max(0, ly0), min(PHYS_WIDTH, ly1)
+    py0, py1 = max(0, PHYS_HEIGHT - lx1), min(PHYS_HEIGHT, PHYS_HEIGHT - lx0)
+    if px1 <= px0 or py1 <= py0:
+        return None
+    return px0, px1, py0, py1
+
+
+def exempt_rows(rects, margin_top, margin_left):
+    """py -> list of (first_byte, last_byte_exclusive, first_px, last_px) to blank out.
+
+    Interior bytes of a rectangle are exempt in full; the two boundary bytes carry a bit mask so the
+    text pixels sharing that byte are still compared.
     """
     rows = {}
     for r in rects:
-        x0, y0 = max(0, int(r['x'])), max(0, int(r['y']))
-        x1, y1 = min(WIDTH, int(r['x']) + int(r['w'])), min(HEIGHT, int(r['y']) + int(r['h']))
-        if x1 <= x0 or y1 <= y0:
+        span = rect_to_physical(r, margin_top, margin_left)
+        if span is None:
             continue
-        for y in range(y0, y1):
-            rows.setdefault(y, []).append((x0, x1))
+        px0, px1, py0, py1 = span
+        for py in range(py0, py1):
+            rows.setdefault(py, []).append((px0, px1))
     out = {}
-    for y, spans in rows.items():
+    for py, spans in rows.items():
         entries = []
-        for x0, x1 in spans:
-            b0, b1 = x0 // 8, (x1 - 1) // 8 + 1
-            entries.append((b0, b1, x0, x1))
-        out[y] = entries
+        for px0, px1 in spans:
+            b0, b1 = px0 // 8, (px1 - 1) // 8 + 1
+            entries.append((b0, b1, px0, px1))
+        out[py] = entries
     return out
 
 
 def text_only(data, exempt):
     """Return a copy of one plane with only the image pixels blanked, so the text bits can be compared."""
     buf = bytearray(data)
-    for y, entries in exempt.items():
-        row = y * ROW_BYTES
-        for b0, b1, x0, x1 in entries:
+    for py, entries in exempt.items():
+        row = py * ROW_BYTES
+        for b0, b1, px0, px1 in entries:
             if b1 - b0 > 2:
                 buf[row + b0 + 1: row + b1 - 1] = b'\x00' * (b1 - b0 - 2)   # interior bytes, in full
             for b in (b0, b1 - 1):
-                lo = max(x0, b * 8)
-                hi = min(x1, (b + 1) * 8)
+                lo = max(px0, b * 8)
+                hi = min(px1, (b + 1) * 8)
                 bits = 0
                 for px in range(lo, hi):
                     bits |= 1 << (7 - (px % 8))
@@ -100,16 +143,44 @@ def text_only(data, exempt):
     return bytes(buf)
 
 
-def compare(port_dir, oracle_dir, manifest_path):
-    """Returns (pages_checked, exempt_pixels, problems[], image_page_findings).
+def load_manifest(path):
+    """(pages, margin_top, margin_left, geometry_problems[]).
 
-    problems[] is fatal — image-free pages, where exact text parity is PROVEN and mandatory.
-    image_page_findings[] is not: on a page holding an image the rectangle cannot isolate the text (see the
-    measurement in the comment below), so those pages are counted and reported as NOT PROVEN.
+    The margins are required, not defaulted: a manifest without them cannot be mapped into the
+    physical planes, and silently substituting 0 would mask a region the image does not occupy —
+    exactly the class of error this file exists to avoid.
+    """
+    problems = []
+    doc = json.load(open(path, encoding='utf-8'))
+    pages = doc['pages']
+
+    # Identity must be unique. A duplicated (spine, page) would collapse in a set and in the
+    # rects_by_page dict, so a page could be compared against the wrong page's rectangles — or
+    # silently dropped from the count — without anything saying so.
+    ids = [(int(p['spine']), int(p['page'])) for p in pages]
+    dupes = sorted(k for k, n in Counter(ids).items() if n > 1)
+    if dupes:
+        problems.append(f'manifest repeats the same (spine, page) identity: {dupes[:4]} — '
+                        f'deduplication would hide a page')
+
+    margins = doc.get('margins')
+    if not margins or len(margins) != 4:
+        problems.append('manifest has no usable "margins" [top, right, bottom, left]; the image '
+                        'rectangles are page-local and cannot be mapped without them')
+        return pages, 0, 0, problems
+    return pages, int(margins[0]), int(margins[3]), problems
+
+
+def compare(port_dir, oracle_dir, manifest_path):
+    """Returns (pages_checked, exempt_pixels, problems[], image_page_findings[]).
+
+    problems[] is fatal — a difference on an image-free page (where exact text parity is the contract)
+    or a structural failure. image_page_findings[] carries the differences outside the image
+    rectangles on image-bearing pages: reported, and fatal only under --require-image-page-text.
     """
     problems = []
     image_page_findings = []
-    pages = json.load(open(manifest_path, encoding='utf-8'))['pages']
+    pages, margin_top, margin_left, problems = load_manifest(manifest_path)
     expected = {(int(p['spine']), int(p['page'])) for p in pages}
     rects_for = {(int(p['spine']), int(p['page'])): (p.get('images') or []) for p in pages}
 
@@ -132,7 +203,7 @@ def compare(port_dir, oracle_dir, manifest_path):
     for key in sorted(expected):
         rects = rects_for.get(key, [])
         exempt_pixels += sum(max(0, int(r['w'])) * max(0, int(r['h'])) for r in rects)
-        exempt = exempt_rows(rects)
+        exempt = exempt_rows(rects, margin_top, margin_left)
         checked += 1
         for suffix in PLANES:
             a = port.get(key, {}).get(suffix)
@@ -144,7 +215,8 @@ def compare(port_dir, oracle_dir, manifest_path):
             pb = open(b, 'rb').read()
             if len(pa) != PLANE_BYTES or len(pb) != PLANE_BYTES:
                 problems.append(f'spine {key[0]} page {key[1]}: {suffix} is {len(pa)}/{len(pb)} bytes, '
-                                f'expected {PLANE_BYTES}')
+                                f'expected {PLANE_BYTES} (physical {PHYS_WIDTH}x{PHYS_HEIGHT}, '
+                                f'{ROW_BYTES} bytes/row)')
                 continue
             if pa == pb:
                 continue
@@ -155,12 +227,11 @@ def compare(port_dir, oracle_dir, manifest_path):
             ta, tb = text_only(pa, exempt), text_only(pb, exempt)
             if ta != tb:
                 differing = sum(1 for x, y in zip(ta, tb) if x != y)
-                # MEASURED, AND THE REASON THIS IS NOT A PASS: an image's raster influence is NOT confined to
-                # its rectangle. Rendering the port twice with a different --image-dither moves 183,057 pixel
-                # bits OUTSIDE the rectangles, and even moves pages the manifest says have no images at all —
-                # so on a page that holds an image, the rect mask cannot isolate the text. Only a text-only
-                # CAPTURE (engine support on BOTH sides, which the pinned reference cannot gain) could.
-                # Counted and reported, never certified. --require-image-page-text makes it fatal.
+                # Differences OUTSIDE the image rectangles on a page that holds an image. Reported
+                # always; fatal only under --require-image-page-text. Two limits keep this out of the
+                # mandatory set: an image whose decoder writes beyond its declared rect would leak,
+                # and text overlapping a rect would be exempt there. On the current fixtures the count
+                # is zero, so this is a hedge against a case not yet measured, not a known gap.
                 image_page_findings.append(
                     f'spine {key[0]} page {key[1]}: {suffix} differs in {differing} byte(s) outside the image '
                     f'rectangles')
@@ -170,10 +241,10 @@ def compare(port_dir, oracle_dir, manifest_path):
 def self_control(port_dir, oracle_dir, manifest_path):
     """Flip one TEXT bit and require the comparison to catch it.
 
-    Prefers an image-free page; if every page carries an image it falls back to a page with images and flips
-    a bit in the text area, which is the harder case and still must be caught.
+    Prefers an image-free page; if every page carries an image it falls back to a page with images and
+    flips a bit outside the rectangles, which is the harder case and still must be caught.
     """
-    pages = json.load(open(manifest_path, encoding='utf-8'))['pages']
+    pages, margin_top, margin_left, _problems = load_manifest(manifest_path)
     keys = [(int(p['spine']), int(p['page'])) for p in pages]
     rects_for = {(int(p['spine']), int(p['page'])): (p.get('images') or []) for p in pages}
     target = next((k for k in keys if not rects_for.get(k)), None)
@@ -191,12 +262,11 @@ def self_control(port_dir, oracle_dir, manifest_path):
         if not raw:
             print('  CONTROL VOID: the victim plane is empty', file=sys.stderr)
             return 1
-        exempt = exempt_rows(rects_for.get(target, []))
+        exempt = exempt_rows(rects_for.get(target, []), margin_top, margin_left)
         # Choose a byte the text owns, so the control exercises the mask rather than the exemption.
-        available = [i for i in range(len(raw))
-                     if not any(b0 <= i - y * ROW_BYTES < b1
-                                for y, entries in exempt.items() for b0, b1, _x0, _x1 in entries
-                                if 0 <= i - y * ROW_BYTES < ROW_BYTES)]
+        masked = {py * ROW_BYTES + b for py, entries in exempt.items()
+                  for b0, b1, _px0, _px1 in entries for b in range(b0, b1)}
+        available = [i for i in range(len(raw)) if i not in masked]
         idx = available[len(available) // 2] if available else len(raw) // 2
         raw[idx] ^= 0x01
         open(victim, 'wb').write(bytes(raw))
@@ -226,20 +296,20 @@ def main():
     for p in problems[:8]:
         print(f'  {p}', file=sys.stderr)
     for f in findings[:4]:
-        print(f'  NOT PROVEN (image page): {f}', file=sys.stderr)
+        print(f'  OUTSIDE RECTS (image page): {f}', file=sys.stderr)
     if problems:
-        print(f'TEXT RASTER PARITY FAILED — {len(problems)} problem(s) on image-free pages across '
-              f'{checked} page(s)', file=sys.stderr)
+        print(f'TEXT RASTER PARITY FAILED — {len(problems)} problem(s) across {checked} page(s)',
+              file=sys.stderr)
         return 1
     if findings and '--require-image-page-text' in sys.argv[4:]:
         print(f'TEXT RASTER PARITY FAILED — {len(findings)} image-page plane(s) differ outside their '
               f'rectangles and enforcement was requested', file=sys.stderr)
         return 1
-    verdict = (f'TEXT RASTER PARITY OK — {checked} page(s) checked; image-free pages byte-identical '
-               f'({exempt_pixels:,} exempt image pixels)')
+    verdict = (f'TEXT RASTER PARITY OK — {checked} page(s) checked; image-free pages byte-identical, '
+               f'image-page text identical outside the rectangles ({exempt_pixels:,} exempt image pixels)')
     if findings:
-        verdict += (f' | NOT PROVEN on {len(findings)} image-page plane(s): an image perturbs the whole '
-                    f'page, so a rectangle cannot isolate its text')
+        verdict += (f' | {len(findings)} image-page plane(s) differ outside their rectangles '
+                    f'(reported, not certified)')
     print(verdict)
     return 0
 

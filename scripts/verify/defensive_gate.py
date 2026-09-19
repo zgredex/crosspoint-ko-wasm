@@ -169,7 +169,10 @@ def stage_storage_path_normalisation():
     # only resolves when the book's own directory is the working directory. That cwd is the point: the
     # mount key then has no slash at all, which is the other half of the contract under test.
     bare = invoke(Path(BOOK).name, bare_out, cwd=(ROOT / BOOK).parent)
-    check(bare.returncode == 0 and rel_out.exists(),
+    # bare_out, NOT rel_out. rel_out already exists from the check above, so asserting on it let a bare
+    # invocation that returned 0 without writing anything pass this check — and the byte-identity check
+    # further down was then skipped, because it guards on bare_out.exists().
+    check(bare.returncode == 0 and bare_out.exists(),
           "a BARE filename (no slash) loads", (bare.stderr or b"").decode()[-200:])
 
     abso = invoke(str(ROOT / BOOK), abs_out)

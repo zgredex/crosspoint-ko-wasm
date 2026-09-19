@@ -511,33 +511,73 @@ and the gate printed PASS while comparing **zero** fixtures.
 
 ### LAYER 2a: mandatory where proven, and honestly not proven where not
 
-The layer now compares **every** page, not only image-free ones, with the image rectangles blanked out of
+The layer compares **every** page, not only image-free ones, with the image rectangles blanked out of
 both copies first (interior bytes in full, boundary bytes bit-masked, so the text bits sharing a byte with
 an image are still compared). The rectangles come from the layout manifest, which LAYER 1 has already
 proven identical.
 
-That design rests on an assumption, so the assumption was measured — and it is **false**:
+#### The mask was in the wrong coordinate system for one revision
+
+The dumped `.bw/.lsb/.msb` vectors are the raw **PHYSICAL 800x480 framebuffer at 100 bytes per row** —
+`RenderedPage` says so in as many words and `host_main.cpp` dumps those vectors verbatim. They are *not*
+a logical 480x800 portrait page at 60 bytes per row; the logical portrait buffer is what the XTH/XTG
+encoder *builds from* them (`src/xtch_writer.h`), a different layout entirely. **Both are 48000 bytes**,
+so no size check can tell them apart, and the comparator silently masked the wrong region.
+
+Two conversions have to happen before a manifest rectangle names a region of the dump:
+
+1. the manifest's image `x`/`y` are **page-local**; rendering adds the margins — `PageImage::render` calls
+   `imageBlock->render(renderer, xPos + xOffset, yPos + yOffset)` with `xOffset = marginLeft`,
+   `yOffset = marginTop`;
+2. **logical → physical is a rotation**: `phyX = logicalY`, `phyY = 479 − logicalX` (row stride 100).
+
+#### The measurement that declared the assumption false was an artefact of that error
+
+The previous revision of this document recorded, as a measured fact:
 
 > Rendering the port twice with a different `--image-dither` moves **183,057 pixel bits outside the image
 > rectangles**, and the knob moves pages the manifest says contain no images at all (spine 0, 5 and 9 of
 > `demo-images`). An image perturbs the whole page, so a rectangle cannot isolate its text.
 
-Consequently the layer is split, and the split is reported rather than smoothed over:
+**That is retracted.** Re-measured with the corrected mapping, on `demo-images` (13 pages, 9 of them
+image-bearing), over **all 45 pairs of the ten dither models**:
+
+> **0** pixel bits move outside the image rectangles, and **0** move on the pages the manifest says contain
+> no image. Under the old 480x800/60/no-margins reading the same 45 comparisons reported **1,676,856**
+> phantom bits "outside the rectangles" (worst single pair: 43,396) — every one of them an artefact of
+> masking the wrong region.
+
+An image does **not** perturb its whole page. The knob is confined to the rectangles, which is what the
+mask always assumed and now actually measures. Run-to-run determinism was checked alongside it: the same
+dither twice gives byte-identical manifests, planes and containers.
+
+The page-class split is nevertheless kept, because the mask still rests on two cases the fixtures do not
+exercise: a decoder that writes beyond its declared rectangle would leak into the comparison, and text
+overlapping a rectangle would be exempt there. A hedge against an unmeasured case, not a known gap.
 
 | Pages | Status |
 |---|---|
-| image-free | **MANDATORY, exact.** Byte-identical text pixels, every page, every fixture. |
-| image-bearing | **NOT PROVEN.** Differences outside the rectangles are counted and named, and never certified. |
+| image-free | **MANDATORY, exact.** Byte-identical planes, every page, every fixture. |
+| image-bearing | **Compared outside the rectangles; differences reported, not certified.** Currently 0 on every fixture. `--require-image-page-text` promotes them to a failure. |
 
-Current state, enforced: `ko-text` 3 pages, `ko-ruby` 1, `ko-mixed` 1, `ko-glyphs` 1, `ko-glyphs` at 1-bit 1,
-`ko-symbols` 1, `demo-png` 13, `demo-images` 13 (27 image-page planes NOT PROVEN), `demo.epub` **1690
-pages, image-free pages byte-identical** (213 image-page planes NOT PROVEN). `--require-image-page-text`
-turns the unproven half into a failure for anyone who wants to work on it.
+The comparator's own controls, all of which were exercised by hand before this was believed — mutate
+inside a rectangle (exempt, still passes), mutate outside every rectangle on an image page (reported, and
+fatal under `--require-image-page-text`), mutate an image-free page (fatal), and rebuild with the old
+mapping (27 phantom image-page findings on a clean render).
 
-Closing that half properly needs a **text-only capture**: render the page with the image contribution
-suppressed, on *both* implementations, and compare that plane on every page. A rectangle mask cannot do it;
-engine-level suppression can, which means it needs a mechanism the pinned reference build cannot gain by
-patching. That is the remaining work, recorded as a gap rather than papered over with a padded mask.
+Current state, enforced (full gate, 9 fixtures, exit 0): `ko-text` 3 pages, `ko-ruby` 1, `ko-mixed` 1,
+`ko-glyphs` 1, `ko-glyphs` at 1-bit 1, `ko-symbols` 1, `demo-png` 13, `demo-images` 13, `demo.epub`
+**1690 pages**. Image-free pages byte-identical on every fixture, and image-bearing pages now report
+**0 planes differing outside the rectangles** — the 27 and 213 that this line used to carry were the
+phantom of the wrong mask, and they are gone.
+
+What a rectangle mask still cannot reach is **text drawn under an image**: if a book puts a caption or a
+float over a figure, a divergence inside that overlap is exempt. The manifest alone cannot separate the
+two — line `y` positions are there, but the gap between two lines is not text, it is exactly where the
+image sits — so no geometric guard can be sound, and one was tried and rejected. That is a real, bounded
+limitation of the approach, not a reason to distrust the layer on the pages it does cover. Closing it needs
+a **text-only capture**: render with the image contribution suppressed on *both* implementations, which
+means a mechanism the pinned reference build cannot gain by patching.
 
 ### The glyph-branch fixture
 

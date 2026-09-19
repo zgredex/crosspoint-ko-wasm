@@ -13,14 +13,23 @@
 #     visible-text offsets, viewport geometry, spec. Enforced as byte-identical layout
 #     manifests, so there is no tolerance to argue about.
 #
-#   LAYER 2a — TEXT RASTER PARITY (MANDATORY, every page)
-#     the TEXT pixels of every page's BW/LSB/MSB planes must be byte-identical to the reference's — on
-#     every page, whether or not it also holds an image. The Korean fork owns everything up to and
-#     including text rasterisation, so text coverage is not "ours to improve".
-#     Only IMAGE RECTANGLES are exempt (blue-noise dithering, a different decoder and the preview
-#     palette are XTCKO additions past the parity boundary), and the rectangles come from the layout
-#     manifest, which LAYER 1 has already proven identical. Exempting whole pages was too broad: one
-#     small illustration beside twenty lines of prose could hide wrong glyph rasterisation.
+#   LAYER 2a — TEXT RASTER PARITY (mandatory on image-free pages)
+#     On a page with NO image, the page's BW/LSB/MSB planes must be byte-identical to the reference's.
+#     There is nothing on such a page that XTCKO is allowed to re-rasterise: the Korean fork owns
+#     everything up to and including text rasterisation, so text coverage is not "ours to improve".
+#     On a page that HOLDS an image, the image rectangles are exempted (blue-noise dithering, a
+#     different decoder and the preview palette are XTCKO additions past the parity boundary) and the
+#     text bits OUTSIDE them are compared. The rectangles come from the layout manifest, which LAYER 1
+#     has already proven identical. Exempting whole pages was too broad: one small illustration beside
+#     twenty lines of prose could hide wrong glyph rasterisation.
+#     The comparison runs in the PHYSICAL 800x480 / 100-bytes-per-row framebuffer geometry the dump
+#     actually is, with the manifest's page-local image rects translated by the margins and rotated
+#     into it. Getting that transform wrong is not a small error: the 480x800/60 reading reports
+#     tens of thousands of phantom "outside the rectangle" bits on a clean render.
+#     Differences outside the rectangles on an image page are REPORTED and not certified; so are the
+#     two limits that keep them out of the mandatory set (a decoder writing past its declared rect,
+#     text overlapping a rect). They are currently zero on every fixture, so this is a hedge against a
+#     case not yet measured, not a known gap. --require-image-page-text promotes them to a failure.
 #
 #   LAYER 2 — PERCEPTUAL (the conformance requirement for pixels)
 #     a page fails only if a reader could SEE the difference as typography: content moved
@@ -96,20 +105,47 @@ fi
 # large fixture.
 echo "== builds =="
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-[ -x "$PORT_BIN" ] || { bad "missing $PORT_BIN — configure it first: cmake -S . -B build"; exit 1; }
-cmake --build build -j"$JOBS" >"$WORK/port-build.log" 2>&1 \
-  || { bad "port build failed (see $WORK/port-build.log)"; exit 1; }
 if [ ! -d "$ORACLE_CMAKE_ROOT" ]; then
   bad "no reference checkout at $ORACLE_CMAKE_ROOT — fetch the pinned tarball first (see oracle/README.md)"
   exit 1
 fi
-if [ ! -f build-oracle/CMakeCache.txt ]; then
-  echo "  configuring the reference build from the pinned checkout..."
-  cmake -S . -B build-oracle -DCMAKE_BUILD_TYPE=Release -DKO_ENGINE_ROOT="$ORACLE_CMAKE_ROOT" >"$WORK/oracle-cmake.log" 2>&1 \
-    || { bad "reference configure failed (see $WORK/oracle-cmake.log)"; exit 1; }
+# CONFIGURE BOTH, EVERY RUN. --build alone fixes stale objects, but a build tree that was configured
+# once keeps its cached KO_ENGINE_ROOT forever: repointing KO_ORACLE_CMAKE_ROOT at a different checkout
+# left build-oracle compiling the OLD one (and an accidentally oracle-configured ordinary build/ would
+# have produced a KO_ORACLE_BUILD "port", i.e. compared the reference against itself). Re-running the
+# configure is cheap and makes the cached value an assertion rather than a hope.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKO_ENGINE_ROOT="" >"$WORK/port-cmake.log" 2>&1 \
+  || { bad "port configure failed (see $WORK/port-cmake.log)"; exit 1; }
+cmake -S . -B build-oracle -DCMAKE_BUILD_TYPE=Release -DKO_ENGINE_ROOT="$ORACLE_CMAKE_ROOT" >"$WORK/oracle-cmake.log" 2>&1 \
+  || { bad "reference configure failed (see $WORK/oracle-cmake.log)"; exit 1; }
+
+# Assert what the trees ACTUALLY cached, not what was passed. CMake can ignore or rewrite a cache
+# entry, and a silent mismatch here is a gate that compares the wrong pair of engines.
+port_root="$(sed -n 's/^KO_ENGINE_ROOT:[^=]*=//p' build/CMakeCache.txt | head -1)"
+oracle_root="$(sed -n 's/^KO_ENGINE_ROOT:[^=]*=//p' build-oracle/CMakeCache.txt | head -1)"
+if [ -n "$port_root" ]; then
+  bad "build/ is oracle-configured (KO_ENGINE_ROOT=$port_root) — it would produce a reference build, not the port"
+  exit 1
 fi
+if [ "$oracle_root" != "$ORACLE_CMAKE_ROOT" ]; then
+  bad "build-oracle/ cached KO_ENGINE_ROOT='$oracle_root', expected '$ORACLE_CMAKE_ROOT'"
+  exit 1
+fi
+note "port      cached KO_ENGINE_ROOT empty (vendored engine)"
+note "reference cached KO_ENGINE_ROOT $oracle_root"
+
+cmake --build build -j"$JOBS" >"$WORK/port-build.log" 2>&1 \
+  || { bad "port build failed (see $WORK/port-build.log)"; exit 1; }
 cmake --build build-oracle -j"$JOBS" >"$WORK/oracle-build.log" 2>&1 \
   || { bad "reference build failed (see $WORK/oracle-build.log)"; exit 1; }
+[ -x "$PORT_BIN" ] || { bad "no port binary at $PORT_BIN after the build"; exit 1; }
+[ -x "$ORACLE_BIN" ] || { bad "no reference binary at $ORACLE_BIN after the build"; exit 1; }
+# CONTROL: the two binaries must differ. If the port tree had been oracle-configured they would be the
+# same engine, and every layer below would report perfect agreement while testing nothing.
+if cmp -s "$PORT_BIN" "$ORACLE_BIN"; then
+  bad "the port and reference binaries are byte-identical — this is not a port-vs-reference comparison"
+  exit 1
+fi
 note "port      rebuilt  $(shasum -a 256 "$PORT_BIN" | cut -c1-16)"
 note "reference rebuilt  $(shasum -a 256 "$ORACLE_BIN" | cut -c1-16)"
 
@@ -249,17 +285,20 @@ for fx in $FIXTURES; do
     continue
   fi
 
-  # LAYER 2a — TEXT RASTER PARITY: MANDATORY, per page.
-  # The Korean fork owns everything up to and including text rasterisation, so on a page with no images
-  # the BW/LSB/MSB planes must be byte-identical to the reference's. Image-bearing pages are the ones
-  # where XTCKO is allowed to differ (blue-noise dithering, a different decoder), so they are reported
-  # and never judged. Whole-container equality cannot express that distinction: one illustration would
-  # hide a text divergence on every other page of the book.
+  # LAYER 2a — TEXT RASTER PARITY. Mandatory and exact on a page with no images: the Korean fork owns
+  # everything up to and including text rasterisation, so those planes must be byte-identical. On a page
+  # that HOLDS an image the image rectangles are exempted and the text bits outside them are compared
+  # (blue-noise dithering and the different decoder are XTCKO's, past the parity boundary); those numbers
+  # are reported and not certified. Whole-container equality cannot express the distinction: one
+  # illustration would hide a text divergence on every other page of the book.
+  # The comparator does the margin translation and the logical->physical rotation itself, reading the
+  # margins out of the manifest header. It FAILS LOUDLY if the manifest has no margins rather than
+  # defaulting them to zero, because a zeroed translation masks the wrong region silently.
   if python3 scripts/verify/text_plane_parity.py "$PORT_PLANES" "$REF_PLANES" \
        "$WORK/$name.port.json" 2>&1 | sed 's/^/     /'; then
-    ok "$name: LAYER 2a text raster parity — image-free pages byte-identical (any image-page gap is named below)"
+    ok "$name: LAYER 2a text raster parity — image-free pages byte-identical, image-page text identified outside the rectangles"
   else
-    bad "$name: LAYER 2a FAILED — text pixels differ on an IMAGE-FREE page (a real divergence)"
+    bad "$name: LAYER 2a FAILED — text pixels differ on an image-free page, or the comparison could not be made (a real divergence)"
   fi
 
   # CONTROL, right here and not before the loop: the comparator must be able to fail. Placing this in the
