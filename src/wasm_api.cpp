@@ -437,9 +437,16 @@ KO_EXPORT void ko_get_title(char* buf, int bufLen) {
 // Spine href (basename) for the chapter picker; pointer valid until next call.
 KO_EXPORT const char* ko_get_spine_href(int spineIndex) {
   if (!g_driver || spineIndex < 0 || spineIndex >= g_driver->spineCount()) return "";
-  const auto& item = g_driver->spineHref(spineIndex);
+  // By value: spineHref() copies out of the metadata cache, so there is no temporary to outlive here.
+  // `last` is the buffer the returned pointer refers to, so the pointer is valid until the next call.
+  //
+  // Assign DIRECTLY — no `const auto& item = spineHref(...)` in between. That indirection is legal only
+  // while the accessor returns by value: the reference binds to a temporary whose lifetime gets extended.
+  // It is also exactly how this function read a dead stack frame before, so if the accessor ever goes
+  // back to returning a reference, the indirection silently reintroduces the UB instead of failing to
+  // compile. `scripts/verify/spine_href_gate.py` asserts this line stays in the direct form.
   static std::string last;
-  last = item;
+  last = g_driver->spineHref(spineIndex);
   // basename only
   size_t slash = last.find_last_of('/');
   if (slash != std::string::npos) last = last.substr(slash + 1);
@@ -557,6 +564,12 @@ KO_EXPORT double ko_image_perf(int which) {
   }
 }
 
+// 1-bit consumers (XTC preview, XTC export) only read the BW plane; monoOnly skips the gray passes.
+KO_EXPORT int ko_render_page_mode(int pageIndex, int monoOnly) {
+  if (!g_driver || g_currentSpine < 0) return -1;
+  return g_driver->renderPage(pageIndex, g_spec, g_page, nullptr, g_currentSpine, monoOnly != 0) ? 0 : -1;
+}
+
 KO_EXPORT int ko_render_page(int pageIndex) {
   if (!g_driver || g_currentSpine < 0) return -1;
   ko::imagePerfReset();
@@ -629,9 +642,11 @@ KO_EXPORT int ko_export_spine(int spine) {
   const int n = g_driver->buildSection(spine, g_spec);
   if (n < 0) return -1;
   const int before = g_totalPages;
+  // Same rule as ko_encode_spine: a 1-bit container never stores the gray planes, so do not render them.
+  const bool monoSerial = (g_xtch->mode() == ko::XtcMode::Mono1Bit);
   for (int p = 0; p < n; p++) {
     ko::RenderedPage rp;
-    if (!g_driver->renderPage(p, g_spec, rp)) continue;
+    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0, monoSerial)) continue;
     g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
     g_totalPages++;
   }
@@ -727,7 +742,10 @@ KO_EXPORT int ko_encode_spine(int spine) {
   int rendered = 0;
   for (int p = 0; p < n; p++) {
     ko::RenderedPage rp;
-    if (!g_driver->renderPage(p, g_spec, rp)) continue;
+    // A 1-bit container stores no gray planes, so rendering them is dead work — and on an AA-off image
+    // page each gray pass is another full image decode. Only ever mono when the writer is Mono1Bit.
+    const bool mono = (w.mode() == ko::XtcMode::Mono1Bit);
+    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0, mono)) continue;
     w.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
     rendered++;
   }

@@ -2,6 +2,13 @@
 (() => {
   'use strict';
 
+  // Measurement hook for the open path: `?noEarlyRead=1` sends the open WITHOUT the read-ahead, which is
+  // exactly what the worker did before it, so one build can produce both arms of the A/B (see the
+  // earlyRead note in web/ko.worker.js). Read once — a URL that changes mid-session is not a scenario.
+  const NO_EARLY_READ = (() => {
+    try { return new URLSearchParams(location.search).get('noEarlyRead') === '1'; } catch (_) { return false; }
+  })();
+
   const $ = (id) => document.getElementById(id);
 
   const els = {
@@ -59,7 +66,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=84');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=91');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -119,7 +126,6 @@
     // Release the previous pool NOW rather than at the next ensurePool(): that path only refused to
     // REUSE a stale pool (bookEpoch is part of the identity), so eight engines each holding a 162 MB
     // book — ~1.3 GB measured — stayed resident while the user read the replacement book.
-    killPool();
     killPool();                       // a new book invalidates every pooled engine's heap too
     // kill worker + reject in-flight calls so no promise hangs forever
     try { worker.terminate(); } catch (_) {}
@@ -219,7 +225,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=84');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=91');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -600,7 +606,12 @@
       const page = keepPage ? state.page : 0;
       const payload = { spine, page, mode: state.mode };
       if (spec) payload.spec = spec;
+      const tRenderCall = performance.now();
       const r = await call('render', payload);
+      // P2: what the round trip cost versus what the worker says it spent. The difference is transport +
+      // the worker queue — time the page waits for and no worker phase accounts for.
+      const renderCallMs = performance.now() - tRenderCall;
+      const workerRenderMs = (r && r.timing && r.timing.totalMs) || 0;
       // The FIRST frame after a book load carries the engine's own breakdown (section layout, glyph
       // render, compose). Recorded once per book so an open can be explained, not just timed.
       if (r && r.timing && !window.__koFirstFrame) window.__koFirstFrame = r.timing;
@@ -614,7 +625,15 @@
         els.page.width = 480;
         els.page.height = 800;
       }
+      const tDraw = performance.now();
       drawImage(r.image);
+      const canvasDrawMs = performance.now() - tDraw;
+      window.__koLastRenderDetail = {
+        renderCallMs: +renderCallMs.toFixed(1),
+        workerRenderMs: +workerRenderMs.toFixed(1),
+        renderTransportGapMs: +(renderCallMs - workerRenderMs).toFixed(1),
+        canvasDrawMs: +canvasDrawMs.toFixed(1),
+      };
       updateZoomCss();
       updatePager();
       // Routine navigation must not flood a live region: the page counter is plain text
@@ -912,7 +931,25 @@
       // A book change resets the export engine outright: one engine per book, and no chance of a
       // leftover instance still converting the previous one.
       killExportEngine();
-      const r = await call('load', { blob }, null, 120000);
+      // P3: open + first page in ONE round trip. The two-step handshake (load, then render) has a page →
+      // worker → page → worker hop in the middle that the first page never needed: the reply to 'load'
+      // carries no frame, so the page must do its UI work and ask again. 'openPreview' returns book
+      // metadata AND the first composed frame together, so title/chapter-list work cannot delay page 1.
+      // 'load' is still what export and pool workers use (they want metadata, not a preview frame).
+      const tLoadCall = performance.now();
+      let r;
+      let openFrame = null;
+      try {
+        r = await call('openPreview', Object.assign({ blob, spec: readSpec(), mode: state.mode },
+                                                    NO_EARLY_READ ? { noEarlyRead: true } : {}), null, 120000);
+        if (r && r.image) openFrame = r;
+      } catch (e) {
+        // A worker that predates the command, or any failure inside it, still opens — just in two steps.
+        window.__koOpenFallback = String((e && e.message) || e);
+        r = await call('load', Object.assign({ blob }, NO_EARLY_READ ? { noEarlyRead: true } : {}), null, 120000);
+      }
+      const loadCallMs = performance.now() - tLoadCall;
+      const loadReplyAt = performance.now();
       // §5: canonicalize ONCE, here. The header, the export filename and every later comparison
       // then use one composed string. An NFD metadata title used to reach the filename sanitizer
       // raw, where only composed syllables ([가-힣]) are allowed, and a book with no metadata title
@@ -952,7 +989,45 @@
       els.exportStatus.textContent = '';
       invalidateWarm();           // warm bytes (if any) belong to a previous book
       lastPushedSpecKey = null;   // §2: a fresh engine needs the spec once
-      await refresh(false);
+      // P2: the open, measured ACROSS the boundary. The worker's own phases stop at the reply; the parts
+      // the user actually waits for — the page→worker→page hop, the canvas blit and the frame that
+      // presents it — were outside the accounting, which is why a 60.7 ms first page had only ~32 ms
+      // attributed. Every number below is a real interval, not a reconstruction.
+      const mainBeforeRenderMs = performance.now() - loadReplyAt;
+      if (openFrame) {
+        // The frame arrived with the book metadata, so there is no second round trip to wait for.
+        const tDraw = performance.now();
+        state.page = openFrame.page || 0;
+        state.pages = openFrame.pages || 0;
+        state.total = openFrame.total || openFrame.pages || 0;
+        if (els.page.width !== 480 || els.page.height !== 800) {
+          els.page.width = 480;
+          els.page.height = 800;
+        }
+        drawImage(openFrame.image);
+        const canvasDrawMs = performance.now() - tDraw;
+        updateZoomCss();
+        updatePager();
+        const tFrame = performance.now();
+        await new Promise((res) => requestAnimationFrame(res));
+        const frameWaitMs = performance.now() - tFrame;
+        window.__koOpenPhases = Object.assign({}, r.timing || {}, {
+          loadCallMs: +loadCallMs.toFixed(1),
+          mainBeforeRenderMs: +mainBeforeRenderMs.toFixed(1),
+          canvasDrawMs: +canvasDrawMs.toFixed(1),
+          frameWaitMs: +frameWaitMs.toFixed(1),
+          firstPageSubmittedMs: +(performance.now() - window.__koOpenT0).toFixed(1),
+          firstFrameMs: +(performance.now() - window.__koOpenT0).toFixed(1),
+          singleRoundTrip: true,
+        });
+      } else {
+        await refresh(false);
+        window.__koOpenPhases = Object.assign({}, r.timing || {}, {
+          loadCallMs: +loadCallMs.toFixed(1),
+          mainBeforeRenderMs: +mainBeforeRenderMs.toFixed(1),
+          singleRoundTrip: false,
+        }, window.__koLastRenderDetail || {});
+      }
       // The reader has a usable page. Only NOW is the export engine prepared: starting it alongside
       // the preview load made opening a book two complete engine initialisations at once — instantiate
       // wasm, fetch and register the reader face, read the Blob, parse ZIP/OPF/TOC, twice — competing
@@ -1615,7 +1690,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=84');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=91');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };

@@ -1,0 +1,159 @@
+[  1%] Building C object CMakeFiles/jpeg12-static.dir/jcapistd.c.o
+[  2%] Building C object CMakeFiles/jpeg12-static.dir/jccolor.c.o
+[  2%] Building C object CMakeFiles/jpeg12-static.dir/jcdiffct.c.o
+[  3%] Building C object CMakeFiles/jpeg12-static.dir/jclossls.c.o
+[  4%] Building C object CMakeFiles/jpeg12-static.dir/jcmainct.c.o
+[  4%] Building C object CMakeFiles/jpeg12-static.dir/jcprepct.c.o
+[  5%] Building C object CMakeFiles/jpeg12-static.dir/jcsample.c.o
+[  6%] Building C object CMakeFiles/jpeg12-static.dir/jdapistd.c.o
+[  6%] Building C object CMakeFiles/jpeg12-static.dir/jdcolor.c.o
+[  7%] Building C object CMakeFiles/jpeg12-static.dir/jddiffct.c.o
+[  8%] Building C object CMakeFiles/jpeg12-static.dir/jdlossls.c.o
+[  9%] Building C object CMakeFiles/jpeg12-static.dir/jdmainct.c.o
+[  9%] Building C object CMakeFiles/jpeg12-static.dir/jdpostct.c.o
+[ 10%] Building C object CMakeFiles/jpeg12-static.dir/jdsample.c.o
+[ 11%] Building C object CMakeFiles/jpeg12-static.dir/jutils.c.o
+[ 11%] Building C object CMakeFiles/jpeg12-static.dir/jccoefct.c.o
+[ 12%] Building C object CMakeFiles/jpeg12-static.dir/jcdctmgr.c.o
+[ 13%] Building C object CMakeFiles/jpeg12-static.dir/jdcoefct.c.o
+[ 13%] Building C object CMakeFiles/jpeg12-static.dir/jddctmgr.c.o
+[ 14%] Building C object CMakeFiles/jpeg12-static.dir/jdmerge.c.o
+[ 15%] Building C object CMakeFiles/jpeg12-static.dir/jfdctfst.c.o
+[ 16%] Building C object CMakeFiles/jpeg12-static.dir/jfdctint.c.o
+[ 16%] Building C object CMakeFiles/jpeg12-static.dir/jidctflt.c.o
+[ 17%] Building C object CMakeFiles/jpeg12-static.dir/jidctfst.c.o
+[ 18%] Building C object CMakeFiles/jpeg12-static.dir/jidctint.c.o
+[ 18%] Building C object CMakeFiles/jpeg12-static.dir/jidctred.c.o
+[ 19%] Building C object CMakeFiles/jpeg12-static.dir/jquant1.c.o
+[ 20%] Building C object CMakeFiles/jpeg12-static.dir/jquant2.c.o
+[ 20%] Built target jpeg12-static
+[ 20%] Building C object CMakeFiles/jpeg16-static.dir/jcapistd.c.o
+[ 21%] Building C object CMakeFiles/jpeg16-static.dir/jccolor.c.o
+[ 22%] Building C object CMakeFiles/jpeg16-static.dir/jcdiffct.c.o
+[ 22%] Building C object CMakeFiles/jpeg16-static.dir/jclossls.c.o
+[ 23%] Building C object CMakeFiles/jpeg16-static.dir/jcmainct.c.o
+[ 24%] Building C object CMakeFiles/jpeg16-static.dir/jcprepct.c.o
+[ 25%] Building C object CMakeFiles/jpeg16-static.dir/jcsample.c.o
+[ 25%] Building C object CMakeFiles/jpeg16-static.dir/jdapistd.c.o
+[ 26%] Building C object CMakeFiles/jpeg16-static.dir/jdcolor.c.o
+[ 27%] Building C object CMakeFiles/jpeg16-static.dir/jddiffct.c.o
+[ 27%] Building C object CMakeFiles/jpeg16-static.dir/jdlossls.c.o
+[ 28%] Building C object CMakeFiles/jpeg16-static.dir/jdmainct.c.o
+[ 29%] Building C object CMakeFiles/jpeg16-static.dir/jdpostct.c.o
+[ 29%] Building C object CMakeFiles/jpeg16-static.dir/jdsample.c.o
+[ 30%] Building C object CMakeFiles/jpeg16-static.dir/jutils.c.o
+[ 30%] Built target jpeg16-static
+[ 31%] Building C object CMakeFiles/jpeg-static.dir/jcapistd.c.o
+[ 32%] Building C object CMakeFiles/jpeg-static.dir/jccolor.c.o
+[ 32%] Building C object CMakeFiles/jpeg-static.dir/jcdiffct.c.o
+[ 33%] Building C object CMakeFiles/jpeg-static.dir/jclossls.c.o
+[ 34%] Building C object CMakeFiles/jpeg-static.dir/jcmainct.c.o
+[ 34%] Building C object CMakeFiles/jpeg-static.dir/jcprepct.c.o
+[ 35%] Building C object CMakeFiles/jpeg-static.dir/jcsample.c.o
+[ 36%] Building C object CMakeFiles/jpeg-static.dir/jdapistd.c.o
+[ 37%] Building C object CMakeFiles/jpeg-static.dir/jdcolor.c.o
+[ 37%] Building C object CMakeFiles/jpeg-static.dir/jddiffct.c.o
+[ 38%] Building C object CMakeFiles/jpeg-static.dir/jdlossls.c.o
+[ 39%] Building C object CMakeFiles/jpeg-static.dir/jdmainct.c.o
+[ 39%] Building C object CMakeFiles/jpeg-static.dir/jdpostct.c.o
+[ 40%] Building C object CMakeFiles/jpeg-static.dir/jdsample.c.o
+[ 41%] Building C object CMakeFiles/jpeg-static.dir/jutils.c.o
+[ 41%] Building C object CMakeFiles/jpeg-static.dir/jccoefct.c.o
+[ 42%] Building C object CMakeFiles/jpeg-static.dir/jcdctmgr.c.o
+[ 43%] Building C object CMakeFiles/jpeg-static.dir/jdcoefct.c.o
+[ 43%] Building C object CMakeFiles/jpeg-static.dir/jddctmgr.c.o
+[ 44%] Building C object CMakeFiles/jpeg-static.dir/jdmerge.c.o
+[ 45%] Building C object CMakeFiles/jpeg-static.dir/jfdctfst.c.o
+[ 46%] Building C object CMakeFiles/jpeg-static.dir/jfdctint.c.o
+[ 46%] Building C object CMakeFiles/jpeg-static.dir/jidctflt.c.o
+[ 47%] Building C object CMakeFiles/jpeg-static.dir/jidctfst.c.o
+[ 48%] Building C object CMakeFiles/jpeg-static.dir/jidctint.c.o
+[ 48%] Building C object CMakeFiles/jpeg-static.dir/jidctred.c.o
+[ 49%] Building C object CMakeFiles/jpeg-static.dir/jquant1.c.o
+[ 50%] Building C object CMakeFiles/jpeg-static.dir/jquant2.c.o
+[ 50%] Building C object CMakeFiles/jpeg-static.dir/jcapimin.c.o
+[ 51%] Building C object CMakeFiles/jpeg-static.dir/jchuff.c.o
+[ 52%] Building C object CMakeFiles/jpeg-static.dir/jcicc.c.o
+[ 52%] Building C object CMakeFiles/jpeg-static.dir/jcinit.c.o
+[ 53%] Building C object CMakeFiles/jpeg-static.dir/jclhuff.c.o
+[ 54%] Building C object CMakeFiles/jpeg-static.dir/jcmarker.c.o
+[ 55%] Building C object CMakeFiles/jpeg-static.dir/jcmaster.c.o
+[ 55%] Building C object CMakeFiles/jpeg-static.dir/jcomapi.c.o
+[ 56%] Building C object CMakeFiles/jpeg-static.dir/jcparam.c.o
+[ 57%] Building C object CMakeFiles/jpeg-static.dir/jcphuff.c.o
+[ 57%] Building C object CMakeFiles/jpeg-static.dir/jctrans.c.o
+[ 58%] Building C object CMakeFiles/jpeg-static.dir/jdapimin.c.o
+[ 59%] Building C object CMakeFiles/jpeg-static.dir/jdatadst.c.o
+[ 59%] Building C object CMakeFiles/jpeg-static.dir/jdatasrc.c.o
+[ 60%] Building C object CMakeFiles/jpeg-static.dir/jdhuff.c.o
+[ 61%] Building C object CMakeFiles/jpeg-static.dir/jdicc.c.o
+[ 62%] Building C object CMakeFiles/jpeg-static.dir/jdinput.c.o
+[ 62%] Building C object CMakeFiles/jpeg-static.dir/jdlhuff.c.o
+[ 63%] Building C object CMakeFiles/jpeg-static.dir/jdmarker.c.o
+[ 64%] Building C object CMakeFiles/jpeg-static.dir/jdmaster.c.o
+[ 64%] Building C object CMakeFiles/jpeg-static.dir/jdphuff.c.o
+[ 65%] Building C object CMakeFiles/jpeg-static.dir/jdtrans.c.o
+[ 66%] Building C object CMakeFiles/jpeg-static.dir/jerror.c.o
+[ 66%] Building C object CMakeFiles/jpeg-static.dir/jfdctflt.c.o
+[ 67%] Building C object CMakeFiles/jpeg-static.dir/jmemmgr.c.o
+[ 68%] Building C object CMakeFiles/jpeg-static.dir/jmemnobs.c.o
+[ 68%] Building C object CMakeFiles/jpeg-static.dir/jpeg_nbits.c.o
+[ 69%] Building C object CMakeFiles/jpeg-static.dir/jaricom.c.o
+[ 70%] Building C object CMakeFiles/jpeg-static.dir/jcarith.c.o
+[ 71%] Building C object CMakeFiles/jpeg-static.dir/jdarith.c.o
+[ 71%] Linking C static library libjpeg.a
+[ 71%] Built target jpeg-static
+[ 72%] Building C object CMakeFiles/cjpeg12-static.dir/rdgif.c.o
+[ 72%] Building C object CMakeFiles/cjpeg12-static.dir/rdppm.c.o
+[ 72%] Built target cjpeg12-static
+[ 73%] Building C object CMakeFiles/cjpeg16-static.dir/rdgif.c.o
+[ 74%] Building C object CMakeFiles/cjpeg16-static.dir/rdppm.c.o
+[ 74%] Built target cjpeg16-static
+[ 74%] Building C object CMakeFiles/cjpeg-static.dir/cjpeg.c.o
+[ 75%] Building C object CMakeFiles/cjpeg-static.dir/cdjpeg.c.o
+[ 76%] Building C object CMakeFiles/cjpeg-static.dir/rdbmp.c.o
+[ 76%] Building C object CMakeFiles/cjpeg-static.dir/rdgif.c.o
+[ 77%] Building C object CMakeFiles/cjpeg-static.dir/rdppm.c.o
+[ 78%] Building C object CMakeFiles/cjpeg-static.dir/rdswitch.c.o
+[ 78%] Building C object CMakeFiles/cjpeg-static.dir/rdtarga.c.o
+[ 79%] Linking C executable cjpeg-static
+[ 79%] Built target cjpeg-static
+[ 80%] Building C object CMakeFiles/djpeg12-static.dir/rdcolmap.c.o
+[ 80%] Building C object CMakeFiles/djpeg12-static.dir/wrgif.c.o
+[ 81%] Building C object CMakeFiles/djpeg12-static.dir/wrppm.c.o
+[ 81%] Built target djpeg12-static
+[ 82%] Building C object CMakeFiles/djpeg16-static.dir/wrppm.c.o
+[ 82%] Built target djpeg16-static
+[ 83%] Building C object CMakeFiles/djpeg-static.dir/djpeg.c.o
+[ 83%] Building C object CMakeFiles/djpeg-static.dir/cdjpeg.c.o
+[ 84%] Building C object CMakeFiles/djpeg-static.dir/rdcolmap.c.o
+[ 85%] Building C object CMakeFiles/djpeg-static.dir/rdswitch.c.o
+[ 85%] Building C object CMakeFiles/djpeg-static.dir/wrbmp.c.o
+[ 86%] Building C object CMakeFiles/djpeg-static.dir/wrgif.c.o
+[ 87%] Building C object CMakeFiles/djpeg-static.dir/wrppm.c.o
+[ 87%] Building C object CMakeFiles/djpeg-static.dir/wrtarga.c.o
+[ 88%] Linking C executable djpeg-static
+[ 88%] Built target djpeg-static
+[ 89%] Building C object CMakeFiles/jpegtran-static.dir/jpegtran.c.o
+[ 89%] Building C object CMakeFiles/jpegtran-static.dir/cdjpeg.c.o
+[ 90%] Building C object CMakeFiles/jpegtran-static.dir/rdswitch.c.o
+[ 91%] Building C object CMakeFiles/jpegtran-static.dir/transupp.c.o
+[ 92%] Linking C executable jpegtran-static
+[ 92%] Built target jpegtran-static
+[ 93%] Building C object CMakeFiles/example-static.dir/example.c.o
+[ 93%] Linking C executable example-static
+[ 93%] Built target example-static
+[ 94%] Building C object CMakeFiles/rdjpgcom.dir/rdjpgcom.c.o
+[ 95%] Linking C executable rdjpgcom
+[ 95%] Built target rdjpgcom
+[ 96%] Building C object CMakeFiles/wrjpgcom.dir/wrjpgcom.c.o
+[ 97%] Linking C executable wrjpgcom
+[ 97%] Built target wrjpgcom
+[ 97%] Building C object CMakeFiles/strtest.dir/strtest.c.o
+[ 98%] Linking C executable strtest
+[ 98%] Built target strtest
+[ 98%] Building C object md5/CMakeFiles/md5cmp.dir/md5cmp.c.o
+[ 99%] Building C object md5/CMakeFiles/md5cmp.dir/md5.c.o
+[100%] Building C object md5/CMakeFiles/md5cmp.dir/md5hl.c.o
+[100%] Linking C executable md5cmp
+[100%] Built target md5cmp

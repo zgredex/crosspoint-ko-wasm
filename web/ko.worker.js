@@ -350,6 +350,13 @@ function _frameFromEngine() {
   return img;
 }
 
+// 1-bit callers (XTC preview/export) read only the BW plane, so the engine can skip both gray passes.
+// Falls back to the plain entry point if this module predates ko_render_page_mode.
+function renderPageEngine(page, mono) {
+  if (api._ko_render_page_mode) return api._ko_render_page_mode(page, mono ? 1 : 0);
+  return api._ko_render_page(page);
+}
+
 function composeMono() {
   _stage('compose.mono', () => {
     if (api._ko_compose_rgba(1) !== 0) throw new Error('engine compose failed (mono)');
@@ -400,7 +407,7 @@ function schedulePrefetch(spine, page, pages, mono, rk, fStamp, gen) {
     if (frameCache.has(nk)) return;
     // Always preceded by a real render of the requested page, so the engine's planes can never be
     // composed as the wrong page here.
-    if (api._ko_render_page(next) !== 0) return;
+    if (renderPageEngine(next, mono) !== 0) return;
     const nextImg = mono ? composeMono() : composePage();
     frameCachePut(nk, nextImg.data, true);         // never transferred → the cache takes ownership
     COUNTERS.prefetches += 1;
@@ -830,19 +837,12 @@ let loadTiming = {};
 // What the engine did with images during the render it just performed. `decodes` is the number that
 // matters: the page is rendered three times (BW, then LSB, then MSB), so unless the grey passes stop
 // decoding, an image page decodes its image three times to produce one preview frame.
-// Spine labels, snapshotted ONCE per book, in the same tight loop that loads it.
-//
-// They used to be fetched on demand by the 'spineHrefs' command, reading the engine's live href
-// accessor later. That accessor returns pointers into the current metadata cache, and reading them after
-// a book replacement produced GARBAGE NONDETERMINISTICALLY — observed as "䏆" / U+070F U+0006 in a
-// label list, on BOTH the adopting and the copying load path, so it is not the owned mount. Five
-// consecutive loads of one book, and immediate-vs-delayed reads, all came back clean, so the trigger
-// needs an interleaving that a tight loop cannot have.
-//
-// The cost of the snapshot is real but small (measured 0.1 ms for 10 spines, 0.6 ms for 60), and it is
-// taken here rather than in the page's chapter-picker loop: building one <option> per spine is still
-// behind the first frame, which is where the UI cost was.
-let spineLabels = [];
+// The spine-label snapshot that used to live here is GONE. It contained a symptom: Driver::spineHref()
+// returned `const std::string&` bound to `epub_->getSpineItem(i).href`, but getSpineItem() returns
+// BookMetadataCache::SpineEntry BY VALUE, so the reference dangled and short hrefs were read out of a
+// dead stack frame (the "䏆" / U+070F U+0006 garbage). spineHref() now returns std::string by value and
+// ko_get_spine_href() copies into its own buffer, so labels are read on demand again, after the first
+// frame, where an omnibus with thousands of spines should pay for them.
 
 function readImagePerf() {
   if (!api || !api._ko_image_decodes) return null;
@@ -867,7 +867,7 @@ function renderTiming(t0, buildMs, renderMs, composeMs, cached, imagePerf) {
     composeMs: +(composeMs || 0).toFixed(2),
     totalMs: +(performance.now() - t0).toFixed(2),
     pagesAvailable: currentPages,
-    sectionComplete: true,
+    sectionComplete: api && api._ko_spine_build_complete ? api._ko_spine_build_complete() === 1 : true,
     cached: !!cached,
     image: imagePerf || undefined,
   };
@@ -898,22 +898,34 @@ let sectionEstimates = {};
 // out a section nobody is looking at (and could interleave with an export's own buildSection).
 function invalidateSection() { sectionGen += 1; }
 
-function yieldToLoop() { return new Promise((r) => setTimeout(r, 0)); }
 
-// Load a book into the engine. Phases are measured because the right answer here is not obvious and
-// the two candidate paths differ by 2x on the same book:
-//
-//   read + adopt (default) — one bulk Blob read into the heap, then hand that buffer to storage, so the
-//     bytes are never copied a second time by C++. On an 80 MB book: 45 ms read + 7 ms copy-in, and no
-//     C++ copy of the book.
-//   stream + own (opt-in, `streamEpub`) — write the Blob into the heap in chunks and adopt it, which
-//     never materialises the book in JS at all. MEASURED SLOWER on wall time (93.8 ms vs 52 ms for
-//     80 MB): the chunks cross into the worker as ~1,280 separate messages, and one bulk read beats
-//     that. It saves an 80 MB transient allocation, so it stays available and measurable, but it is not
-//     the default until a case shows it paying.
-//
-// Returns the spine count, or -1. Fills `timing` with the phases it measured.
-async function loadEngineBook(data, timing) {
+async function continueSection(spine, gen, chunk) {
+  while (gen === sectionGen && currentSpine === spine && !foregroundExportRunning && !warmRunning) {
+    if (api._ko_spine_build_complete() === 1) break;
+    const t0 = performance.now();
+    const n = api._ko_build_spine_more(chunk);
+    if (n < 0) break;
+    currentPages = api._ko_spine_pages_available();
+    const est = api._ko_spine_pages_estimated();
+    const done = api._ko_spine_build_complete() === 1;
+    sectionEstimates[spine] = { pages: currentPages, estimated: est, complete: done };
+    // Progress carries no id: the page updates its "x / y" total without a round trip.
+    self.postMessage({ sectionProgress: true, spine, pages: currentPages, estimated: est,
+                       complete: done, ms: +(performance.now() - t0).toFixed(2) });
+    if (done) break;
+    await yieldToLoop();          // let render / navigation / settings messages run between chunks
+  }
+  if (gen === sectionGen && currentSpine === spine && api._ko_spine_build_complete() === 1) {
+    sectionEstimates[spine] = { pages: currentPages, estimated: currentPages, complete: true };
+    self.postMessage({ sectionProgress: true, spine, pages: currentPages, estimated: currentPages,
+                       complete: true, ms: 0 });
+  }
+}
+
+// `early` = {promise, startedAt} for a read the caller started BEFORE awaiting initPromise. The read needs
+// no engine, so on a cold page load the module's fetch/compile and the file read overlap instead of
+// running back to back. Everything below is otherwise unchanged, including the ownership contract.
+async function loadEngineBook(data, timing, early) {
   const t0 = performance.now();
   if (data.epub) {
     const bytes = new Uint8Array(data.epub);
@@ -962,7 +974,15 @@ async function loadEngineBook(data, timing) {
   // The read and the heap allocation are independent, so start the read first and allocate while it is
   // in flight. `wasmAllocMs` and `wasmMemcpyMs` are separate because they have different fixes: growth
   // can overlap I/O, a memcpy cannot.
-  const readPromise = blob.arrayBuffer();
+  let readPromise;
+  let readStartedAt;
+  if (early && early.promise) {
+    readPromise = early.promise;
+    readStartedAt = early.startedAt;           // may be before initPromise resolved
+  } else {
+    readStartedAt = performance.now();
+    readPromise = blob.arrayBuffer();
+  }
   const tAlloc = performance.now();
   const ptr = api._ko_epub_alloc ? api._ko_epub_alloc(blob.size) : api._malloc(blob.size);
   timing.wasmAllocMs = performance.now() - tAlloc;
@@ -972,12 +992,17 @@ async function loadEngineBook(data, timing) {
   }
   const tWait = performance.now();
   const buf = await readPromise;
-  timing.blobWaitAfterAllocMs = performance.now() - tWait;
+  const waitedFor = performance.now() - tWait;
+  const readDone = performance.now();
   const bytes = new Uint8Array(buf);
   const tCopy = performance.now();
   api.HEAPU8.set(bytes, ptr);
   timing.wasmMemcpyMs = performance.now() - tCopy;
-  timing.blobReadMs = +(timing.wasmAllocMs + timing.blobWaitAfterAllocMs).toFixed(2);
+  // Read wall time from when it STARTED (possibly before init) plus the part still outstanding once the
+  // engine was ready; the difference is what the overlap actually bought.
+  timing.blobReadMs = +(readDone - readStartedAt).toFixed(2);
+  timing.blobWaitAfterInitMs = +waitedFor.toFixed(2);
+  timing.blobBootOverlapMs = +Math.max(0, timing.blobReadMs - waitedFor).toFixed(2);
   timing.wasmCopyMs = timing.wasmMemcpyMs;
   if (api._ko_load_epub_owned) {
     // Adopt: storage takes this buffer, so the book is not copied again in C++.
@@ -1005,33 +1030,26 @@ async function loadEngineBook(data, timing) {
   return n;
 }
 
-async function continueSection(spine, gen, chunk) {
-  while (gen === sectionGen && currentSpine === spine && !foregroundExportRunning && !warmRunning) {
-    if (api._ko_spine_build_complete() === 1) break;
-    const t0 = performance.now();
-    const n = api._ko_build_spine_more(chunk);
-    if (n < 0) break;
-    currentPages = api._ko_spine_pages_available();
-    const est = api._ko_spine_pages_estimated();
-    const done = api._ko_spine_build_complete() === 1;
-    sectionEstimates[spine] = { pages: currentPages, estimated: est, complete: done };
-    // Progress carries no id: the page updates its "x / y" total without a round trip.
-    self.postMessage({ sectionProgress: true, spine, pages: currentPages, estimated: est,
-                       complete: done, ms: +(performance.now() - t0).toFixed(2) });
-    if (done) break;
-    await yieldToLoop();          // let render / navigation / settings messages run between chunks
-  }
-  if (gen === sectionGen && currentSpine === spine && api._ko_spine_build_complete() === 1) {
-    sectionEstimates[spine] = { pages: currentPages, estimated: currentPages, complete: true };
-    self.postMessage({ sectionProgress: true, spine, pages: currentPages, estimated: currentPages,
-                       complete: true, ms: 0 });
-  }
-}
-
 self.onmessage = async (ev) => {
   const { id, cmd } = ev.data;
+  let earlyRead = null;
+  const t0Open = performance.now();
   try {
+    // Start the file read BEFORE waiting for the engine. Reading a File/Blob needs no WASM, and on a cold
+    // page load this is the one place where the two unavoidable startup costs can overlap. The streaming
+    // path manages its own read and the ArrayBuffer path has nothing to read, so both are excluded.
+    //
+    // `noEarlyRead` is the CONTROL for measuring it: the same build, the same book, one variable — the
+    // read either starts before `await initPromise` or after it, exactly as it did before this change.
+    if ((cmd === 'load' || cmd === 'openPreview') && ev.data.blob && !ev.data.streamEpub
+        && !ev.data.noEarlyRead && typeof ev.data.blob.arrayBuffer === 'function') {
+      const promise = ev.data.blob.arrayBuffer();
+      promise.catch(() => {});            // init may fail first; do not surface an unhandled rejection
+      earlyRead = { promise, startedAt: performance.now() };
+    }
+    const tInit0 = performance.now();
     await initPromise;   // engine ready before any command
+    const initWaitMs = performance.now() - tInit0;
     switch (cmd) {      case 'ping': {
         const vp = api._ko_version();
         const ver = api.UTF8ToString ? api.UTF8ToString(vp) : String(vp);
@@ -1080,8 +1098,8 @@ self.onmessage = async (ev) => {
         // Each worker reads the same Blob instead.
         dropWarmResult();     // §3: warm bytes belong to the previous book
         invalidateSection();
-        loadTiming = {};
-        spineCount = await loadEngineBook(ev.data, loadTiming);
+        loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
+        spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
         loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength : (ev.data.blob ? ev.data.blob.size : 0);
         loadTiming.heapAfterLoadBytes = api.HEAPU8.buffer.byteLength;
         if (spineCount < 0) {
@@ -1117,12 +1135,6 @@ self.onmessage = async (ev) => {
         // Where the reference reader would open: its own text reference, not always spine 0. The page
         // starts there; the container still holds every spine.
         const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
-        const tLabels0 = performance.now();
-        spineLabels = [];
-        for (let s = 0; s < spineCount; s++) {
-          spineLabels.push(api.UTF8ToString(api._ko_get_spine_href(s)));
-        }
-        loadTiming.spineLabelsMs = +(performance.now() - tLabels0).toFixed(2);
         post(id, true, { spineCount, title, startSpine, timing: loadTiming });
         break;
       }
@@ -1160,6 +1172,78 @@ self.onmessage = async (ev) => {
         currentSpine = ev.data.spine;
         currentPages = n;
         post(id, true, { pages: n });
+        break;
+      }
+
+      // P3: open + first page in ONE round trip. First open otherwise costs
+      //   page->worker load, worker->page metadata, page UI work, page->worker render, worker->page frame
+      // and nothing about the first page needs that middle hop. `load` is kept for export/pool workers,
+      // which want metadata without a preview frame.
+      case 'openPreview': {
+        if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); break; }
+        if (!api) await init();
+        await stopWarmBeforeMutation();
+        dropWarmResult();
+        invalidateSection();
+        loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
+        spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
+        loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength
+                                            : (ev.data.blob ? ev.data.blob.size : 0);
+        loadTiming.heapAfterLoadBytes = api.HEAPU8.buffer.byteLength;
+        if (spineCount < 0) {
+          post(id, false, { error: 'Epub::load failed', timing: loadTiming });
+          return;
+        }
+        const titleBuf = api._malloc(512);
+        api._ko_get_title(titleBuf, 512);
+        const openTitle = api.UTF8ToString(titleBuf);
+        api._free(titleBuf);
+        bookGen += 1;
+        currentSpine = -1;
+        currentPages = 0;
+        if (ev.data.spec) await applySpec(ev.data.spec);
+        const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
+        const tBuild0 = performance.now();
+        const pages = api._ko_start_spine(startSpine, FIRST_PAGES);
+        if (pages < 0) {
+          post(id, false, { error: 'build failed: ' + (api.UTF8ToString(api._ko_error()) || 'unknown'),
+                            timing: loadTiming });
+          return;
+        }
+        currentSpine = startSpine;
+        currentPages = pages;
+        builtKey = layoutKey(currentSpec || {});
+        builtFontStamp = fontStamp;
+        const buildMs = performance.now() - tBuild0;
+        const wantMono = ev.data.mode === 0;
+        const tRender0 = performance.now();
+        const rc = renderPageEngine(0, wantMono);
+        if (rc !== 0) {
+          post(id, false, { error: 'first page render failed', timing: loadTiming });
+          return;
+        }
+        const renderMs = performance.now() - tRender0;
+        const tCompose0 = performance.now();
+        const frame = wantMono ? composeMono() : composePage();
+        const composeMs = performance.now() - tCompose0;
+        const gen = sectionGen;
+        const tx = frame.data.buffer;
+        post(id, true, {
+          title: openTitle,
+          spineCount,
+          startSpine,
+          page: 0,
+          pages,
+          total: Math.max(pages, api._ko_spine_pages_estimated ? api._ko_spine_pages_estimated() : pages),
+          image: tx,
+          mono: wantMono,
+          cached: false,
+          timing: Object.assign({}, loadTiming,
+                                renderTiming(tRender0, buildMs, renderMs, composeMs, false, readImagePerf()),
+                                { totalOpenWorkerMs: +(performance.now() - t0Open).toFixed(2) }),
+        }, [tx]);
+        // The rest of the spine keeps building behind the drawn frame.
+        continueSection(startSpine, gen, BUILD_CHUNK);
         break;
       }
 
@@ -1243,7 +1327,7 @@ self.onmessage = async (ev) => {
         tick('renderPage');
         COUNTERS.renders += 1;
         const tRenderStart = performance.now();
-        const rc = api._ko_render_page(page);
+        const rc = renderPageEngine(page, wantMono);
         tock('renderPage');
         const renderMs = performance.now() - tRenderStart;
         const imgPerf = readImagePerf();
@@ -1454,11 +1538,16 @@ self.onmessage = async (ev) => {
 // the call site whether that conversion happens, and a silently-null path is exactly the kind of thing
 // that would produce a container with missing chapter names and no error.
       case 'spineHrefs': {
-        // Served from the snapshot taken during load, for the reason documented at `spineLabels`.
+        // On demand again: safe because ko_get_spine_href() copies the href into its own buffer instead of
+        // pointing into a by-value temporary (see the note where the snapshot used to be).
         const start = Math.max(0, ev.data.start | 0);
         const count = Math.max(1, ev.data.count | 0);
-        const end = Math.min(spineLabels.length, start + count);
-        post(id, true, { start, hrefs: spineLabels.slice(start, end) });
+        const end = Math.min(spineCount, start + count);
+        const hrefs = [];
+        for (let s = start; s < end; s++) {
+          hrefs.push(api.UTF8ToString(api._ko_get_spine_href(s)));
+        }
+        post(id, true, { start, hrefs });
         break;
       }
 

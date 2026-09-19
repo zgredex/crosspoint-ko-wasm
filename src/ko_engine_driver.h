@@ -214,7 +214,21 @@ class EngineDriver {
     return t >= 0 && t < spineCount() ? t : 0;
   }
   const std::string& title() const { return epub_->getTitle(); }
-  const std::string& spineHref(int i) const { return epub_->getSpineItem(i).href; }
+  // RETURNS BY VALUE. This used to return `const std::string&` bound to
+  // `epub_->getSpineItem(i).href`, but getSpineItem() returns BookMetadataCache::SpineEntry BY VALUE
+  // (Epub.h:67), so the reference outlived the temporary that owned the string. Short hrefs live in the
+  // string's SSO buffer, i.e. inside that dead temporary, which is where the nondeterministic labels
+  // ("䏆", U+070F U+0006) came from. Copying here removes the UB at the source instead of reducing how
+  // often it is observed.
+  //
+  // Note for whoever tries to gate this: the host build does NOT reproduce it — a Release x86_64 build
+  // happens to leave the temporary's bytes intact at the point the copy reads them (measured: the
+  // --spine-hrefs sweep passes with the bug reinstated). It showed up in the wasm build. So the argument
+  // here is the language rule plus the browser behaviour, not a host regression test.
+  std::string spineHref(int i) const {
+    if (!epub_ || i < 0 || i >= spineCount()) return {};
+    return epub_->getSpineItem(i).href;
+  }
 
   // Build a section (spine) and return page count; -1 on failure.
   int buildSection(int spineIndex, const Spec& spec) {
@@ -278,8 +292,10 @@ class EngineDriver {
     ko::setImageDitherOptions(opts);
   }
 
+  // `monoOnly` is for 1-bit output (XTC preview and export): the consumer reads only the BW plane, so the
+  // two gray planes are pure waste — and on an AA-off image page they are a full extra image decode each.
   bool renderPage(int pageIndex, const Spec& spec, RenderedPage& out, ManifestPage* probe = nullptr,
-                  int spineIndex = 0) {
+                  int spineIndex = 0, bool monoOnly = false) {
     if (!section_) return false;
     applyImageDitherOptions(spec);
     auto page = section_->loadPage(pageIndex);
@@ -365,7 +381,7 @@ class EngineDriver {
     // The gate switch: render the OLD way (capture text, still draw images in both gray passes) so the
     // optimized path can be compared against it from one binary. Default off; --three-pass on the host,
     // ko_set_three_pass() for the browser probe. Never exposed in the product UI.
-    const bool captureWholeGray = textOnce && aaOn && !threePass_;
+    const bool captureWholeGray = textOnce && aaOn && !threePass_ && !monoOnly;
 
     // The three calls below are the port's capture API. It does not exist in the
     // reference renderer, so the reference build simply does not make them — and
@@ -379,6 +395,15 @@ class EngineDriver {
     if (captureText) renderer_.endLevelCapture();
 #endif
     out.bw.assign(display_.getFrameBuffer(), display_.getFrameBuffer() + 48000);
+
+    if (monoOnly) {
+      // No gray work at all: no capture, no gray passes, no plane copies. The caller asked for the 1-bit
+      // plane, so nothing here can change what it consumes.
+      out.lsb.clear();
+      out.msb.clear();
+      renderer_.setRenderMode(GfxRenderer::BW);
+      return true;
+    }
 
     renderer_.clearScreen(0x00);
     renderer_.setRenderMode(GfxRenderer::GRAYSCALE_LSB);

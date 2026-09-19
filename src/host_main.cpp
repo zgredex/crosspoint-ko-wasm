@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <algorithm>   // std::sort, std::max_element (spine distribution)
 #include <numeric>     // std::accumulate
@@ -110,9 +111,11 @@ int main(int argc, char** argv) {
   // --owned exercises the path the browser now takes: an allocation the storage adopts instead of
   // copying. Its bytes must be the same bytes, so the container is compared against the copied mount.
   bool useOwned = false;
+  bool hrefSweep = false;
   for (int i = 1; i < argc; i++) {
     if (std::string(argv[i]) == "--owned") useOwned = true;
     if (std::string(argv[i]) == "--three-pass") driver.setThreePass(true);
+    if (std::string(argv[i]) == "--spine-hrefs") hrefSweep = true;
   }
   bool loaded;
   if (useOwned) {
@@ -134,6 +137,56 @@ int main(int argc, char** argv) {
   const double tLoad = msSince(tLoad0);
   fprintf(stderr, "loaded: title='%s' spines=%d  [load %.1f ms]\n", driver.title().c_str(),
           driver.spineCount(), tLoad);
+
+  if (hrefSweep) {
+    // Read every spine href, then read them AGAIN after stack-churning work. spineHref() used to return a
+    // reference into a by-value temporary (BookMetadataCache::SpineEntry returns by value), so later reads
+    // came out of a dead frame and produced nondeterministic garbage like "䏆". Two independent reads that
+    // must agree, plus a charset check, is the strongest regression this host can run on the accessor.
+    //
+    // HONEST SCOPE — this sweep does NOT discriminate the bug. Measured with the reference form
+    // reinstated: `SPINE_HREFS ok — 3/10 spines, 0 differing/ill-formed` on every fixture. Row A of
+    // tools/spine_href_repro.cpp is the explanation: reading the href immediately after the call copies
+    // out of the poisoned slot while it is still intact, and that is exactly what the loop below does.
+    // The bug needs an intervening call to land on the dead frame, which is a real program's normal
+    // state (title retrieval, an allocation, a message loop) but never this loop's.
+    //
+    // So the discriminating evidence for the fix is scripts/verify/spine_href_gate.py: it asserts the
+    // accessor's signature and compiles the shape at -O0 and -O3, where one intervening call corrupts
+    // the href. ASAN is NOT an option on this host — a trivial `-fsanitize=address` program hangs
+    // (verified), so no stack-use-after-return report exists to point at.
+    const int hn = driver.spineCount();
+    std::vector<std::string> first;
+    first.reserve(hn);
+    for (int i = 0; i < hn; i++) first.push_back(driver.spineHref(i));
+
+    volatile size_t churn = 0;
+    for (int i = 0; i < hn; i++) {
+      std::string scratch(64, 'x');
+      std::string a = driver.spineHref(i), b = driver.spineHref(i), c = driver.spineHref(i);
+      churn += scratch.size() + a.size() + b.size() + c.size();
+    }
+    (void)churn;
+
+    int bad = 0;
+    for (int i = 0; i < hn; i++) {
+      const std::string again = driver.spineHref(i);
+      bool ok = !again.empty() && again == first[i];
+      for (char c : again) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-' || c == '/')) {
+          ok = false;
+        }
+      }
+      if (!ok) {
+        if (bad < 3) {
+          printf("  SPINE_HREF_BAD %d: \"%s\" (first read \"%s\")\n", i, again.c_str(), first[i].c_str());
+        }
+        bad++;
+      }
+    }
+    printf("SPINE_HREFS %s — %d spines, %d differing/ill-formed\n", bad ? "FAIL" : "ok", hn, bad);
+    if (bad) return 1;
+  }
 
   bool noKern = false;
   ko::Spec spec;

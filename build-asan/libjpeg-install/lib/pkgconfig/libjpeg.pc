@@ -1,0 +1,10 @@
+prefix=/Users/patryk/krxtc/ko-wasm/build-asan/libjpeg-install
+exec_prefix=/Users/patryk/krxtc/ko-wasm/build-asan/libjpeg-install
+libdir=/Users/patryk/krxtc/ko-wasm/build-asan/libjpeg-install/lib
+includedir=/Users/patryk/krxtc/ko-wasm/build-asan/libjpeg-install/include
+
+Name: libjpeg
+Description: A SIMD-accelerated JPEG codec that provides the libjpeg API
+Version: 3.0.4
+Libs: -L${libdir} -ljpeg
+Cflags: -I${includedir}
