@@ -330,25 +330,40 @@ KO_EXPORT int ko_font() { return g_spec.fontId; }
 // bytes are mounted into the in-memory FS, loaded through SdFontFamily and
 // registered under CUSTOM_FONT_ID. After a book load (which clears the FS),
 // the caller must re-send the font (the web worker caches and re-applies it).
+// Path of the currently installed custom face, so a replacement can retire the old file. Empty when no
+// custom face is installed.
+static std::string g_customFontPath;
+
+// CANDIDATE FIRST (defensive pass, stage 5). The old order removed the working face, mounted the new
+// blob and only then tried to parse it — so a truncated or malformed payload left the engine with NO
+// custom face and the previous one already gone. Now the candidate is mounted under its own name and
+// parsed to completion before anything live is touched; on failure the installed face is untouched, and
+// the caller's state (worker + page) is likewise unchanged, so all three layers still agree.
 KO_EXPORT int ko_load_epdfont(const uint8_t* data, size_t size, const char* name) {
   if (!g_renderer || !data || size < 64) {
     setError("bad epdfont payload");
     return -1;
   }
-  // remove any previous custom font first (mirrors reloadCustomReaderFont)
-  if (g_renderer->hasFont(CUSTOM_FONT_ID)) {
-    g_renderer->removeFont(CUSTOM_FONT_ID);
-  }
-  const std::string path = std::string("/.fonts/") + (name && name[0] ? name : "custom") + ".epdfont";
-  Storage.mountBlob(path, data, size);
-  auto family = new SdFontFamily(path.c_str());
-  if (!family || !family->load()) {
-    delete family;
-    Storage.remove(path.c_str());
+  const std::string candidatePath =
+      std::string("/.fonts/") + (name && name[0] ? name : "custom") + ".candidate.epdfont";
+  Storage.mountBlob(candidatePath, data, size);
+  // std::unique_ptr: if load() throws or returns false, the candidate storage is released on every path.
+  auto candidate = std::unique_ptr<SdFontFamily>(new SdFontFamily(candidatePath.c_str()));
+  if (!candidate->load()) {
+    candidate.reset();
+    Storage.remove(candidatePath.c_str());
     setError("epdfont load failed (bad format?)");
     return -1;
   }
-  g_renderer->insertSdFont(CUSTOM_FONT_ID, family);  // takes ownership
+  // The replacement is known-good. Only now destroy what was working.
+  if (g_renderer->hasFont(CUSTOM_FONT_ID)) {
+    g_renderer->removeFont(CUSTOM_FONT_ID);
+  }
+  if (!g_customFontPath.empty() && g_customFontPath != candidatePath) {
+    Storage.remove(g_customFontPath.c_str());
+  }
+  g_renderer->insertSdFont(CUSTOM_FONT_ID, candidate.release());  // takes ownership
+  g_customFontPath = candidatePath;
   g_spec.fontId = CUSTOM_FONT_ID;
   return 0;
 }
@@ -356,6 +371,12 @@ KO_EXPORT int ko_load_epdfont(const uint8_t* data, size_t size, const char* name
 KO_EXPORT int ko_clear_custom_font() {
   if (g_renderer && g_renderer->hasFont(CUSTOM_FONT_ID)) {
     g_renderer->removeFont(CUSTOM_FONT_ID);
+  }
+  // Retire the file too, or the next load's candidate would be the only thing ever removed and the
+  // cleared face would keep a slot in the storage.
+  if (!g_customFontPath.empty()) {
+    Storage.remove(g_customFontPath.c_str());
+    g_customFontPath.clear();
   }
   if (g_spec.fontId == CUSTOM_FONT_ID) {
     // Back to the reference default face, not to a port-specific one.
@@ -396,30 +417,43 @@ KO_EXPORT int ko_logical_height() {
 
 // ---- EPUB loading -----------------------------------------------------------
 
-// Shared tail of both load entry points: reset everything that belongs to a previous book. Kept in one
-// place so the copying and adopting paths cannot drift in what they leave behind.
-static int resetForNewBook() {
-  g_xtch->reset();
-  g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
+// ---- book replacement: split from the load that follows it --------------------------------------
+// FAIL CLOSED. The old shape cleared the storage and then relied on a success-only reset for everything
+// else, so after a failed replacement the writer, currentSpine, totalPages and the driver's live section
+// still described the PREVIOUS book while its files had already been dropped. Every load entry point now
+// runs beginBookReplacement() first and finishBookLoad() only on success, so a failure leaves one
+// coherent state: no book.
+static void beginBookReplacement() {
+  if (g_driver) g_driver->resetBook();
+  Storage.clearAll();
+  if (g_xtch) g_xtch->reset();
   g_chapters.clear();
+  g_spineFallback.clear();
+  g_chapterCandidates.clear();
   g_currentSpine = -1;
   g_spinePageStart = 0;
   g_totalPages = 0;
   g_xtchFullReady = 0;
+  g_page = ko::RenderedPage{};
+}
+
+static int finishBookLoad() {
+  g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
   return g_driver->spineCount();
 }
 
 KO_EXPORT int ko_load_epub(const uint8_t* data, size_t size, const char* virtualPath) {
-  if (!g_driver || !data || size == 0) return -1;
-  // Fresh in-memory FS per book: section caches from a previous load otherwise
-  // accumulate in the wasm heap and eventually fail section builds.
-  Storage.clearAll();
+  if (!g_driver || !g_xtch || !data || size == 0) return -1;
+  // Fresh in-memory FS per book: section caches from a previous load otherwise accumulate in the wasm
+  // heap and eventually fail section builds. Done as part of "begin", so the engine is already describing
+  // no book if the parse below fails.
+  beginBookReplacement();
   const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
   if (!g_driver->loadEpubFromBlob(data, size, vp)) {
     setError("Epub::load failed");
     return -1;
   }
-  return resetForNewBook();
+  return finishBookLoad();
 }
 
 // Allocate the buffer the caller will stream an EPUB into. It is NOT a general-purpose allocator: pair
@@ -444,13 +478,13 @@ KO_EXPORT int ko_load_epub_owned(uint8_t* data, size_t size, const char* virtual
     setError("no engine");
     return -1;
   }
-  Storage.clearAll();
+  beginBookReplacement();     // NOT Storage.clearAll(): see the begin/finish split above
   const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
   if (!g_driver->loadEpubFromOwnedBlob(data, size, vp)) {
     setError("Epub::load failed");
     return -1;      // the driver already dropped the mounted blob, which freed the buffer
   }
-  return resetForNewBook();
+  return finishBookLoad();
 }
 
 // ---- Range-backed mount entry point (P4) ---------------------------------------------------------
@@ -473,7 +507,7 @@ static int ko_blob_read_trampoline(void* ctx, size_t offset, uint8_t* dst, size_
 // the mount. Returns the spine count, or -1.
 KO_EXPORT int ko_load_epub_external(int size, const char* virtualPath) {
   if (!g_driver || size <= 0) return -1;
-  Storage.clearAll();                       // fresh FS per book, same as every other load path
+  beginBookReplacement();                   // fresh FS + no live book, same as every other load path
   externalStats().reset();
   const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
   // The reader is passed in, not looked up: the browser's is the EM_JS bridge and the host's is a pread,
@@ -491,7 +525,7 @@ KO_EXPORT int ko_load_epub_external(int size, const char* virtualPath) {
     setError("Epub::load failed");
     return -1;
   }
-  return resetForNewBook();
+  return finishBookLoad();
 }
 
 // Range-mount instrumentation. `which`: 0 window fetches, 1 bytes crossed, 2 reads served from RAM,
@@ -736,7 +770,7 @@ KO_EXPORT int ko_export_spine(int spine) {
   // and asserted by scripts/verify/mono_planes_gate.py. Do not "optimize" this away.
   for (int p = 0; p < n; p++) {
     ko::RenderedPage rp;
-    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0, false)) continue;
+    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) continue;
     g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
     g_totalPages++;
   }
@@ -834,7 +868,7 @@ KO_EXPORT int ko_encode_spine(int spine) {
     ko::RenderedPage rp;
     // Same rule as the serial path: the gray planes are consumed by the 1-bit writer, so they are always
     // rendered. See the note in ko_export_spine().
-    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0, false)) continue;
+    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) continue;
     w.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
     rendered++;
   }

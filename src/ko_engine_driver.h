@@ -178,10 +178,25 @@ class EngineDriver {
   // Same, but ADOPTS a caller-owned allocation instead of copying it. The browser streams the EPUB into
   // the wasm heap and hands that pointer over; the ZIP reader then walks exactly those bytes. The
   // ownership transfer is the contract: the storage's Blob frees the pointer, and the caller must not.
+  // CONTRACT: for non-null, non-empty input this call CONSUMES `data` whether parsing succeeds or fails.
+  // The owned Blob's deleter frees the pointer, and a failed openEpub() removes the mount — which drops
+  // that Blob. A caller must therefore never free `data` itself, and never read it again. (The host CLI
+  // used to free it on failure: a double free on malformed input.)
   bool loadEpubFromOwnedBlob(uint8_t* data, size_t size, const std::string& virtualPath) {
     if (!data || size == 0) return false;
     Storage.mountOwnedBlob(virtualPath, data, size);
     return openEpub(virtualPath);
+  }
+
+  // Drop every trace of the mounted book, WITHOUT touching the storage. Called at the START of a book
+  // replacement, before the new bytes are parsed, so that a parse failure leaves the engine describing
+  // "no book" — not the previous book, whose backing files have already been cleared.
+  void resetBook() {
+    ImageBlock::setExtractor(nullptr, nullptr);
+    section_.reset();
+    epub_.reset();
+    epubPath_.clear();
+    pageCount_ = 0;
   }
 
   // Range-backed mount: the EPUB is never made resident. `readFn` serves aligned windows on demand from
@@ -310,8 +325,86 @@ class EngineDriver {
   // ink is thinned with them) and so does the preview compositor, so a 1-bit page is not a function of
   // the BW plane. Measured: thousands of differing pixels on a text fixture. Every product path passes
   // false; only `ko_xtch_host --drop-gray-planes` passes true.
+  // The PRODUCT entry point for rendering a page. It takes NO boolean that can drop the gray passes.
+  //
+  // An audit proposed skipping them for 1-bit output on the theory that a 1-bit consumer reads only the
+  // BW plane. That was implemented, pushed, and silently corrupted every 1-bit export and preview: both
+  // xtch_writer.h::addMonoPage() and wasm_api.cpp::ko_compose_rgba() READ lsb/msb (grey pixels become ink
+  // dots; AA ink is thinned with them). Reverted, gated by scripts/verify/mono_planes_gate.py.
+  //
+  // Leaving it as a defaulted parameter would leave the product one careless `true` away from the same
+  // regression, so the capability now lives in the test-only entry point below and NOTHING in the shipped
+  // module can select it: KO_TEST_NEGATIVE_CONTROLS is defined for the host CLI alone (see CMakeLists).
   bool renderPage(int pageIndex, const Spec& spec, RenderedPage& out, ManifestPage* probe = nullptr,
-                  int spineIndex = 0, bool monoOnly = false) {
+                  int spineIndex = 0) {
+    return renderPageImpl(pageIndex, spec, out, probe, spineIndex, false);
+  }
+
+#ifdef KO_TEST_NEGATIVE_CONTROLS
+  // Negative control, host-only. Passing true here is what proves the gray planes are load-bearing for a
+  // 1-bit container; it must never be reachable from a product path.
+  bool renderPageDroppingGrayForTest(int pageIndex, const Spec& spec, RenderedPage& out,
+                                     ManifestPage* probe = nullptr, int spineIndex = 0) {
+    return renderPageImpl(pageIndex, spec, out, probe, spineIndex, true);
+  }
+#endif
+
+  // ---- TOC (chapter) access -------------------------------------------------
+  // The device reader names the current chapter from the EPUB TOC (TocEntry:
+  // title/href/anchor/level/spineIndex). Export chapters from the same source
+  // so the file's chapter list matches device chapter navigation.
+  int tocCount() const { return epub_ ? epub_->getTocItemsCount() : 0; }
+  // Raw spine index stored in the TOC entry (-1 = unresolved). getSpineIndex-
+  // ForTocIndex conflates spine 0 with errors, so read the entry directly.
+  int tocSpine(int i) const {
+    if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return -1;
+    return epub_->getTocItem(i).spineIndex;
+  }
+  std::string tocTitle(int i) const {
+    if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return "";
+    return epub_->getTocItem(i).title;
+  }
+  std::string tocAnchor(int i) const {
+    if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return "";
+    return epub_->getTocItem(i).anchor;
+  }
+  // Local page inside the CURRENT section for an anchor id (from the section's
+  // anchor map), or -1 when unknown. Valid after buildSection().
+  int anchorLocalPage(const std::string& anchor) const {
+    if (!section_ || anchor.empty()) return -1;
+    auto p = section_->findAnchor(anchor);
+    return p ? static_cast<int>(*p) : -1;
+  }
+
+  void close() {
+    ImageBlock::setExtractor(nullptr, nullptr);  // drop book ctx (mirrors onExit)
+    section_.reset();
+    epub_.reset();
+  }
+
+  ReaderRenderSpec toReaderSpec(const Spec& s) {
+    ReaderRenderSpec rs;
+    rs.fontId = s.fontId;
+    rs.lineCompression = s.lineCompression;
+    rs.extraParagraphSpacing = s.extraParagraphSpacing != 0;
+    rs.paragraphAlignment = static_cast<uint8_t>(s.paragraphAlignment);
+    rs.viewportWidth = s.viewportWidth;
+    rs.viewportHeight = s.viewportHeight;
+    rs.hyphenationEnabled = s.hyphenationEnabled != 0 && s.characterWrap == 0;
+    rs.embeddedStyle = s.embeddedStyle != 0;
+    rs.imageRendering = static_cast<uint8_t>(s.imageRendering);
+    rs.focusReadingEnabled = s.focusReadingEnabled != 0;
+    rs.paragraphIndent = s.paragraphIndent != 0;
+    rs.characterWrap = s.characterWrap != 0;
+    return rs;
+  }
+
+ private:
+
+  // Private implementation. No defaults: every argument is supplied by the two entry points above, so a
+  // defaulted `dropGrayPlanes` can never be reached by accident — which is the whole point of the split.
+  bool renderPageImpl(int pageIndex, const Spec& spec, RenderedPage& out, ManifestPage* probe,
+                      int spineIndex, bool dropGrayPlanes) {
     if (!section_) return false;
     // Per-render image accounting starts here, in the ONE function every entry point goes through. It used
     // to live in ko_render_page, so when the worker switched to ko_render_page_mode the counters silently
@@ -401,7 +494,7 @@ class EngineDriver {
     // The gate switch: render the OLD way (capture text, still draw images in both gray passes) so the
     // optimized path can be compared against it from one binary. Default off; --three-pass on the host,
     // ko_set_three_pass() for the browser probe. Never exposed in the product UI.
-    const bool captureWholeGray = textOnce && aaOn && !threePass_ && !monoOnly;
+    const bool captureWholeGray = textOnce && aaOn && !threePass_ && !dropGrayPlanes;
 
     // The three calls below are the port's capture API. It does not exist in the
     // reference renderer, so the reference build simply does not make them — and
@@ -416,7 +509,7 @@ class EngineDriver {
 #endif
     out.bw.assign(display_.getFrameBuffer(), display_.getFrameBuffer() + 48000);
 
-    if (monoOnly) {
+    if (dropGrayPlanes) {
       // No gray work at all: no capture, no gray passes, no plane copies. The caller asked for the 1-bit
       // plane, so nothing here can change what it consumes.
       out.lsb.clear();
@@ -447,58 +540,6 @@ class EngineDriver {
     out.msb.assign(display_.getMsbPlane(), display_.getMsbPlane() + 48000);
     return true;
   }
-
-  // ---- TOC (chapter) access -------------------------------------------------
-  // The device reader names the current chapter from the EPUB TOC (TocEntry:
-  // title/href/anchor/level/spineIndex). Export chapters from the same source
-  // so the file's chapter list matches device chapter navigation.
-  int tocCount() const { return epub_ ? epub_->getTocItemsCount() : 0; }
-  // Raw spine index stored in the TOC entry (-1 = unresolved). getSpineIndex-
-  // ForTocIndex conflates spine 0 with errors, so read the entry directly.
-  int tocSpine(int i) const {
-    if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return -1;
-    return epub_->getTocItem(i).spineIndex;
-  }
-  std::string tocTitle(int i) const {
-    if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return "";
-    return epub_->getTocItem(i).title;
-  }
-  std::string tocAnchor(int i) const {
-    if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return "";
-    return epub_->getTocItem(i).anchor;
-  }
-  // Local page inside the CURRENT section for an anchor id (from the section's
-  // anchor map), or -1 when unknown. Valid after buildSection().
-  int anchorLocalPage(const std::string& anchor) const {
-    if (!section_ || anchor.empty()) return -1;
-    auto p = section_->findAnchor(anchor);
-    return p ? static_cast<int>(*p) : -1;
-  }
-
-  void close() {
-    ImageBlock::setExtractor(nullptr, nullptr);  // drop book ctx (mirrors onExit)
-    section_.reset();
-    epub_.reset();
-  }
-
-  ReaderRenderSpec toReaderSpec(const Spec& s) {
-    ReaderRenderSpec rs;
-    rs.fontId = s.fontId;
-    rs.lineCompression = s.lineCompression;
-    rs.extraParagraphSpacing = s.extraParagraphSpacing != 0;
-    rs.paragraphAlignment = static_cast<uint8_t>(s.paragraphAlignment);
-    rs.viewportWidth = s.viewportWidth;
-    rs.viewportHeight = s.viewportHeight;
-    rs.hyphenationEnabled = s.hyphenationEnabled != 0 && s.characterWrap == 0;
-    rs.embeddedStyle = s.embeddedStyle != 0;
-    rs.imageRendering = static_cast<uint8_t>(s.imageRendering);
-    rs.focusReadingEnabled = s.focusReadingEnabled != 0;
-    rs.paragraphIndent = s.paragraphIndent != 0;
-    rs.characterWrap = s.characterWrap != 0;
-    return rs;
-  }
-
- private:
   GfxRenderer& renderer_;
   HalDisplay& display_;
   std::shared_ptr<Epub> epub_;

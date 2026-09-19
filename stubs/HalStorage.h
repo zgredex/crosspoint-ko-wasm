@@ -93,17 +93,26 @@ struct Blob {
     size_t len = externalSize - aligned;
     if (len > kWindow) len = kWindow;
     if (windowBytes.size() < len) windowBytes.resize(len);
-    // Counted HERE, once, so the browser bridge and the host CLI produce identical numbers — a wrapper
-    // in the caller would have to be written twice and could drift.
-    ExternalStats& stats = externalStats();
-    const auto t0 = std::chrono::steady_clock::now();
-    stats.calls++;
-    const int got = readFn(readCtx, aligned, windowBytes.data(), len);
-    stats.readMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    if (got <= 0) return false;
-    stats.bytes += static_cast<size_t>(got);
+    // A reader is allowed to return a SHORT positive read; the old code took the first positive result as
+    // the whole window and would then serve the gap as if it were file content. Loop until `len` is
+    // satisfied, and treat a short final window as a failure — `len` is already clipped to externalSize,
+    // so there is no legitimate short window at the end.
+    size_t total = 0;
+    while (total < len) {
+      ExternalStats& stats = externalStats();     // counted here, once, for both hosts
+      const auto t0 = std::chrono::steady_clock::now();
+      stats.calls++;
+      const int got = readFn(readCtx, aligned + total, windowBytes.data() + total, len - total);
+      stats.readMs +=
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      if (got <= 0) return false;
+      const size_t took = static_cast<size_t>(got);
+      if (took > len - total) return false;       // a reader must never report more than it was asked for
+      stats.bytes += took;
+      total += took;
+    }
     windowStart = aligned;
-    windowValid = static_cast<size_t>(got);
+    windowValid = total;
     windowFilled = true;
     return true;
   }

@@ -916,10 +916,6 @@ const BUILD_CHUNK = 4;      // pages per continuation tick
 // wash on the very first open of a session; the win at 80 MB is 76 ms, which no such cost can erase.
 const EXTERNAL_MIN_BYTES = 6 * 1024 * 1024;
 
-// Why the read-ahead was not started for the load currently in flight: 'external' (the range-backed
-// mount will serve the bytes), 'none' (nothing to read ahead), or null when it did start.
-let earlyReadSkipReason = null;
-
 // Range-mount instrumentation: 0 window fetches, 1 bytes crossed, 2 reads served from RAM, 3 ms in reader.
 function extStat(which) {
   if (!api || !api._ko_external_stat) return 0;
@@ -933,27 +929,48 @@ let sectionEstimates = {};
 function invalidateSection() { sectionGen += 1; }
 
 
+// Progress carries no id: the page updates its "x / y" total without a round trip.
+function postSectionProgress(spine, pages, estimated, complete, ms) {
+  self.postMessage({ sectionProgress: true, spine, pages, estimated, complete, ms });
+}
+
+// A continuation that stops silently is a wrong state, not a stop: page 1 can be valid while later
+// XHTML in the SAME spine fails to parse or lay out. The old code did `if (n < 0) break;` and simply
+// disappeared, leaving the page showing an estimated total that could never be reached and no reason
+// why. It now reports the failure, marks the estimate as failed rather than complete, and never throws
+// out of a detached promise (call sites are fire-and-forget).
 async function continueSection(spine, gen, chunk) {
-  while (gen === sectionGen && currentSpine === spine && !foregroundExportRunning && !warmRunning) {
-    if (api._ko_spine_build_complete() === 1) break;
-    const t0 = performance.now();
-    const n = api._ko_build_spine_more(chunk);
-    if (n < 0) break;
-    currentPages = api._ko_spine_pages_available();
-    const est = api._ko_spine_pages_estimated();
-    const done = api._ko_spine_build_complete() === 1;
-    sectionEstimates[spine] = { pages: currentPages, estimated: est, complete: done };
-    // Progress carries no id: the page updates its "x / y" total without a round trip.
-    self.postMessage({ sectionProgress: true, spine, pages: currentPages, estimated: est,
-                       complete: done, ms: +(performance.now() - t0).toFixed(2) });
-    if (done) break;
-    await yieldToLoop();          // let render / navigation / settings messages run between chunks
+  try {
+    while (gen === sectionGen && currentSpine === spine && !foregroundExportRunning && !warmRunning) {
+      if (api._ko_spine_build_complete() === 1) break;
+      const t0 = performance.now();
+      const n = api._ko_build_spine_more(chunk);
+      if (n < 0) {
+        const ep = api._ko_error();
+        reportSectionFailure(spine, api.UTF8ToString(ep) || 'section continuation failed');
+        return;
+      }
+      currentPages = api._ko_spine_pages_available();
+      const est = api._ko_spine_pages_estimated();
+      const done = api._ko_spine_build_complete() === 1;
+      sectionEstimates[spine] = { pages: currentPages, estimated: est, complete: done };
+      postSectionProgress(spine, currentPages, est, done, +(performance.now() - t0).toFixed(2));
+      if (done) break;
+      await yieldToLoop();          // let render / navigation / settings messages run between chunks
+    }
+    if (gen === sectionGen && currentSpine === spine && api._ko_spine_build_complete() === 1) {
+      sectionEstimates[spine] = { pages: currentPages, estimated: currentPages, complete: true };
+      postSectionProgress(spine, currentPages, currentPages, true, 0);
+    }
+  } catch (e) {
+    // A throw here used to be an unhandled rejection on a promise nobody holds.
+    reportSectionFailure(spine, String((e && e.message) || e));
   }
-  if (gen === sectionGen && currentSpine === spine && api._ko_spine_build_complete() === 1) {
-    sectionEstimates[spine] = { pages: currentPages, estimated: currentPages, complete: true };
-    self.postMessage({ sectionProgress: true, spine, pages: currentPages, estimated: currentPages,
-                       complete: true, ms: 0 });
-  }
+}
+
+function reportSectionFailure(spine, error) {
+  sectionEstimates[spine] = { pages: currentPages, estimated: currentPages, complete: false, failed: true };
+  self.postMessage({ sectionError: true, spine, pages: currentPages, error });
 }
 
 // `early` = {promise, startedAt} for a read the caller started BEFORE awaiting initPromise. The read needs
@@ -1059,7 +1076,7 @@ async function loadEngineBook(data, timing, early) {
   } else {
     readStartedAt = performance.now();
     readPromise = blob.arrayBuffer();
-    timing.earlyReadSkipReason = earlyReadSkipReason || undefined;
+    timing.earlyReadSkipReason = (early && early.skipReason) || undefined;
   }
   const tAlloc = performance.now();
   const ptr = api._ko_epub_alloc ? api._ko_epub_alloc(blob.size) : api._malloc(blob.size);
@@ -1108,6 +1125,164 @@ async function loadEngineBook(data, timing, early) {
   return n;
 }
 
+
+// ---- book-replacement serialization (defensive pass, stage 1) -----------------------------------
+// `self.onmessage` is async, so two `load`/`openPreview` commands could interleave across their awaits
+// and both mutate the globals the whole engine is described by: Storage, g_driver, __koBookBlob,
+// currentSpine/currentPages, currentSpec, sectionGen, the frame cache. Selecting book A then quickly
+// book B could therefore resume A's handler against B's engine. The page's render token does not reach
+// into the worker, so the serialization has to happen here.
+//
+// Only book replacement is queued. Page turns, renders and spec changes keep running immediately — they
+// are protected by their own guards and queuing them behind a slow book load would stall the reader.
+let bookLoadTail = Promise.resolve();
+function enqueueBookLoad(fn) {
+  // `then(fn, fn)` runs the queued work whether or not the previous load succeeded.
+  const run = bookLoadTail.then(fn, fn);
+  // A failed load must not poison the queue: settle the tail on both outcomes and swallow the result,
+  // so one bad EPUB cannot make every later book fail with the previous error.
+  bookLoadTail = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+// Everything one book load invalidates, in ONE place. `load` and `openPreview` had drifted: load reset
+// currentSpine/currentPages/bookGen/frame cache and appliedFont, openPreview reset only the first two.
+// The important omission was `appliedFont`: the engine's filesystem is cleared by a new book, so the
+// custom face is GONE, but applyFont('custom') short-circuits on
+// `appliedFont === 'custom' && appliedFontStamp === fontStamp` and would report success without
+// reloading it — leaving the reader rendering with the default face while the page believes otherwise.
+// `sectionEstimates` is cleared for the same reason: it is indexed by spine number alone, so a previous
+// book's spine 0 estimate would otherwise be inherited by the next book's spine 0.
+function resetWorkerStateAfterBookLoad() {
+  currentSpine = -1;
+  currentPages = 0;
+  builtKey = null;
+  builtFontStamp = -1;
+  sectionEstimates = {};
+  bookGen += 1;                 // new book, new frame namespace
+  clearFrameCache();
+  appliedFont = null;           // the engine's font state went with the filesystem
+  appliedFontStamp = -1;
+}
+
+async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
+  if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); return; }
+  if (!api) await init();
+  // §2: stop the warm and WAIT for it before the engine's EPUB is replaced. Bumping the token
+  // alone only asks it to abort at its next spine yield, and the suspended warm handler would
+  // then resume its spine loop against the NEW book.
+  await stopWarmBeforeMutation();
+  // EITHER an ArrayBuffer or a Blob. A Blob matters now that two engines exist: an ArrayBuffer
+  // handed to one worker is DETACHED by the transfer, so the second engine could never read it,
+  // and keeping a second copy in the page would double the book's memory for a 200 MB book.
+  // Each worker reads the same Blob instead.
+  dropWarmResult();     // §3: warm bytes belong to the previous book
+  invalidateSection();
+  loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
+  spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
+  loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength : (ev.data.blob ? ev.data.blob.size : 0);
+  loadTiming.heapAfterLoadBytes = api.HEAPU8.buffer.byteLength;
+  if (spineCount < 0) {
+    post(id, false, { error: 'Epub::load failed' });
+    return;
+  }
+  // title
+  const tbuf = api._malloc(512);
+  api._ko_get_title(tbuf, 512);
+  const title = api.UTF8ToString(tbuf);
+  api._free(tbuf);
+  resetWorkerStateAfterBookLoad();
+  // a new book cleared the in-memory FS: re-apply the custom font if one
+  // is loaded, so the reader face survives chapter navigation
+  if (customFontBytes && currentSpec && currentSpec.font === 'custom') {
+    // a new book cleared the in-memory FS, so the custom font has to go back in; if that fails
+    // the engine would render this book with the default face while the page believes otherwise
+    if (!applyFont('custom')) {
+      const ep = api._ko_error();
+      post(id, false, { error: 'epdfont re-apply after book load failed: ' +
+                               (api.UTF8ToString(ep) || 'failed') });
+      return;
+    }
+  }
+  // `engineSpanMs` stops when the parse stops. It does NOT cover the font re-apply above, the
+  // title read, the spec apply or the text-reference lookup — none of which loadEngineBook can
+  // see. The command-wide number is loadCommandMs, taken here, so nothing is left implied.
+  loadTiming.loadCommandMs = +(performance.now() - t0Open).toFixed(2);
+  // Spine labels are NOT sent here: one label per spine in front of the first page buys nothing,
+  // and an omnibus has thousands. The page asks for them in batches once the first frame is up.
+  // Where the reference reader would open: its own text reference, not always spine 0. The page
+  // starts there; the container still holds every spine.
+  const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
+  post(id, true, { spineCount, title, startSpine, timing: loadTiming });
+}
+
+async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
+  if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); return; }
+  if (!api) await init();
+  await stopWarmBeforeMutation();
+  dropWarmResult();
+  invalidateSection();
+  loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
+  spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
+  loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength
+                                      : (ev.data.blob ? ev.data.blob.size : 0);
+  loadTiming.heapAfterLoadBytes = api.HEAPU8.buffer.byteLength;
+  if (spineCount < 0) {
+    post(id, false, { error: 'Epub::load failed', timing: loadTiming });
+    return;
+  }
+  const titleBuf = api._malloc(512);
+  api._ko_get_title(titleBuf, 512);
+  const openTitle = api.UTF8ToString(titleBuf);
+  api._free(titleBuf);
+  // Same invalidation as 'load', through the same function: openPreview used to reset only the first two
+  // of these, which is how a custom face could be believed still applied after the filesystem was gone.
+  resetWorkerStateAfterBookLoad();
+  if (ev.data.spec) await applySpec(ev.data.spec);
+  const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
+  const tBuild0 = performance.now();
+  const pages = api._ko_start_spine(startSpine, FIRST_PAGES);
+  if (pages < 0) {
+    post(id, false, { error: 'build failed: ' + (api.UTF8ToString(api._ko_error()) || 'unknown'),
+                      timing: loadTiming });
+    return;
+  }
+  currentSpine = startSpine;
+  currentPages = pages;
+  builtKey = layoutKey(currentSpec || {});
+  builtFontStamp = fontStamp;
+  const buildMs = performance.now() - tBuild0;
+  const wantMono = ev.data.mode === 0;
+  const tRender0 = performance.now();
+  const rc = renderPageEngine(0);
+  if (rc !== 0) {
+    post(id, false, { error: 'first page render failed', timing: loadTiming });
+    return;
+  }
+  const renderMs = performance.now() - tRender0;
+  const tCompose0 = performance.now();
+  const frame = wantMono ? composeMono() : composePage();
+  const composeMs = performance.now() - tCompose0;
+  const gen = sectionGen;
+  const tx = frame.data.buffer;
+  post(id, true, {
+    title: openTitle,
+    spineCount,
+    startSpine,
+    page: 0,
+    pages,
+    total: Math.max(pages, api._ko_spine_pages_estimated ? api._ko_spine_pages_estimated() : pages),
+    image: tx,
+    mono: wantMono,
+    cached: false,
+    timing: Object.assign({}, loadTiming,
+                          renderTiming(tRender0, buildMs, renderMs, composeMs, false, readImagePerf()),
+                          { totalOpenWorkerMs: +(performance.now() - t0Open).toFixed(2) }),
+  }, [tx]);
+  // The rest of the spine keeps building behind the drawn frame.
+  continueSection(startSpine, gen, BUILD_CHUNK);
+}
+
 self.onmessage = async (ev) => {
   const { id, cmd } = ev.data;
   let earlyRead = null;
@@ -1126,13 +1301,14 @@ self.onmessage = async (ev) => {
     // decision needs only the Blob's size and FileReaderSync, both of which are known NOW, so it is made
     // now instead of after init. If the engine turns out not to have the entry point, the bulk path
     // simply reads on the spot (`early` is null) and loses only the overlap.
-    const externalPlanned = (cmd === 'load' || cmd === 'openPreview') && !!ev.data.blob && !ev.data.epub
+    const loadCmd = cmd === 'load' || cmd === 'openPreview';
+    const externalPlanned = loadCmd && !!ev.data.blob && !ev.data.epub
         && !ev.data.bulkRead && !ev.data.streamEpub
         && ev.data.blob.size >= EXTERNAL_MIN_BYTES
         && (typeof api !== 'undefined' && api && api._ko_load_epub_external
               ? true                                             // known-present engine: certain
               : typeof FileReaderSync !== 'undefined');            // cold start: the entry point is in every shipped build
-    if ((cmd === 'load' || cmd === 'openPreview') && ev.data.blob && !ev.data.streamEpub
+    if (loadCmd && ev.data.blob && !ev.data.streamEpub
         && !externalPlanned && !ev.data.noEarlyRead && typeof ev.data.blob.arrayBuffer === 'function') {
       const promise = ev.data.blob.arrayBuffer();
       promise.catch(() => {});            // init may fail first; do not surface an unhandled rejection
@@ -1141,9 +1317,11 @@ self.onmessage = async (ev) => {
     const tInit0 = performance.now();
     await initPromise;   // engine ready before any command
     const initWaitMs = performance.now() - tInit0;
-    // Say WHY there is no read-ahead when there is none. Without this, a missing blobBootOverlapMs reads
-    // as "the overlap stopped working" instead of "the range-backed mount owns the read".
-    earlyReadSkipReason = earlyRead ? null : (externalPlanned ? 'external' : 'none');
+    // Carry the read-ahead decision ON THE REQUEST. A single module-level flag was wrong the moment two
+    // loads could be queued: the second request would overwrite the first one's reason.
+    if (loadCmd && !earlyRead) {
+      earlyRead = { promise: null, startedAt: 0, skipReason: externalPlanned ? 'external' : 'none' };
+    }
     switch (cmd) {      case 'ping': {
         const vp = api._ko_version();
         const ver = api.UTF8ToString ? api.UTF8ToString(vp) : String(vp);
@@ -1179,62 +1357,11 @@ self.onmessage = async (ev) => {
         break;
       }
 
-      case 'load': {
-        if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); break; }
-        if (!api) await init();
-        // §2: stop the warm and WAIT for it before the engine's EPUB is replaced. Bumping the token
-        // alone only asks it to abort at its next spine yield, and the suspended warm handler would
-        // then resume its spine loop against the NEW book.
-        await stopWarmBeforeMutation();
-        // EITHER an ArrayBuffer or a Blob. A Blob matters now that two engines exist: an ArrayBuffer
-        // handed to one worker is DETACHED by the transfer, so the second engine could never read it,
-        // and keeping a second copy in the page would double the book's memory for a 200 MB book.
-        // Each worker reads the same Blob instead.
-        dropWarmResult();     // §3: warm bytes belong to the previous book
-        invalidateSection();
-        loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
-        spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
-        loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength : (ev.data.blob ? ev.data.blob.size : 0);
-        loadTiming.heapAfterLoadBytes = api.HEAPU8.buffer.byteLength;
-        if (spineCount < 0) {
-          post(id, false, { error: 'Epub::load failed' });
-          return;
-        }
-        // title
-        const tbuf = api._malloc(512);
-        api._ko_get_title(tbuf, 512);
-        const title = api.UTF8ToString(tbuf);
-        api._free(tbuf);
-        currentSpine = -1;
-        currentPages = 0;
-        bookGen += 1;                // §5: new book, new frame namespace
-        clearFrameCache();
-        appliedFont = null;          // §1: a load resets the engine's font state, so force a re-apply
-        // a new book cleared the in-memory FS: re-apply the custom font if one
-        // is loaded, so the reader face survives chapter navigation
-        if (customFontBytes && currentSpec && currentSpec.font === 'custom') {
-          // a new book cleared the in-memory FS, so the custom font has to go back in; if that fails
-          // the engine would render this book with the default face while the page believes otherwise
-          if (!applyFont('custom')) {
-            const ep = api._ko_error();
-            post(id, false, { error: 'epdfont re-apply after book load failed: ' +
-                                     (api.UTF8ToString(ep) || 'failed') });
-            return;
-          }
-        }
-        // `engineSpanMs` stops when the parse stops. It does NOT cover the font re-apply above, the
-        // title read, the spec apply or the text-reference lookup — none of which loadEngineBook can
-        // see. The command-wide number is loadCommandMs, taken here, so nothing is left implied.
-        loadTiming.loadCommandMs = +(performance.now() - t0Open).toFixed(2);
-        // Spine labels are NOT sent here: one label per spine in front of the first page buys nothing,
-        // and an omnibus has thousands. The page asks for them in batches once the first frame is up.
-        // Where the reference reader would open: its own text reference, not always spine 0. The page
-        // starts there; the container still holds every spine.
-        const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
-        post(id, true, { spineCount, title, startSpine, timing: loadTiming });
+case 'load': {
+        // Queued: a book replacement must not overlap another one (see enqueueBookLoad).
+        await enqueueBookLoad(() => handleLoad(ev, id, initWaitMs, earlyRead, t0Open));
         break;
       }
-
       case 'spec': {
         if (foregroundExportRunning) { post(id, false, { error: 'settings locked during export' }); break; }
         // §3 of the 1.4 audit: the worker owns this invariant, not the caller. window.__call is
@@ -1275,74 +1402,11 @@ self.onmessage = async (ev) => {
       //   page->worker load, worker->page metadata, page UI work, page->worker render, worker->page frame
       // and nothing about the first page needs that middle hop. `load` is kept for export/pool workers,
       // which want metadata without a preview frame.
-      case 'openPreview': {
-        if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); break; }
-        if (!api) await init();
-        await stopWarmBeforeMutation();
-        dropWarmResult();
-        invalidateSection();
-        loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
-        spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
-        loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength
-                                            : (ev.data.blob ? ev.data.blob.size : 0);
-        loadTiming.heapAfterLoadBytes = api.HEAPU8.buffer.byteLength;
-        if (spineCount < 0) {
-          post(id, false, { error: 'Epub::load failed', timing: loadTiming });
-          return;
-        }
-        const titleBuf = api._malloc(512);
-        api._ko_get_title(titleBuf, 512);
-        const openTitle = api.UTF8ToString(titleBuf);
-        api._free(titleBuf);
-        bookGen += 1;
-        currentSpine = -1;
-        currentPages = 0;
-        if (ev.data.spec) await applySpec(ev.data.spec);
-        const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
-        const tBuild0 = performance.now();
-        const pages = api._ko_start_spine(startSpine, FIRST_PAGES);
-        if (pages < 0) {
-          post(id, false, { error: 'build failed: ' + (api.UTF8ToString(api._ko_error()) || 'unknown'),
-                            timing: loadTiming });
-          return;
-        }
-        currentSpine = startSpine;
-        currentPages = pages;
-        builtKey = layoutKey(currentSpec || {});
-        builtFontStamp = fontStamp;
-        const buildMs = performance.now() - tBuild0;
-        const wantMono = ev.data.mode === 0;
-        const tRender0 = performance.now();
-        const rc = renderPageEngine(0);
-        if (rc !== 0) {
-          post(id, false, { error: 'first page render failed', timing: loadTiming });
-          return;
-        }
-        const renderMs = performance.now() - tRender0;
-        const tCompose0 = performance.now();
-        const frame = wantMono ? composeMono() : composePage();
-        const composeMs = performance.now() - tCompose0;
-        const gen = sectionGen;
-        const tx = frame.data.buffer;
-        post(id, true, {
-          title: openTitle,
-          spineCount,
-          startSpine,
-          page: 0,
-          pages,
-          total: Math.max(pages, api._ko_spine_pages_estimated ? api._ko_spine_pages_estimated() : pages),
-          image: tx,
-          mono: wantMono,
-          cached: false,
-          timing: Object.assign({}, loadTiming,
-                                renderTiming(tRender0, buildMs, renderMs, composeMs, false, readImagePerf()),
-                                { totalOpenWorkerMs: +(performance.now() - t0Open).toFixed(2) }),
-        }, [tx]);
-        // The rest of the spine keeps building behind the drawn frame.
-        continueSection(startSpine, gen, BUILD_CHUNK);
+case 'openPreview': {
+        // Queued for the same reason as 'load' — and it is the same operation plus a first frame.
+        await enqueueBookLoad(() => handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open));
         break;
       }
-
       case 'render': {
         // §2/§8: the spec travels with the render, so an ordinary page turn is one request and a
         // settings change is one request too. When it has not changed, this does nothing at all.
@@ -1511,19 +1575,39 @@ self.onmessage = async (ev) => {
         await stopWarmBeforeMutation();
         // ev.data.epdfont: ArrayBuffer, ev.data.name: string
         tick('loadFont');
-        customFontBytes = new Uint8Array(ev.data.epdfont);
-        customFontName = (ev.data.name || 'custom').replace(/[^\w-]/g, '') || 'custom';
-        fontStamp++;
-        clearFrameCache();    // §6: frames keyed by the old stamp can never hit again
-        tick('applyFont');
-        const ok = applyFont('custom');
-        tock('applyFont');
+        // TRANSACTIONAL (defensive pass, stage 4): nothing canonical is touched until the ENGINE has
+        // accepted the face. This used to assign customFontBytes/customFontName and bump fontStamp FIRST,
+        // so a truncated or malformed payload left the worker describing a font the engine never loaded —
+        // and the next book load would then "re-apply" a face that does not exist while reporting success.
+        const candidateBytes = new Uint8Array(ev.data.epdfont);
+        const candidateName = (ev.data.name || 'custom').replace(/[^\w-]/g, '') || 'custom';
+        const fp = api._malloc(candidateBytes.length);
+        let rc;
+        try {
+          api.HEAPU8.set(candidateBytes, fp);
+          tick('applyFont');
+          rc = api._ko_load_epdfont(fp, candidateBytes.length, candidateName);
+          COUNTERS.epdfontLoads += 1;
+          tock('applyFont');
+        } finally {
+          api._free(fp);
+        }
         tock('loadFont');
-        if (!ok) {
+        if (rc !== 0) {
+          // The PREVIOUS face is still live in the engine (the C++ loader is candidate-first too), and
+          // every described-state variable is untouched, so the page and the worker still agree.
           const ep = api._ko_error();
           post(id, false, { error: 'epdfont load: ' + (api.UTF8ToString(ep) || 'failed') });
           return;
         }
+        // COMMIT — only now.
+        customFontBytes = candidateBytes;
+        customFontName = candidateName;
+        fontStamp++;
+        appliedFont = 'custom';
+        appliedFontStamp = fontStamp;
+        clearFrameCache();    // §6: frames keyed by the old stamp can never hit again
+        COUNTERS.fontApplies += 1;
         post(id, true, { font: 'custom', fontStamp });
         break;
       }

@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
             "          [--text-aa|--no-text-aa] [--font kopub|ridibatang] [--kopub-external blob]\n"
             "          [--external-font kopub|ridibatang blob] [--no-kern]\n"
             "          [--screen-margin N | --margin-bottom N]\n"
-            "[--manifest PATH] [--dump-planes DIR] [--max-pages N] [--external] [--drop-gray-planes]\n",
+            "[--manifest PATH] [--dump-planes DIR] [--max-pages N] [--external] [--drop-gray-planes] [--read-helpers]\n",
             argv[0]);
     return 2;
   }
@@ -131,11 +131,13 @@ int main(int argc, char** argv) {
   // copying. Its bytes must be the same bytes, so the container is compared against the copied mount.
   bool useOwned = false;
   bool useExternal = false;
+  bool readHelpers = false;   // --read-helpers: exercise the generic read helpers on an external mount
   bool hrefSweep = false;
   for (int i = 1; i < argc; i++) {
     if (std::string(argv[i]) == "--owned") useOwned = true;
     if (std::string(argv[i]) == "--external") useExternal = true;
     if (std::string(argv[i]) == "--drop-gray-planes") g_dropGrayPlanes = true;
+    if (std::string(argv[i]) == "--read-helpers") readHelpers = true;
     if (std::string(argv[i]) == "--three-pass") driver.setThreePass(true);
     if (std::string(argv[i]) == "--spine-hrefs") hrefSweep = true;
   }
@@ -155,8 +157,17 @@ int main(int argc, char** argv) {
       fprintf(stderr, "cannot open %s for range reads\n", epubPath.c_str());
       return 1;
     }
+    // KO_EXTERNAL_MAX_READ clamps how much one callback reads. A real reader may return a SHORT positive
+    // read, and the storage must loop rather than treat the first positive result as the whole window
+    // (it used to serve the gap as file content). external_gate.py uses a tiny clamp to prove that.
+    static const size_t kMaxRead = [] {
+      const char* v = std::getenv("KO_EXTERNAL_MAX_READ");
+      const long n = v ? std::strtol(v, nullptr, 10) : 0;
+      return n > 0 ? static_cast<size_t>(n) : static_cast<size_t>(1) << 40;
+    }();
     auto pread = [](void* ctx, size_t offset, uint8_t* dst, size_t len) -> int {
       std::ifstream* f = static_cast<std::ifstream*>(ctx);
+      if (len > kMaxRead) len = kMaxRead;           // short read, by request
       f->clear();                                   // a previous EOF must not poison the next read
       f->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
       if (!*f) return -1;
@@ -165,6 +176,30 @@ int main(int argc, char** argv) {
       return got > 0 ? static_cast<int>(got) : -1;
     };
     loaded = driver.loadEpubFromExternal(fileSizeBytes, epubPath, pread, &reader);
+    if (loaded && readHelpers) {
+      // Exercise the three GENERIC read helpers against an external mount. They used to read Blob::data
+      // directly, which is nullptr for an external Blob by design — a null dereference waiting for the
+      // first caller. This is the host's way of covering them; the size is what matters, not the bytes.
+      char buf[1024];
+      const size_t got = Storage.readFileToBuffer(epubPath.c_str(), buf, sizeof(buf), 0);
+      const HalFile f = Storage.open(epubPath.c_str(), O_RDONLY);
+      const String whole = Storage.readFile(epubPath.c_str());
+      std::vector<uint8_t> sink;
+      struct Collect : Print {
+        std::vector<uint8_t>* out;
+        explicit Collect(std::vector<uint8_t>* o) : out(o) {}
+        size_t write(const uint8_t* p, size_t n) override {
+          out->insert(out->end(), p, p + n);
+          return n;
+        }
+        size_t write(uint8_t c) override { out->push_back(c); return 1; }
+      };
+      Collect collect(&sink);
+      const bool streamed = Storage.readFileToStream(epubPath.c_str(), collect, 512);
+      fprintf(stderr,
+              "READ_HELPERS buffer=%zu fileSize=%zu whole=%zu streamed=%zu streamBytes=%zu\n",
+              got, f.size(), whole.length(), streamed ? 1u : 0u, sink.size());
+    }
   } else if (useOwned) {
     auto* owned = static_cast<uint8_t*>(std::malloc(epubBytes.size()));
     if (!owned) {
@@ -172,8 +207,11 @@ int main(int argc, char** argv) {
       return 1;
     }
     std::memcpy(owned, epubBytes.data(), epubBytes.size());
+    // Ownership is consumed by the call REGARDLESS of the outcome: mountOwnedBlob installs the Blob whose
+    // deleter is std::free, and a failed openEpub() removes that mount. The `if (!loaded) std::free(owned)`
+    // that used to be here was therefore a double free on malformed input — exactly the case a
+    // malformed-input test exercises.
     loaded = driver.loadEpubFromOwnedBlob(owned, epubBytes.size(), epubPath);
-    if (!loaded) std::free(owned);   // on failure the storage never adopted it
   } else {
     loaded = driver.loadEpubFromBlob(epubBytes.data(), epubBytes.size(), epubPath);
   }
@@ -447,8 +485,11 @@ int main(int argc, char** argv) {
       t0 = Clock::now();
       // Gray planes are always rendered (see g_dropGrayPlanes): a 1-bit container's writer consumes
       // them, so `monoOnly` is only ever true from the negative-control flag.
-      const bool monoOnly = g_dropGrayPlanes && writer.mode() == ko::XtcMode::Mono1Bit;
-      if (!driver.renderPage(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine, monoOnly)) {
+      // The rejected gray-plane-skipping state is only reachable through the test-only entry point, which
+      // the product module does not compile (KO_TEST_NEGATIVE_CONTROLS is host-only).
+      const bool dropGray = g_dropGrayPlanes && writer.mode() == ko::XtcMode::Mono1Bit;
+      if (!(dropGray ? driver.renderPageDroppingGrayForTest(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine)
+                     : driver.renderPage(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine))) {
         fprintf(stderr, "  page %d failed\n", p);
         continue;
       }

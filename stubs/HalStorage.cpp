@@ -63,38 +63,48 @@ ExternalStats& externalStats() {
   return stats;
 }
 
+// These three used to read `Blob::data` directly. That was fine while every Blob was RAM-backed, and
+// became a null dereference the moment a third representation existed: an external Blob has data == null
+// by design, because its bytes live outside this address space. They now go through HalFile::read(), so
+// the backing type is the storage's business and no helper above it can crash on a valid representation.
 String HalStorage::readFile(const char* path) {
-  auto it = files_.find(path ? path : "");
-  if (it == files_.end()) return String();
-  it->second->refresh();
-  return String(std::string(reinterpret_cast<const char*>(it->second->data), it->second->size));
+  HalFile f = open(path, O_RDONLY);
+  if (!f) return String();
+  const size_t n = f.size();
+  std::vector<char> buf(n, '\0');
+  if (n > 0) {
+    const int got = f.read(buf.data(), n);
+    if (got < 0) return String();
+    buf.resize(static_cast<size_t>(got));
+  }
+  return String(std::string(buf.begin(), buf.end()));
 }
 
 bool HalStorage::readFileToStream(const char* path, Print& out, size_t chunkSize) {
-  auto it = files_.find(path ? path : "");
-  if (it == files_.end()) return false;
-  auto& b = *it->second;
-  b.refresh();
-  size_t off = 0;
-  while (off < b.size) {
-    size_t n = std::min(chunkSize, b.size - off);
-    size_t w = out.write(b.data + off, n);
-    if (w != n) return false;
-    off += n;
+  HalFile f = open(path, O_RDONLY);
+  if (!f) return false;
+  if (chunkSize == 0) chunkSize = 256;
+  std::vector<uint8_t> tmp(chunkSize);
+  while (f.position() < f.size()) {
+    const size_t want = std::min(tmp.size(), f.size() - f.position());
+    const int got = f.read(tmp.data(), want);
+    if (got <= 0) return false;                 // a failed read is an error, not EOF
+    if (out.write(tmp.data(), static_cast<size_t>(got)) != static_cast<size_t>(got)) return false;
   }
   return true;
 }
 
 size_t HalStorage::readFileToBuffer(const char* path, char* buffer, size_t bufferSize, size_t maxBytes) {
   if (!buffer || bufferSize == 0) return 0;
-  auto it = files_.find(path ? path : "");
-  if (it == files_.end()) return 0;
-  auto& b = *it->second;
-  b.refresh();
-  size_t n = std::min({b.size, bufferSize - 1, maxBytes ? maxBytes : b.size});
-  memcpy(buffer, b.data, n);
-  buffer[n] = '\0';
-  return n;
+  HalFile f = open(path, O_RDONLY);
+  if (!f) return 0;
+  const size_t limit = maxBytes ? std::min(maxBytes, bufferSize - 1) : bufferSize - 1;
+  const size_t wanted = std::min(f.size(), limit);
+  if (wanted == 0) { buffer[0] = '\0'; return 0; }
+  const int got = f.read(buffer, wanted);
+  if (got < 0) { buffer[0] = '\0'; return 0; }
+  buffer[got] = '\0';
+  return static_cast<size_t>(got);
 }
 
 bool HalStorage::writeFile(const char* path, const String& content) {

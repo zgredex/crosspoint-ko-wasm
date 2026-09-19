@@ -49,6 +49,7 @@
   let state = { spine: 0, page: 0, pages: 0, mode: 1 };  // mode: 0=1-bit XTC, 1=2-bit XTCH
   let viewingCover = false;       // canvas shows cover BMP, not a page
   let renderToken = 0;            // invalidates stale renders
+  let bookLoadToken = 0;          // invalidates a superseded BOOK LOAD (distinct from a stale render)
   let repaintTimer = null;        // trailing debounce → visible-page repaint
   let customFontLoaded = false;   // a runtime .epdfont is active in the engine
   let exporting = false;          // export in flight → knobs disabled
@@ -72,12 +73,23 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=97');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=98');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
       // the total on screen follows it. Navigation stays clamped to the pages that EXIST (state.pages);
       // this only changes what "x / y" says.
+      if (m && m.sectionError) {
+        // A continuation that failed after page 1 was already valid. The worker says so now instead of
+        // stopping silently, and the total must stop advertising pages that cannot arrive.
+        if (m.spine === state.spine) {
+          state.total = m.pages || state.pages;
+          updatePager();
+          reportError(new Error(m.error || '장 처리 실패'), '장 처리');
+        }
+        window.__koSectionError = { spine: m.spine, error: m.error };
+        return;
+      }
       if (m && m.sectionProgress) {
         if (m.spine === state.spine) {
           state.total = m.complete ? m.pages : Math.max(m.estimated || 0, m.pages);
@@ -231,7 +243,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=97');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=98');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -835,16 +847,24 @@
     // the buffer that was sent. The previous version handed meta._bytes straight to the preview worker
     // and kept nothing, so the export engine could be told font:"custom" while owning no such font.
     const retained = meta._bytes.slice(0);
-    customFontAsset = { name: meta.name, bytes: retained, generation: ++customFontGeneration };
+
+    // Stage 4C of the defensive pass: the worker goes FIRST, and the page commits only if it accepted the
+    // face. This used to set customFontAsset and bump customFontGeneration before the round trip, so a
+    // font that the engine refused was still the page's official face — and `generation` is part of
+    // poolIdentity(), so the pool was torn down for a face nobody ever loaded.
+    const previewBytes = retained.slice(0);
+    const r = await call('loadFont', { epdfont: previewBytes, name: meta.name }, [previewBytes]);
+
+    // COMMIT — the preview engine is holding this face, so the page and every pool identity may now say so.
+    customFontGeneration++;
+    customFontAsset = { name: meta.name, bytes: retained, generation: customFontGeneration };
 
     // Every pooled engine is holding the PREVIOUS face. Destroying the pool is cheaper and easier to
     // reason about than broadcasting a font to N speculative engines: the next pooled export rebuilds
     // them and restores the current asset, which is the path that is already verified. The export
     // engine keeps its hot-sync, because it exists for the download path and is one engine, not N.
+    // Only reached on success: a refused payload must leave the previous face's engines alive.
     killPool();
-
-    const previewBytes = retained.slice(0);
-    const r = await call('loadFont', { epdfont: previewBytes, name: meta.name }, [previewBytes]);
 
     // A newly converted font must reach the export engine too, or the next conversion is built from a
     // different face than the preview shows. Best-effort: loadExportEngine() restores it anyway, and
@@ -919,8 +939,13 @@
   }
 
   async function loadBook(blob, name) {
+    // Stage 1B of the defensive pass: the LAST selection wins. The worker serializes book replacements,
+    // but that alone is not enough on this side — an earlier load that finishes after a newer one would
+    // still overwrite the newer book's title, pager and chapter list. `spinePopulateToken` is bumped
+    // immediately so chapter population for the previous book stops now rather than when B commits.
+    const token = ++bookLoadToken;
+    ++spinePopulateToken;
     renderToken++;                      // kill in-flight renders
-    currentBookBlob = blob;             // rebuildable from here on, whatever its source
     window.__koOpenT0 = performance.now();   // per book, or the timings below lie on the second open
     window.__koFirstFrame = null;            // per book, ditto
     // §2 of the 1.2 audit: cancel the warm BEFORE asking the engine to load. Cancelling afterwards
@@ -937,6 +962,11 @@
       // A book change resets the export engine outright: one engine per book, and no chance of a
       // leftover instance still converting the previous one.
       killExportEngine();
+      // Stage 6: release pooled engines NOW. poolIdentity() only refused to REUSE a stale pool
+      // (bookEpoch is part of the identity), so several workers went on holding the previous book and
+      // their wasm heaps until the next pooled export — the same resident-state leak the respawn() path
+      // already closes. Nothing needs them: a pool is rebuilt per export.
+      killPool();
       // P3: open + first page in ONE round trip. The two-step handshake (load, then render) has a page →
       // worker → page → worker hop in the middle that the first page never needed: the reply to 'load'
       // carries no frame, so the page must do its UI work and ask again. 'openPreview' returns book
@@ -951,12 +981,25 @@
                                                     NO_EXTERNAL ? { bulkRead: true } : {}), null, 120000);
         if (r && r.image) openFrame = r;
       } catch (e) {
-        // A worker that predates the command, or any failure inside it, still opens — just in two steps.
-        window.__koOpenFallback = String((e && e.message) || e);
+        // Stage 3 of the defensive pass: fall back ONLY for the compatibility condition this exists for.
+        // Catching every failure (bad EPUB, font apply, first-page build, first-page render, OOM, a bad
+        // range read) turned one precise error into a second engine mutation plus a misleading final
+        // message, and it made real defects look like an old worker. The exact-text match is deliberate:
+        // a structured error code would be better, but never catch-all.
+        const msg = String((e && e.message) || e || '');
+        if (msg !== 'unknown cmd openPreview') throw e;
+        window.__koOpenFallback = msg;
         r = await call('load', Object.assign({ blob }, NO_EARLY_READ ? { noEarlyRead: true } : {}), null, 120000);
       }
       const loadCallMs = performance.now() - tLoadCall;
       const loadReplyAt = performance.now();
+      // Superseded while the worker was loading: a newer selection owns the UI. Return before touching
+      // book/state/els — the newer load is the one allowed to commit. The worker will finish this one
+      // (its queue is serialized), so nothing is left half-applied in the engine.
+      if (token !== bookLoadToken) {
+        window.__koOpenSuperseded = (window.__koOpenSuperseded || 0) + 1;
+        return;
+      }
       // §5: canonicalize ONCE, here. The header, the export filename and every later comparison
       // then use one composed string. An NFD metadata title used to reach the filename sanitizer
       // raw, where only composed syllables ([가-힣]) are allowed, and a book with no metadata title
@@ -972,6 +1015,10 @@
       // Phase timings for the open path. These say WHERE the time went; a single firstPageMs only says
       // whether it improved.
       window.__koOpenPhases = Object.assign({}, r.timing || {});
+      // Stage 2B: promote the candidates only now. `currentBookBlob` used to be assigned at the START of
+      // loadBook, which is transactional nonsense — a book that failed to parse still became "the book we
+      // can rebuild from", and the recovery path would then re-load the very file that just failed.
+      currentBookBlob = blob;
       currentBookFile = pendingBookFile;   // §8: only a successful load promotes the File
       pendingBookFile = null;
       // Labels are NOT built here: they now arrive in batches after the first frame (see below), so
@@ -1062,9 +1109,36 @@
       else setTimeout(prepExport, 0);
       scheduleWarm(3000);          // pre-convert the fresh book once idle
     } catch (e) {
+      if (token !== bookLoadToken) return;    // a newer selection owns the UI; do not clear it
       reportError(e, 'EPUB 열기');
+      // The worker destroyed the previous book when this replacement began (beginBookReplacement), so
+      // that book is gone whether or not the new one parsed. Leaving its title and pages on screen would
+      // describe a book no engine holds — and its "download" or page turn would fail confusingly later.
+      clearLoadedBookAfterFailedOpen();
       idle();
     }
+  }
+
+  // The page-side half of fail-closed book replacement: there is no book, and every affordance that
+  // could act on one is disabled rather than left pointing at a deallocated engine state.
+  function clearLoadedBookAfterFailedOpen() {
+    book = null;
+    currentBookBlob = null;
+    currentBookFile = null;
+    pendingBookFile = null;
+    viewingCover = false;
+    state = { spine: 0, page: 0, pages: 0, total: 0, mode: state.mode };
+    els.spineSel.innerHTML = '';
+    els.spineSel.disabled = true;
+    els.prevBtn.disabled = true;
+    els.nextBtn.disabled = true;
+    els.coverBtn.disabled = true;
+    els.downloadBtn.disabled = true;
+    els.bookTitle.textContent = '';
+    els.bookTitle.hidden = true;
+    setAppState('empty');
+    killExportEngine();
+    killPool();
   }
 
   // ---- events ----
@@ -1697,7 +1771,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=97');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=98');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };
