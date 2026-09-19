@@ -1,5 +1,75 @@
+# Cloudflare Pages headers (copied into dist/ by scripts/build_dist.sh).
+#
+# §26 — why this is per-file instead of one catch-all:
+# Pages CONCATENATES the Cache-Control of every matching rule. A catch-all "/*" plus a specific
+# fingerprinted rule produced:
+#     public, max-age=0, must-revalidate, public, max-age=31536000, immutable
+# and the first max-age (0) wins in most parsers, which silently defeated the immutable caching.
+# So: the catch-all now carries only the security headers, and Cache-Control is set per path.
+#
+# NOTE: do NOT set Content-Type here. Pages derives MIME from the file extension and already serves
+# .wasm as application/wasm. An earlier revision added a `*.wasm` Content-Type rule; without a
+# leading "/" that pattern matched every path and stamped application/wasm onto index.html, app.js
+# and style.css, which makes browsers refuse to render the site. Leave MIME alone.
+
+# security headers for everything (no Cache-Control here — see the note above)
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
+  # Network policy: EPUB content can never initiate network access, and nothing can pull in a remote
+  # script/style/frame. connect-src 'self' deliberately removes cross-origin ?epub= loading; local uploads
+  # and the same-origin demo books are unaffected. 'wasm-unsafe-eval' is required to compile the engine.
+  # NOT identical to what the app needs yet — verify against a real build before trusting it (see below).
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+
+# hand-written, cache-busted by the ?v= chain: always revalidate
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+/app.js
+  Cache-Control: public, max-age=0, must-revalidate
+/ko.worker.js
+  Cache-Control: public, max-age=0, must-revalidate
+/style.css
+  Cache-Control: public, max-age=0, must-revalidate
+/epdfont.js
+  Cache-Control: public, max-age=0, must-revalidate
+/assets.js
+  Cache-Control: public, max-age=0, must-revalidate
+/assets.json
+  Cache-Control: public, max-age=0, must-revalidate
+
+# content-addressed generated artifacts: the filename IS the hash, so these can never be stale.
+# Four exact families — deliberately NOT a broad '/*.js' or '/*.wasm' rule, because ko.worker.js
+# has two dots in its name and must keep revalidating.
+/ko_xtch_wasm.*.js
+  Cache-Control: public, max-age=31536000, immutable
+/ko_xtch_wasm.*.wasm
+  Cache-Control: public, max-age=31536000, immutable
+/ft_wasm.*.js
+  Cache-Control: public, max-age=31536000, immutable
+/ft_wasm.*.wasm
+  Cache-Control: public, max-age=31536000, immutable
+/ko_build_info.*.js
+  Cache-Control: public, max-age=31536000, immutable
+
+# Externalized reader faces (EPD2). These are the reason this file exists at all now: .epd2 is an
+# unknown extension, Pages serves it as application/octet-stream, and Cloudflare's default compression
+# policy works off content type — so an uncompressed blob would cross the wire at full size (measured:
+# 3,169,108 bytes for KoPub, which made the externalized build worse than embedding it).
+#
+# The package therefore ships these files ALREADY brotli-compressed (build_dist.sh) and this rule
+# labels them. That is the one header this file sets beyond caching/security, and it is safe because
+# the content and the label are produced together by the same step: a raw blob can never be served
+# under this rule, and a br blob without it fails loudly in the font loader rather than rendering
+# garbage. (Do NOT copy this pattern to Content-Type. See the note at the top.)
+/kopub_14.*.epd2
+  Content-Encoding: br
+  Cache-Control: public, max-age=31536000, immutable
+/ridibatang_14.*.epd2
+  Content-Encoding: br
+  Cache-Control: public, max-age=31536000, immutable
+
+# the demo books are content, not code — safe to hold longer than a session
+/*.epub
+  Cache-Control: public, max-age=86400
