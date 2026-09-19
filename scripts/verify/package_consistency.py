@@ -11,6 +11,19 @@ face it does embed must not be.**
 
 usage: package_consistency.py <dist-dir> <embedded-face...> -- <external-face...>
        (the split is passed explicitly by build_dist.sh from the engine's own ko_build_info.json)
+
+       Invocation matters, and getting it wrong LOOKS like a packaging failure: called with no arguments
+       this exits non-zero and prints the usage text, so a batch prints
+
+           package_consistency    FAIL
+           usage: package_consistency.py <dist-dir> <embedded-face...> -- <external-face...>
+
+       That is an invocation error, not a broken package — it cost a false alarm once. The correct call for
+       the deployed variant C (no embedded face, both faces shipped as data) is
+
+           /usr/bin/python3 scripts/verify/package_consistency.py dist -- kopub ridibatang
+
+       or simply let scripts/build_dist.sh call it with the split it reads from ko_build_info.json.
 """
 import json
 import os
