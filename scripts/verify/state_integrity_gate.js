@@ -185,6 +185,31 @@ function check(ok, label, detail) {
   check(api._ko_plan_prefix_size() === 0, 'no prefix for an over-limit plan');
   api._free(bigPtr);
 
+  // ---- 11b. the container BYTE budget, which is a separate ceiling from the page count -----------
+  // 12,000 pages is legal by the format (under 65,535) but describes 12,000 x 96,096 = 1.15 GiB of 2-bit
+  // container, above the 1 GiB budget the module can actually hold. The page-count limit cannot catch this.
+  const budgetPages = 12000;
+  const budgetPtr = api._malloc(budgetPages * 4);
+  { const view = u32(budgetPtr, budgetPages); for (let i = 0; i < budgetPages; i++) view[i] = 96096; }
+  api._ko_plan_begin(1);
+  check(api._ko_plan_add_spine(budgetPtr, budgetPages) < 0,
+        'a LEGAL page count whose declared bytes exceed the budget is refused');
+  check(api._ko_plan_finish() < 0, 'the over-budget plan cannot finish');
+  check(api._ko_plan_prefix_size() === 0, 'no prefix published for an over-budget plan');
+
+  const recPtr2 = api._malloc(64);
+  const offPtr2 = api._malloc(budgetPages * 4);
+  const lenPtr2 = api._malloc(budgetPages * 4);
+  { const o = u32(offPtr2, budgetPages), l = u32(lenPtr2, budgetPages);
+    for (let i = 0; i < budgetPages; i++) { o[i] = 0; l[i] = 64; } }
+  api._ko_assemble_begin(1);
+  check(api._ko_assemble_add_spine(recPtr2, 64, budgetPages, offPtr2, lenPtr2) < 0,
+        'the assembler refuses a page count above the byte budget');
+  check(api._ko_assemble_finish() < 0, 'the over-budget assembly cannot finish');
+  check(api._ko_xtch_size() === 0, 'no container published by the over-budget assembly');
+  api._ko_export_abort();
+  api._free(budgetPtr); api._free(recPtr2); api._free(offPtr2); api._free(lenPtr2);
+
   // ---- 12. with no book, the assembler and planner refuse ---------------------------------------
   loadBytes(truncated);
   check(api._ko_assemble_begin(1) < 0, 'assemble_begin refused with no book');

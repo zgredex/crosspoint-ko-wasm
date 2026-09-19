@@ -140,6 +140,8 @@ static int g_xtchFullReady = 0;
 static bool g_rgbaReady = false;
 static bool g_exportActive = false;
 static bool g_exportFailed = false;
+static uint32_t g_exportMaxPages = 0;     // derived from the snapshotted mode at ko_export_begin()
+static ko::XtcMode g_asmMode = ko::XtcMode::Gray2Bit;
 // Assembler/planner are transactions too: a malformed record must make finishing impossible, so a caller
 // that ignores one -1 cannot publish a partial container or prefix.
 static bool g_asmActive = false;
@@ -860,6 +862,28 @@ KO_EXPORT void ko_unload_book() {
   beginBookReplacement();
 }
 
+// A container-byte budget BELOW the wasm ceiling. The 65,535-page limit bounds the FILE FORMAT; it does not
+// bound memory, because one 2-bit page record is ~96 KiB and the format maximum therefore describes over
+// 6 GiB. The module is linked with ALLOW_MEMORY_GROWTH and MAXIMUM_MEMORY=2048MB and built with
+// -fno-exceptions, so a failed vector allocation ABORTS the worker rather than throwing past it.
+//
+// Per-page record sizes are MEASURED, not estimated: demo-images produces 1,249,766 bytes for 13 pages and
+// 625,766 for 13 in 1-bit, i.e. 96,096 and 48,096 bytes per record (plane bytes plus a 96-byte record
+// header).
+static constexpr uint64_t MAX_WASM_CONTAINER_BYTES = 1ull << 30;      // 1 GiB, half the wasm maximum
+static constexpr uint64_t XTC_RECORD_BYTES_GRAY = 96096ull;
+static constexpr uint64_t XTC_RECORD_BYTES_MONO = 48096ull;
+
+static uint64_t recordBytesForMode(ko::XtcMode mode) {
+return mode == ko::XtcMode::Mono1Bit ? XTC_RECORD_BYTES_MONO : XTC_RECORD_BYTES_GRAY;
+}
+
+// How many pages of this mode fit under the budget. Never rely on OOM as the limit.
+static uint32_t maxPagesForMode(ko::XtcMode mode) {
+const uint64_t pages = MAX_WASM_CONTAINER_BYTES / recordBytesForMode(mode);
+return pages > ko::MAX_XTC_PAGES ? static_cast<uint32_t>(ko::MAX_XTC_PAGES) : static_cast<uint32_t>(pages);
+}
+
 // The ONE way an export becomes failed. It also drops the accumulated container, so a failed export cannot
 // leave bytes readable through ko_xtch_ptr() even if the caller ignores every -1 it was given.
 static int failExport(const std::string& why) {
@@ -883,6 +907,9 @@ KO_EXPORT int ko_export_begin() {
   // invariant here, not a convention the caller has to keep.
   g_exportSpec = g_spec;
   g_exportMode = g_xtch->mode();
+  // Derived ONCE per transaction: the page ceiling is then a property of the export rather than of whatever
+  // the mode happens to be when a spine is appended.
+  g_exportMaxPages = maxPagesForMode(g_exportMode);
   g_xtch->reset();
   g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
   g_chapters.clear();
@@ -909,7 +936,12 @@ KO_EXPORT int ko_export_spine(int spine) {
   // Re-assert the switch here as well: it can be flipped between
   // ko_export_set_mode() and the page loop, and this is the only place that is
   // guaranteed to run for every exported page.
-  g_xtch->setTextAa(textAaEnabled());
+  // The snapshot, re-asserted: textAa must not be able to change mid-export either.
+  g_xtch->setMode(g_exportMode);
+  g_xtch->setTextAa(g_exportSpec.textAntiAliasing != 0);
+  if (g_totalPages >= static_cast<int>(g_exportMaxPages)) {
+    return failExport("container byte budget exhausted before spine " + std::to_string(spine));
+  }
   const int n = g_driver->buildSection(spine, g_exportSpec);
   if (n < 0) return failExport("section build failed at spine " + std::to_string(spine));
   const int before = g_totalPages;
@@ -927,6 +959,12 @@ KO_EXPORT int ko_export_spine(int spine) {
     }
     // The writer REFUSES past the format's page limit, and an ignored `false` here would ship a container
     // whose header page count wrapped to zero.
+    // Checked per PAGE, not per spine: one legal spine can be enormous, and the writer's own limit is the
+    // format ceiling rather than the memory ceiling.
+    if (static_cast<uint32_t>(g_totalPages) + 1u > g_exportMaxPages) {
+      return failExport("container byte budget reached at spine " + std::to_string(spine) + ", page " +
+                        std::to_string(p));
+    }
     if (!g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb)) {
       return failExport("page encoder refused a page (container page limit or bad planes)");
     }
@@ -1129,6 +1167,7 @@ KO_EXPORT int ko_assemble_begin(int mode) {
   g_asmFallback.clear();
   g_asmActive = true;
   g_asmFailed = false;
+  g_asmMode = mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit;
   return 0;
 }
 
@@ -1147,8 +1186,10 @@ KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCo
     setError("assemble_add_spine: null record");
     return -1;
   }
-  // The format's page count is 16 bits on disk; refuse rather than wrap the header to zero.
-  if (g_asm->pageCount() + static_cast<size_t>(pageCount) > ko::MAX_XTC_PAGES) {
+// The format's page count is 16 bits on disk; refuse rather than wrap the header to zero.
+  // A legal page count can still describe several GiB of container, so the byte budget is a SEPARATE ceiling.
+  if (g_asm->pageCount() + static_cast<size_t>(pageCount) > ko::MAX_XTC_PAGES ||
+      g_asm->pageCount() + static_cast<size_t>(pageCount) > maxPagesForMode(g_asmMode)) {
     g_asmFailed = true;
     setError("assemble_add_spine: container page limit exceeded");
     return -1;
@@ -1252,6 +1293,18 @@ KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
     g_planFailed = true;
     setError("plan_add_spine: null lengths");
     return -1;
+  }
+  // The planner is where a caller can describe a container that would never fit: it receives record LENGTHS,
+  // so the declared total is known before a single byte is written.
+  {
+    uint64_t total = 0;
+    for (uint32_t v : g_planSizes) total += v;
+    for (int i = 0; i < count; i++) total += lengths[i];
+    if (total > MAX_WASM_CONTAINER_BYTES) {
+      g_planFailed = true;
+      setError("plan_add_spine: container byte budget exceeded (" + std::to_string(total) + " bytes)");
+      return -1;
+    }
   }
   if (g_planSizes.size() + static_cast<size_t>(count) > ko::MAX_XTC_PAGES) {
     g_planFailed = true;
