@@ -178,7 +178,16 @@ bool HalStorage::rename(const char* oldPath, const char* newPath) {
 
 bool HalStorage::openFileForRead(const char* moduleName, const char* path, HalFile& file) {
   (void)moduleName;
-  auto it = files_.find(path ? path : "");
+  // normalisePath, like EVERY other accessor in this class. mountBlob/mountOwnedBlob store under the
+  // normalised key, so looking up the raw argument missed the mount for any path without a leading '/':
+  // the blob was mounted, the ZIP reader could not find it, and it surfaced far from here as
+  // "Could not find or size META-INF/container.xml" followed by "Could not find content.opf in zip".
+  //
+  // Idempotent for absolute paths, so this changes behaviour ONLY for the paths that used to fail — which
+  // is why a relative EPUB loaded in neither the port binary nor the reference binary while every gate,
+  // every gate fixture and the browser path (which mounts "/book.epub") passed.
+  const std::string p = normalisePath(path ? path : "");
+  auto it = files_.find(p);
   if (it == files_.end()) return false;
   file = HalFile(it->first, it->second);
   return true;
@@ -189,7 +198,9 @@ bool HalStorage::openFileForWrite(const char* moduleName, const char* path, HalF
   auto blob = std::make_shared<Blob>();
   blob->writable = std::make_shared<std::vector<uint8_t>>();
   blob->refresh();
-  std::string p = path ? path : "";
+  // Same key rule as the read side, so a relative write cannot create a second entry that exists()/open()
+  // (both normalised) would never see.
+  const std::string p = normalisePath(path ? path : "");
   files_[p] = std::move(blob);  // create/truncate
   file = HalFile(p, files_[p]);
   return true;

@@ -139,12 +139,53 @@ def stage10_gray_plane_control():
           f"{len(defs)} definition line(s)")
 
 
+def stage_storage_path_normalisation():
+    """A relative EPUB path must load, and yield the SAME container as the absolute path.
+
+    The host shim's path contract: mountBlob/mountOwnedBlob store the blob under normalisePath(path), while
+    openFileForRead used to look up the RAW argument. So every path without a leading '/' mounted
+    successfully and then failed to open, surfacing three layers away as "Could not find or size
+    META-INF/container.xml" followed by "Could not find content.opf in zip". Both the port binary and the
+    reference build were affected (they share this shim), and no gate saw it because run() above always
+    builds an absolute path via ROOT / book.
+
+    The absolute arm is the control: it certifies the two containers are comparable at all, so a relative
+    arm that "passes" by producing nothing cannot pass this check.
+    """
+    rel_out, abs_out = OUT / "rel.xtch", OUT / "abs.xtch"
+    env = dict(os.environ)
+
+    def invoke(book_arg, out, extra=(), cwd=None):
+        if Path(out).exists():
+            Path(out).unlink()
+        return subprocess.run([str(HOST), book_arg, str(out), *extra],
+                              capture_output=True, timeout=900, env=env, cwd=str(cwd or ROOT))
+
+    rel = invoke(BOOK, rel_out)                      # relative, with a slash — as a human types it
+    check(rel.returncode == 0 and rel_out.exists(),
+          "a RELATIVE epub path loads", (rel.stderr or b"").decode()[-200:])
+
+    # The host reads the file from the real filesystem with fopen BEFORE mounting it, so a bare filename
+    # only resolves when the book's own directory is the working directory. That cwd is the point: the
+    # mount key then has no slash at all, which is the other half of the contract under test.
+    bare = invoke(Path(BOOK).name, rel_out, cwd=(ROOT / BOOK).parent)
+    check(bare.returncode == 0 and rel_out.exists(),
+          "a BARE filename (no slash) loads", (bare.stderr or b"").decode()[-200:])
+
+    abso = invoke(str(ROOT / BOOK), abs_out)
+    check(abso.returncode == 0 and abs_out.exists(), "the absolute arm runs (control)")
+    if rel.returncode == 0 and abso.returncode == 0 and rel_out.exists() and abs_out.exists():
+        check(masked_sha(rel_out) == masked_sha(abs_out),
+              "relative and absolute paths produce a byte-identical container")
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"defensive host gate — {ROOT}")
     if not HOST.exists():
         print(f"  FAIL  host binary missing at {HOST}")
         return 1
+    stage_storage_path_normalisation()
     stage6_owned_double_free()
     stage7_short_reads()
     stage7_generic_reads()
@@ -153,8 +194,9 @@ def main():
     if failures:
         print(f"FAIL — {len(failures)} check(s) failed: " + "; ".join(failures))
         return 1
-    print("PASS — owned load fails closed without a double free, short external reads are looped, the "
-          "generic read helpers survive an external Blob, and the rejected gray-plane state is test-only")
+    print("PASS — a relative epub path loads identically to an absolute one, owned load fails closed without "
+          "a double free, short external reads are looped, the generic read helpers survive an external Blob, "
+          "and the rejected gray-plane state is test-only")
     return 0
 
 
