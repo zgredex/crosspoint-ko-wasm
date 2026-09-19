@@ -109,7 +109,6 @@
     "lib/EpdFont/scripts/ttf_to_epdfont.py": "608c88eb56c8914fb7d344b4af48d05c97c1930d",
     "lib/EpdFont/scripts/verify_compression.py": "c2320c78be29fdb3bb57b3e281210f222f49ed21",
     "lib/Epub/Epub.h": "40ab6f257d75bb63310a33be09e9db646851f05c",
-    "lib/Epub/Epub/BookMetadataCache.h": "3a479f8e0fcf1fb53ca9b64fd939ad3762f53679",
     "lib/Epub/Epub/FootnoteEntry.h": "6034a6a5c3937d01dc016db504cf1a13e3f1a683",
     "lib/Epub/Epub/Page.cpp": "89dc65eb45e9f69ab387e5aeae16df4b2fd5018d",
     "lib/Epub/Epub/Page.h": "7e9a7c9123e2c5bf4d278e50c0a4c099a8bdcb81",
@@ -221,7 +220,7 @@
       "blob": "f1b8537485013f3efae5d174db31aefe536c9ac5",
       "port_path": "vendor-lib/Epub/Epub.cpp",
       "divergence_kind": "additive",
-      "added_lines": 34,
+      "added_lines": 38,
       "removed_lines": 0,
       "changed_functions": [
         "findContentOpfFile",
@@ -238,19 +237,34 @@
       "blob": "beb14a1aec076dd734471ac6accff3f2c075e7f5",
       "port_path": "vendor-lib/Epub/Epub/BookMetadataCache.cpp",
       "divergence_kind": "amended",
-      "added_lines": 14,
-      "removed_lines": 2,
+      "added_lines": 31,
+      "removed_lines": 3,
       "changed_functions": [
-        "buildBookBin"
+        "beginTocPass",
+        "buildBookBin",
+        "createTocEntry"
       ],
       "only_in_reference": [],
       "only_in_port": [],
       "reference_function_count": 21,
       "port_function_count": 21,
       "removed_line_sample": [
+        "t.index = static_cast<uint16_t>(i);",
         "int matched = zip.fillUncompressedSizes(targets, spineSizes);",
         "cumSize += itemSize;"
       ]
+    },
+    "lib/Epub/Epub/BookMetadataCache.h": {
+      "blob": "3a479f8e0fcf1fb53ca9b64fd939ad3762f53679",
+      "port_path": "vendor-lib/Epub/Epub/BookMetadataCache.h",
+      "divergence_kind": "additive",
+      "added_lines": 4,
+      "removed_lines": 0,
+      "changed_functions": [],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 0,
+      "port_function_count": 0
     },
     "lib/Epub/Epub/blocks/ImageBlock.cpp": {
       "blob": "659504a79d06ea31e756623136dfe90b67a06cd3",
@@ -579,8 +593,8 @@
     ]
   },
   "counts": {
-    "identical": 152,
-    "divergent": 15,
+    "identical": 151,
+    "divergent": 16,
     "missing_from_port": 1,
     "reference_engine_files": 168
   }
