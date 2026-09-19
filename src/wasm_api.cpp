@@ -62,7 +62,14 @@ EM_JS(int, ko_blob_read_sync, (size_t offset, uint8_t* dst, size_t length), {
     return -1;                                  // I/O error: surfaced as a failed read, never as EOF
   }
   const src = new Uint8Array(buf);
-  HEAPU8.set(src, dst);
+  // The destination is wasm linear memory. A bad pointer or an oversize copy must fail the READ rather
+  // than run off the end of the heap, where it would corrupt whatever lives past the window buffer.
+  if (dst < 0 || dst > HEAPU8.length || src.byteLength > HEAPU8.length - dst) return -1;
+  try {
+    HEAPU8.set(src, dst);
+  } catch (_) {
+    return -1;
+  }
   return src.byteLength;
 });
 #endif
@@ -133,6 +140,17 @@ static size_t g_coverSize = 0;
 static void setError(const std::string& msg) {
   g_error.assign(msg.begin(), msg.end());
   g_error.push_back('\0');
+}
+
+// Every operation that needs a mounted book goes through this. Without it, a failed replacement left
+// g_driver alive but bookless, and each of these entry points would act on the previous book's leftovers
+// or dereference a null EPUB. Defined here, above every entry point that uses it.
+static bool requireBook(const char* operation) {
+  if (!g_driver || !g_driver->hasBook()) {
+    setError(std::string(operation) + ": no book loaded");
+    return false;
+  }
+  return true;
 }
 
 extern "C" {
@@ -423,6 +441,10 @@ KO_EXPORT int ko_logical_height() {
 // still described the PREVIOUS book while its files had already been dropped. Every load entry point now
 // runs beginBookReplacement() first and finishBookLoad() only on success, so a failure leaves one
 // coherent state: no book.
+// Defined once the remaining output state is declared (it lives further down this file); forward declared
+// so the replacement path can invalidate it without moving declarations around.
+static void clearBookOutputs();
+
 static void beginBookReplacement() {
   if (g_driver) g_driver->resetBook();
   Storage.clearAll();
@@ -435,6 +457,15 @@ static void beginBookReplacement() {
   g_totalPages = 0;
   g_xtchFullReady = 0;
   g_page = ko::RenderedPage{};
+  // The invariant: after a replacement begins there must be NO API through which bytes belonging to the
+  // previous book can still be obtained. Without this, a page could still fetch the old container, the old
+  // cover, or an encoded spine from a book whose storage had already been cleared.
+  g_xtchOut.clear();
+  g_xtchFullReady = 0;
+  g_coverData.clear();
+  g_coverPath.clear();
+  g_coverSize = 0;
+  clearBookOutputs();         // the rest is declared further down; see the forward declaration
 }
 
 static int finishBookLoad() {
@@ -556,7 +587,10 @@ KO_EXPORT int ko_text_reference_spine() {
 
 KO_EXPORT void ko_get_title(char* buf, int bufLen) {
   if (!buf || bufLen <= 0) return;
-  const std::string& t = g_driver->title();
+  // Empty text when there is no book (the driver's title() is null-safe), so a title read after a failed
+  // replacement cannot crash the worker that is trying to report the failure.
+  static const std::string kNoDriver;
+  const std::string& t = (g_driver && g_driver->hasBook()) ? g_driver->title() : kNoDriver;
   int n = static_cast<int>(t.size()) < bufLen - 1 ? static_cast<int>(t.size()) : bufLen - 1;
   memcpy(buf, t.data(), n);
   buf[n] = '\0';
@@ -586,8 +620,12 @@ KO_EXPORT const char* ko_get_spine_href(int spineIndex) {
 // in-page decoder's RAM cap refuses). Returns bytes via ko_cover_ptr/size.
 // kind: 0 = cropped cover (540x800), 1 = thumb (device-height)
 KO_EXPORT int ko_generate_cover(int kind) {
-  if (!g_driver) return -1;
+  if (!requireBook("generate_cover")) return -1;
   auto epub = g_driver->epubShared();
+  if (!epub) {
+    setError("generate_cover: no book loaded");
+    return -1;
+  }
   bool ok;
   if (kind == 0) {
     ok = epub->generateCoverBmp(true);          // cropped
@@ -623,7 +661,7 @@ KO_EXPORT size_t ko_cover_size() { return g_coverSize; }
 
 // Build spine (0-based). Returns page count, or -1 on failure.
 KO_EXPORT int ko_build_spine(int spineIndex) {
-  if (!g_driver) return -1;
+  if (!requireBook("build_spine")) return -1;
   const int n = g_driver->buildSection(spineIndex, g_spec);
   if (n < 0) {
     setError("section build failed");
@@ -639,7 +677,7 @@ KO_EXPORT int ko_build_spine(int spineIndex) {
 // Lay out enough of a spine for its first page, then extend in chunks. Without this the browser
 // paginates an entire chapter before it may show page 1.
 KO_EXPORT int ko_start_spine(int spine, int initialPages) {
-  if (!g_driver) return -1;
+  if (!requireBook("start_spine")) return -1;
   const int n = g_driver->startSection(spine, g_spec, initialPages < 1 ? 1 : initialPages);
   if (n < 0) {
     setError("progressive section start failed");
@@ -653,7 +691,7 @@ KO_EXPORT int ko_start_spine(int spine, int initialPages) {
 }
 
 KO_EXPORT int ko_build_spine_more(int maxPages) {
-  if (!g_driver) return -1;
+  if (!requireBook("build_spine_more")) return -1;
   return g_driver->buildSectionMore(maxPages);
 }
 
@@ -693,7 +731,7 @@ KO_EXPORT double ko_image_perf(int which) {
 }
 
 KO_EXPORT int ko_render_page(int pageIndex) {
-  if (!g_driver || g_currentSpine < 0) return -1;
+  if (!requireBook("render_page") || g_currentSpine < 0) return -1;
   // (the per-render reset lives in Driver::renderPage, so it covers the preview and both export loops)
   if (!g_driver->renderPage(pageIndex, g_spec, g_page)) {
     setError("page render failed");
@@ -703,16 +741,27 @@ KO_EXPORT int ko_render_page(int pageIndex) {
 }
 
 KO_EXPORT const uint8_t* ko_plane_ptr(int kind) {
+  // A pointer is only handed out for a plane of the expected size. Returning data() for an empty vector
+  // (or a partially filled one) let a caller memcpy 48000 bytes out of a buffer that was never that big.
+  const std::vector<uint8_t>* plane = nullptr;
   switch (kind) {
-    case 0: return g_page.bw.data();
-    case 1: return g_page.lsb.data();
-    case 2: return g_page.msb.data();
+    case 0: plane = &g_page.bw; break;
+    case 1: plane = &g_page.lsb; break;
+    case 2: plane = &g_page.msb; break;
     default: return nullptr;
   }
+  return plane->size() == 48000 ? plane->data() : nullptr;
 }
+// Reports what the plane ACTUALLY holds. It used to claim 48000 for every kind, including after
+// beginBookReplacement() reset g_page — so a caller could size a read against a buffer that no longer
+// existed. The pointer and the size must agree at all times.
 KO_EXPORT size_t ko_plane_size(int kind) {
-  (void)kind;
-  return 48000;
+  switch (kind) {
+    case 0: return g_page.bw.size();
+    case 1: return g_page.lsb.size();
+    case 2: return g_page.msb.size();
+    default: return 0;
+  }
 }
 
 // ---- XTCH container (whole-book convert) -----------------------------------
@@ -739,6 +788,7 @@ KO_EXPORT void ko_export_set_mode(int mode) {
 }
 
 KO_EXPORT int ko_export_begin() {
+  if (!requireBook("export_begin")) return -1;
   if (!g_driver || !g_xtch) return -1;
   g_xtch->reset();
   g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
@@ -756,7 +806,7 @@ KO_EXPORT int ko_export_begin() {
 // ACTUALLY added (>=0), or -1 on build failure — the JS side maps spine→page
 // ranges from this return, so it must reflect real page count.
 KO_EXPORT int ko_export_spine(int spine) {
-  if (!g_driver || !g_xtch) return -1;
+  if (!requireBook("export_spine") || !g_xtch) return -1;
   // Re-assert the switch here as well: it can be flipped between
   // ko_export_set_mode() and the page loop, and this is the only place that is
   // guaranteed to run for every exported page.
@@ -770,7 +820,13 @@ KO_EXPORT int ko_export_spine(int spine) {
   // and asserted by scripts/verify/mono_planes_gate.py. Do not "optimize" this away.
   for (int p = 0; p < n; p++) {
     ko::RenderedPage rp;
-    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) continue;
+    // FAIL THE WHOLE EXPORT. `continue` here meant a 100-page spine with one bad page produced a
+    // "successful" 99-page book — silently wrong output, which is worse than an error, because nothing
+    // downstream can tell the difference. The caller gets an error naming the spine and page instead.
+    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) {
+      setError("render failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
+      return -1;
+    }
     g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
     g_totalPages++;
   }
@@ -856,7 +912,7 @@ static std::vector<ko::XtchChapter> g_asmFallback;
 
 // Layout+render+encode one spine into g_enc. Returns the page count, or -1.
 KO_EXPORT int ko_encode_spine(int spine) {
-  if (!g_driver || !g_xtch) return -1;
+  if (!requireBook("encode_spine") || !g_xtch) return -1;
   g_enc.reset();
   // A local writer: a worker's spine must not touch any shared writer state.
   ko::XtchWriter w(g_xtch->mode());
@@ -867,8 +923,12 @@ KO_EXPORT int ko_encode_spine(int spine) {
   for (int p = 0; p < n; p++) {
     ko::RenderedPage rp;
     // Same rule as the serial path: the gray planes are consumed by the 1-bit writer, so they are always
-    // rendered. See the note in ko_export_spine().
-    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) continue;
+    // rendered. See the note in ko_export_spine(). And the same failure policy: a page that will not
+    // render fails the spine rather than shortening it.
+    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) {
+      setError("render failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
+      return -1;
+    }
     w.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
     rendered++;
   }
@@ -1167,6 +1227,23 @@ KO_EXPORT void ko_export_abort() {
 // know the win is the grouping and not the move into C++.
 static std::vector<uint32_t> g_rgbaOut;  // 480*800 packed RGBA words, allocated once
 
+// The remaining previous-book output state. Nothing here may survive a replacement: every one of these is
+// reachable through an exported accessor, and a failure half-way through a replacement must not leave
+// bytes from the old book obtainable.
+static void clearBookOutputs() {
+  g_enc.reset();
+  g_asm.reset();
+  g_asmCandidates.clear();
+  g_asmFallback.clear();
+  g_planSizes.clear();
+  g_planCandidates.clear();
+  g_planFallback.clear();
+  g_planPrefix.clear();
+  g_rgbaOut.clear();
+  g_customFontPath.clear();   // the font files live in the storage that was just cleared
+}
+
+// Placed after the LAST of the globals it clears, so every identifier is declared above it.
 KO_EXPORT uint8_t* ko_rgba_ptr() {
   if (g_rgbaOut.size() != 480u * 800u) g_rgbaOut.assign(480u * 800u, 0);
   return reinterpret_cast<uint8_t*>(g_rgbaOut.data());
@@ -1175,6 +1252,13 @@ KO_EXPORT uint8_t* ko_rgba_ptr() {
 // mono: 0 = 2-bit page (four shades), 1 = 1-bit page (the ink the XTG file carries:
 // grey pixels blue-noise halftoned to 2 levels, solid ink thinned only with text AA on).
 KO_EXPORT int ko_compose_rgba(int mono) {
+  // All three planes must be complete. After a book replacement g_page is reset, so the BW plane can
+  // exist while the grey ones are empty; composing then read past the end of the smaller buffers. The
+  // sizes are the contract, not just the pointers.
+  if (g_page.bw.size() != 48000 || g_page.lsb.size() != 48000 || g_page.msb.size() != 48000) {
+    setError("no complete rendered page");
+    return -1;
+  }
   const uint8_t* bw = ko_plane_ptr(0);
   if (!bw) return -1;
   // A 1-bit page is never a pure function of the BW plane: grey pixels become ink

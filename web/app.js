@@ -50,6 +50,7 @@
   let viewingCover = false;       // canvas shows cover BMP, not a page
   let renderToken = 0;            // invalidates stale renders
   let bookLoadToken = 0;          // invalidates a superseded BOOK LOAD (distinct from a stale render)
+  let workerBookGen = -1;         // the worker's generation for the book this page is displaying
   let repaintTimer = null;        // trailing debounce → visible-page repaint
   let customFontLoaded = false;   // a runtime .epdfont is active in the engine
   let exporting = false;          // export in flight → knobs disabled
@@ -73,13 +74,14 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=98');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=100');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
       // the total on screen follows it. Navigation stays clamped to the pages that EXIST (state.pages);
       // this only changes what "x / y" says.
       if (m && m.sectionError) {
+        if (m.bookGen !== workerBookGen) return;      // another book's failure
         // A continuation that failed after page 1 was already valid. The worker says so now instead of
         // stopping silently, and the total must stop advertising pages that cannot arrive.
         if (m.spine === state.spine) {
@@ -91,8 +93,17 @@
         return;
       }
       if (m && m.sectionProgress) {
+        // Stage 7: an id-less message carries the generation of the book it describes. Spine numbers
+        // alone are not an identity — a message posted for book A's spine 0 can arrive after book B's
+        // spine 0 and mutate B.
+        if (m.bookGen !== workerBookGen) return;
         if (m.spine === state.spine) {
-          state.total = m.complete ? m.pages : Math.max(m.estimated || 0, m.pages);
+          // Stage 6: state.pages must grow with the build. It used to update only state.total, so a spine
+          // with 5 pages available still reported state.pages === 1 — and goPage() decides chapter
+          // crossing on `target >= state.pages`, which made Next jump to the next spine mid-build.
+          state.pages = Math.max(state.pages, m.pages || 0);
+          state.sectionComplete = !!m.complete;
+          state.total = m.complete ? state.pages : Math.max(m.estimated || 0, state.pages);
           updatePager();
           const chapter = els.spineSel.value ? (Number(els.spineSel.value) + 1) + '장 ' : '';
           els.pageStatus.textContent = chapter + (state.page + 1) + '/' + state.total +
@@ -243,7 +254,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=98');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=100');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -703,8 +714,11 @@
     const atBookStart = state.spine <= 0 && state.page <= 0;
     const atBookEnd = !!book && state.spine >= book.spineCount - 1 &&
                       state.pages > 0 && state.page >= state.pages - 1;
+    // At the build frontier, Next must not promise the next chapter: the current spine still has pages
+    // arriving, so the button is disabled until the build completes for that spine.
+    const atBuildFrontier = state.sectionComplete === false && state.pages > 0 && state.page >= state.pages - 1;
     els.prevBtn.disabled = !book || viewingCover || atBookStart;
-    els.nextBtn.disabled = !book || atBookEnd;
+    els.nextBtn.disabled = !book || atBookEnd || atBuildFrontier;
   }
 
   // ---- custom font conversion & runtime load ----
@@ -876,6 +890,10 @@
         await exportCall('loadFont', { epdfont: exportBytes, name: meta.name }, [exportBytes], 120000);
       } catch (e) {
         console.warn('[export] custom font sync failed:', e && e.message);
+        // Its font identity is now unknown: the preview has the new face and the export worker may still
+        // hold the old one, which would export a book laid out with a different font than the preview.
+        // Destroying it is cheap — the next export rebuilds from customFontAsset, which is canonical.
+        killExportEngine();
       }
     }
 
@@ -1012,6 +1030,8 @@
       );
       bookEpoch++;                 // §3: a new book invalidates any remembered warm key/skip
       book = { title: canonicalTitle, spineCount: r.spineCount };
+      // The worker's generation for THIS book: every id-less message from now on must match it.
+      workerBookGen = Number.isInteger(r.bookGen) ? r.bookGen : -1;
       // Phase timings for the open path. These say WHERE the time went; a single firstPageMs only says
       // whether it improved.
       window.__koOpenPhases = Object.assign({}, r.timing || {});
@@ -1115,7 +1135,11 @@
       // that book is gone whether or not the new one parsed. Leaving its title and pages on screen would
       // describe a book no engine holds — and its "download" or page turn would fail confusingly later.
       clearLoadedBookAfterFailedOpen();
-      idle();
+    } finally {
+      // Stage 12: loadBook owns the busy overlay. The one-round-trip SUCCESS path never called idle(),
+      // so the overlay and its 1 s interval stayed alive after every successful open. The token check
+      // matters: a superseded A must not hide B's spinner.
+      if (token === bookLoadToken) idle();
     }
   }
 
@@ -1408,14 +1432,18 @@
       if (tok !== fontConvertToken) return;
       // knobs moved again while converting → drop; scheduleFontConvert queued
       if (want !== fontKnobSig()) { scheduleFontConvert(); return; }
-      customFontLoaded = true;
-      lastFontSig = want;
+      // Stage 8: committed AFTER the engine accepts the face (below), never before. Committing here meant
+      // a refused font was still recorded as the active one, so the page kept claiming a face it did not
+      // have and never retried.
+
       const wm = meta.weightMode === 'wght-instance' ? 'wght 인스턴스 @' + meta.weight :
                   meta.weightMode === 'embolden' ? '합성 볼드 +' + (meta.emboldenPx64 / 64).toFixed(2) + 'px' :
                   meta.weightMode === 'native' ? '원본 굵기 이하 (' + meta.weight + ' 무시)' : '굵기 해당 없음';
       fontStatus('✓ ' + (meta.name || 'custom') + ' ' + meta.size + 'pt · w' + meta.weight +
                  ' [' + wm + '] · ' + meta.glyphs + '글리프 — 적용 중…', false);
       await applyCustomFont(meta);
+      customFontLoaded = true;      // only now: the preview engine is holding this face
+      lastFontSig = want;
       fontStatus('✓ ' + (meta.name || 'custom') + ' ' + meta.size + 'pt 활성 (' +
                  meta.glyphs + '글리프, ' + Math.round(meta.bytes / 1024) + ' KB' +
                  (meta.inBrowser ? ', 브라우저에서 ' + meta.ms + ' ms 만에 변환 — ' +
@@ -1450,6 +1478,10 @@
       targetSpine -= 1;
       target = 1 << 30;   // worker clamps over-range → that spine's last page
     } else if (target >= state.pages) {
+      // Reaching the frontier of a spine that is STILL BUILDING is not "go to the next chapter": more
+      // pages of this spine are on their way. state.sectionComplete is set by sectionProgress, so an
+      // undefined value (no progress seen yet) keeps the old crossing behaviour.
+      if (state.sectionComplete === false) return;
       if (targetSpine >= book.spineCount - 1) return;  // at book end
       targetSpine += 1;
       target = 0;
@@ -1771,7 +1803,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=98');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=100');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };

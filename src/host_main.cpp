@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
             "          [--text-aa|--no-text-aa] [--font kopub|ridibatang] [--kopub-external blob]\n"
             "          [--external-font kopub|ridibatang blob] [--no-kern]\n"
             "          [--screen-margin N | --margin-bottom N]\n"
-            "[--manifest PATH] [--dump-planes DIR] [--max-pages N] [--external] [--drop-gray-planes] [--read-helpers]\n",
+            "[--manifest PATH] [--dump-planes DIR] [--max-pages N] [--external] [--drop-gray-planes] [--read-helpers] [--fail-render S:P]\n",
             argv[0]);
     return 2;
   }
@@ -132,12 +132,26 @@ int main(int argc, char** argv) {
   bool useOwned = false;
   bool useExternal = false;
   bool readHelpers = false;   // --read-helpers: exercise the generic read helpers on an external mount
+#ifdef KO_TEST_NEGATIVE_CONTROLS
+  int g_failRenderSpine = -1; // --fail-render spine:page — deterministic page-failure injection
+  int g_failRenderPage = -1;
+#endif
   bool hrefSweep = false;
   for (int i = 1; i < argc; i++) {
     if (std::string(argv[i]) == "--owned") useOwned = true;
     if (std::string(argv[i]) == "--external") useExternal = true;
     if (std::string(argv[i]) == "--drop-gray-planes") g_dropGrayPlanes = true;
     if (std::string(argv[i]) == "--read-helpers") readHelpers = true;
+#ifdef KO_TEST_NEGATIVE_CONTROLS
+    if (std::string(argv[i]) == "--fail-render" && i + 1 < argc) {
+      const std::string spec2 = argv[++i];
+      const size_t colon = spec2.find(':');
+      if (colon != std::string::npos) {
+        g_failRenderSpine = std::atoi(spec2.substr(0, colon).c_str());
+        g_failRenderPage = std::atoi(spec2.substr(colon + 1).c_str());
+      }
+    }
+#endif
     if (std::string(argv[i]) == "--three-pass") driver.setThreePass(true);
     if (std::string(argv[i]) == "--spine-hrefs") hrefSweep = true;
   }
@@ -473,7 +487,9 @@ int main(int argc, char** argv) {
       n = driver.buildSection(spine, spec);
     }
     tBuild += msSince(t0);
-    if (n < 0) { fprintf(stderr, "spine %d: build failed\n", spine); continue; }
+    // Same policy as a failed page: a spine that will not build is a failure of the run, not a spine to
+    // leave out of the container. Skipping it silently produced a book missing a whole chapter.
+    if (n < 0) { fprintf(stderr, "FATAL: spine %d build failed\n", spine); return 3; }
     fprintf(stderr, "spine %d/%d: %d pages\n", spine, spineCount, n);
     PoolSpine ps;                       // only filled when --pool
     ko::XtchWriter local(writer.mode());
@@ -488,11 +504,24 @@ int main(int argc, char** argv) {
       // The rejected gray-plane-skipping state is only reachable through the test-only entry point, which
       // the product module does not compile (KO_TEST_NEGATIVE_CONTROLS is host-only).
       const bool dropGray = g_dropGrayPlanes && writer.mode() == ko::XtcMode::Mono1Bit;
-      if (!(dropGray ? driver.renderPageDroppingGrayForTest(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine)
-                     : driver.renderPage(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine))) {
-        fprintf(stderr, "  page %d failed\n", p);
-        continue;
+      // Fail the run, do not skip the page. This binary certifies containers: accepting a page loss here
+      // would let it certify a book that the device would render with a hole in it.
+      const bool rendered =
+          dropGray ? driver.renderPageDroppingGrayForTest(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine)
+                   : driver.renderPage(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine);
+      if (!rendered) {
+        fprintf(stderr, "FATAL: render failed at spine %d page %d\n", spine, p);
+        return 3;
       }
+#ifdef KO_TEST_NEGATIVE_CONTROLS
+      // Deterministic page-failure injection for the negative control: "spine:page". Proving that export
+      // fails on a page it cannot render needs a failure the test can place exactly, not an accidentally
+      // broken fixture.
+      if (g_failRenderSpine == spine && g_failRenderPage == p) {
+        fprintf(stderr, "INJECTED FAILURE at spine %d page %d\n", spine, p);
+        return 3;
+      }
+#endif
       tRender += msSince(t0);
       if (!manifestPath.empty()) manifestPages.push_back(std::move(probe));
       t0 = Clock::now();

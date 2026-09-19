@@ -17,6 +17,7 @@ class ZipFile {
 
   struct ZipDetails {
     uint32_t centralDirOffset;
+    uint32_t centralDirSize;   // validated range of the central directory
     uint16_t totalEntries;
     bool isSet;
   };

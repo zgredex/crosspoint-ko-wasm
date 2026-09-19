@@ -528,7 +528,7 @@ const facePtrs = [];
 function registerFaces(fetched) {
   const results = [];
   for (const { name, bytes } of fetched) {
-    const ptr = api._malloc(bytes.length);
+    const ptr = checkedMalloc(bytes.length, 'registerFaces:ptr');
     if (!ptr) throw new Error(`face ${name}: malloc(${bytes.length}) failed`);
     api.HEAPU8.set(bytes, ptr);
     const rc = api._ko_load_external_builtin_font(FACE_IDS[name], ptr, bytes.length);
@@ -727,7 +727,7 @@ function applyFont(name) {
       COUNTERS.fontSkips += 1;
       return true;                        // already loaded, byte-for-byte the same font
     }
-    const fp = api._malloc(customFontBytes.length);
+    const fp = checkedMalloc(customFontBytes.length, 'applyFont:fp');
     api.HEAPU8.set(customFontBytes, fp);
     const rc = api._ko_load_epdfont(fp, customFontBytes.length, customFontName);
     COUNTERS.epdfontLoads += 1;
@@ -880,7 +880,7 @@ function renderTiming(t0, buildMs, renderMs, composeMs, cached, imagePerf) {
 
 function withCString(str, fn) {
   const bytes = new TextEncoder().encode(str == null ? '' : String(str));
-  const ptr = api._malloc(bytes.length + 1);
+  const ptr = checkedMalloc(bytes.length + 1, 'withCString:ptr');
   try {
     api.HEAPU8.set(bytes, ptr);
     api.HEAPU8[ptr + bytes.length] = 0;
@@ -930,8 +930,10 @@ function invalidateSection() { sectionGen += 1; }
 
 
 // Progress carries no id: the page updates its "x / y" total without a round trip.
+// `bookGen` travels with every id-less message. Spine numbers alone are not an identity: an
+// already-posted message from book A's spine 0 can arrive after book B's spine 0 and mutate it.
 function postSectionProgress(spine, pages, estimated, complete, ms) {
-  self.postMessage({ sectionProgress: true, spine, pages, estimated, complete, ms });
+  self.postMessage({ sectionProgress: true, bookGen, spine, pages, estimated, complete, ms });
 }
 
 // A continuation that stops silently is a wrong state, not a stop: page 1 can be valid while later
@@ -970,7 +972,7 @@ async function continueSection(spine, gen, chunk) {
 
 function reportSectionFailure(spine, error) {
   sectionEstimates[spine] = { pages: currentPages, estimated: currentPages, complete: false, failed: true };
-  self.postMessage({ sectionError: true, spine, pages: currentPages, error });
+  self.postMessage({ sectionError: true, bookGen, spine, pages: currentPages, error });
 }
 
 // `early` = {promise, startedAt} for a read the caller started BEFORE awaiting initPromise. The read needs
@@ -987,7 +989,7 @@ async function loadEngineBook(data, timing, early) {
   if (data.epub) {
     const bytes = new Uint8Array(data.epub);
     const tCopy = performance.now();
-    const ptr = api._malloc(bytes.length);
+    const ptr = checkedMalloc(bytes.length, 'loadEngineBook:ptr');
     api.HEAPU8.set(bytes, ptr);
     timing.wasmCopyMs = performance.now() - tCopy;
     timing.path = 'copy(ArrayBuffer)';
@@ -1058,11 +1060,14 @@ async function loadEngineBook(data, timing, early) {
       timing.engineSpanMs = performance.now() - t0;
       return n;
     }
-    // The mount refused: fall through to the bulk path, which needs its own read. Nothing was adopted
-    // and nothing was freed (the storage only ever borrowed the Blob), so there is no ownership trap
-    // here — unlike the owned path, where a second read would be reading freed memory.
+    // The mount was INVOKED and it refused. That is a parse or I/O failure of this file, not "the API is
+    // unavailable" — so do not quietly read the whole (possibly hostile) book a second time and parse it
+    // again through another path. Fail here and leave the reason in `timing`.
     self.__koBookBlob = null;
-    timing.externalFallback = true;
+    timing.externalFailed = true;
+    timing.externalFallback = false;
+    timing.engineSpanMs = performance.now() - t0;
+    return n;
   }
 
   // The read and the heap allocation are independent, so start the read first and allocate while it is
@@ -1079,7 +1084,7 @@ async function loadEngineBook(data, timing, early) {
     timing.earlyReadSkipReason = (early && early.skipReason) || undefined;
   }
   const tAlloc = performance.now();
-  const ptr = api._ko_epub_alloc ? api._ko_epub_alloc(blob.size) : api._malloc(blob.size);
+  const ptr = api._ko_epub_alloc ? api._ko_epub_alloc(blob.size) : checkedMalloc(blob.size, 'loadEngineBook:buf');
   timing.wasmAllocMs = performance.now() - tAlloc;
   if (!ptr) {
     await readPromise.catch(() => {});
@@ -1136,6 +1141,35 @@ async function loadEngineBook(data, timing, early) {
 // Only book replacement is queued. Page turns, renders and spec changes keep running immediately — they
 // are protected by their own guards and queuing them behind a slow book load would stall the reader.
 let bookLoadTail = Promise.resolve();
+
+// Replacement is an EXCLUSIVE state, not merely a serialized one. The queue orders replacement against
+// replacement; it does nothing about a render, spec change, font load or cover request arriving while a
+// replacement is mid-flight — those read state the replacement is actively tearing down. The concrete
+// hazard: loadEngineBook() clears __koBookBlob before the engine's mount is swapped, so an interleaved
+// render of the previous external-backed book can find its backing Blob gone.
+let replacementsPending = 0;
+const SAFE_DURING_REPLACEMENT = new Set(['ping', 'bootstats', 'stats']);
+
+function checkedMalloc(size, what) {
+  if (!Number.isSafeInteger(size) || size <= 0) {
+    throw new Error(what + ': invalid allocation size ' + size);
+  }
+  const ptr = api._malloc(size);          // the ONE place that calls the allocator directly
+  if (!ptr) throw new Error(what + ': allocation of ' + size + ' bytes failed');
+  return ptr;
+}
+
+function withCString(str, fn) {
+  const bytes = new TextEncoder().encode(str == null ? '' : String(str));
+  const ptr = checkedMalloc(bytes.length + 1, 'CString');
+  try {
+    api.HEAPU8.set(bytes, ptr);
+    api.HEAPU8[ptr + bytes.length] = 0;
+    return fn(ptr);
+  } finally {
+    api._free(ptr);
+  }
+}
 function enqueueBookLoad(fn) {
   // `then(fn, fn)` runs the queued work whether or not the previous load succeeded.
   const run = bookLoadTail.then(fn, fn);
@@ -1187,7 +1221,7 @@ async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
     return;
   }
   // title
-  const tbuf = api._malloc(512);
+  const tbuf = checkedMalloc(512, 'handleLoad:tbuf');
   api._ko_get_title(tbuf, 512);
   const title = api.UTF8ToString(tbuf);
   api._free(tbuf);
@@ -1213,7 +1247,7 @@ async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
   // Where the reference reader would open: its own text reference, not always spine 0. The page
   // starts there; the container still holds every spine.
   const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
-  post(id, true, { spineCount, title, startSpine, timing: loadTiming });
+  post(id, true, { bookGen, spineCount, title, startSpine, timing: loadTiming });
 }
 
 async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
@@ -1231,7 +1265,7 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
     post(id, false, { error: 'Epub::load failed', timing: loadTiming });
     return;
   }
-  const titleBuf = api._malloc(512);
+  const titleBuf = checkedMalloc(512, 'handleOpenPreview:titleBuf');
   api._ko_get_title(titleBuf, 512);
   const openTitle = api.UTF8ToString(titleBuf);
   api._free(titleBuf);
@@ -1266,6 +1300,7 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
   const gen = sectionGen;
   const tx = frame.data.buffer;
   post(id, true, {
+    bookGen,                       // stage 7: the generation of the book this frame belongs to
     title: openTitle,
     spineCount,
     startSpine,
@@ -1285,6 +1320,17 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
 
 self.onmessage = async (ev) => {
   const { id, cmd } = ev.data;
+  const isReplacement = cmd === 'load' || cmd === 'openPreview';
+  let isReplacementDone = false;
+  // Non-replacement work is refused outright while a replacement is running: it would read half-swapped
+  // engine state, and "the caller retries later" is a far better outcome than a render against a book
+  // that is being torn down. Ping/stats stay allowed so the page can still ask whether the engine is
+  // alive while it waits.
+  if (!isReplacement && replacementsPending > 0 && !SAFE_DURING_REPLACEMENT.has(cmd)) {
+    post(id, false, { code: 'BOOK_REPLACING', error: 'book replacement in progress' });
+    return;
+  }
+  if (isReplacement) replacementsPending++;
   let earlyRead = null;
   const t0Open = performance.now();
   try {
@@ -1308,7 +1354,7 @@ self.onmessage = async (ev) => {
         && (typeof api !== 'undefined' && api && api._ko_load_epub_external
               ? true                                             // known-present engine: certain
               : typeof FileReaderSync !== 'undefined');            // cold start: the entry point is in every shipped build
-    if (loadCmd && ev.data.blob && !ev.data.streamEpub
+    if (loadCmd && replacementsPending === 1 && ev.data.blob && !ev.data.streamEpub
         && !externalPlanned && !ev.data.noEarlyRead && typeof ev.data.blob.arrayBuffer === 'function') {
       const promise = ev.data.blob.arrayBuffer();
       promise.catch(() => {});            // init may fail first; do not surface an unhandled rejection
@@ -1358,10 +1404,15 @@ self.onmessage = async (ev) => {
       }
 
 case 'load': {
-        // Queued: a book replacement must not overlap another one (see enqueueBookLoad).
-        await enqueueBookLoad(() => handleLoad(ev, id, initWaitMs, earlyRead, t0Open));
-        break;
-      }
+  // Queued: a book replacement must not overlap another one (see enqueueBookLoad).
+  try {
+    await enqueueBookLoad(() => handleLoad(ev, id, initWaitMs, earlyRead, t0Open));
+  } finally {
+    replacementsPending--;
+  }
+  isReplacementDone = true;
+  break;
+}
       case 'spec': {
         if (foregroundExportRunning) { post(id, false, { error: 'settings locked during export' }); break; }
         // §3 of the 1.4 audit: the worker owns this invariant, not the caller. window.__call is
@@ -1403,10 +1454,15 @@ case 'load': {
       // and nothing about the first page needs that middle hop. `load` is kept for export/pool workers,
       // which want metadata without a preview frame.
 case 'openPreview': {
-        // Queued for the same reason as 'load' — and it is the same operation plus a first frame.
-        await enqueueBookLoad(() => handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open));
-        break;
-      }
+  // Queued for the same reason as 'load' — and it is the same operation plus a first frame.
+  try {
+    await enqueueBookLoad(() => handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open));
+  } finally {
+    replacementsPending--;
+  }
+  isReplacementDone = true;
+  break;
+}
       case 'render': {
         // §2/§8: the spec travels with the render, so an ordinary page turn is one request and a
         // settings change is one request too. When it has not changed, this does nothing at all.
@@ -1581,7 +1637,7 @@ case 'openPreview': {
         // and the next book load would then "re-apply" a face that does not exist while reporting success.
         const candidateBytes = new Uint8Array(ev.data.epdfont);
         const candidateName = (ev.data.name || 'custom').replace(/[^\w-]/g, '') || 'custom';
-        const fp = api._malloc(candidateBytes.length);
+        const fp = checkedMalloc(candidateBytes.length, 'case-loadFont:fp');
         let rc;
         try {
           api.HEAPU8.set(candidateBytes, fp);
@@ -1792,7 +1848,7 @@ case 'openPreview': {
           if (pages <= 0) continue;                       // matches the serial path's `if (added > 0)`
           const lengths = Uint32Array.from(sp.lengths || []);
           if (lengths.length !== pages) { bad = 'spine ' + sp.spine + ': ' + lengths.length + ' lengths for ' + pages + ' pages'; break; }
-          const lptr = api._malloc(pages * 4);
+          const lptr = checkedMalloc(pages * 4, 'case-planPrefix:lptr');
           try {
             new Uint32Array(api.HEAPU8.buffer, lptr, pages).set(lengths);
             if (api._ko_plan_add_spine(lptr, pages) < 0) { bad = 'plan add spine failed'; break; }
@@ -1837,10 +1893,12 @@ case 'openPreview': {
           let acc = 0;
           for (let i = 0; i < pages; i++) { offs[i] = acc; acc += lengths[i]; }
           if (acc !== bytes.length) { bad = 'spine ' + sp.spine + ': lengths sum ' + acc + ' != ' + bytes.length + ' bytes'; break; }
-          const bptr = api._malloc(bytes.length);
-          const optr = api._malloc(pages * 4);
-          const lptr = api._malloc(pages * 4);
+          // Allocated before the try: if a later allocation throws, the earlier ones must still be freed.
+          let bptr = 0, optr = 0, lptr = 0;
           try {
+            bptr = checkedMalloc(bytes.length, 'case-assembleSpines:bptr');
+            optr = checkedMalloc(pages * 4, 'case-assembleSpines:optr');
+            lptr = checkedMalloc(pages * 4, 'case-assembleSpines:lptr');
             api.HEAPU8.set(bytes, bptr);
             new Uint32Array(api.HEAPU8.buffer, optr, pages).set(offs);
             new Uint32Array(api.HEAPU8.buffer, lptr, pages).set(lengths);
@@ -1848,7 +1906,9 @@ case 'openPreview': {
               bad = 'assemble add spine failed for spine ' + sp.spine; break;
             }
           } finally {
-            api._free(bptr); api._free(optr); api._free(lptr);
+            if (bptr) api._free(bptr);
+            if (optr) api._free(optr);
+            if (lptr) api._free(lptr);
           }
           for (const t of (sp.toc || [])) {
             const r = withCString(t.title, (tp) => api._ko_assemble_add_toc(base, tp, t.localPage | 0));
@@ -1958,6 +2018,9 @@ case 'openPreview': {
         post(id, false, { error: 'unknown cmd ' + cmd });
     }
   } catch (e) {
+    // A replacement that threw before its case completed must still release the exclusive state, or every
+    // later command would be refused with BOOK_REPLACING forever.
+    if (isReplacement && !isReplacementDone) replacementsPending--;
     // A throw here usually means the wasm runtime aborted (OOM / bad_alloc
     // under -fno-exceptions). The engine is poisoned after an abort — flag
     // fatal so the app respawns the worker instead of retrying a dead engine.

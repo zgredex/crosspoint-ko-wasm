@@ -127,7 +127,25 @@ HalFile HalStorage::open(const char* path, const oflag_t oflag) {
 
 bool HalStorage::exists(const char* path) { return files_.count(path ? path : "") > 0; }
 
-bool HalStorage::remove(const char* path) { return files_.erase(path ? path : "") > 0; }
+// Every alias of the same Blob must go, not just the key that was named. The mount functions also install
+// a BASENAME alias whenever the path is nested, so removing "/.fonts/foo.epdfont" used to leave
+// "/foo.epdfont" holding the Blob alive: a stale file that still answered lookups and still counted
+// against the storage. (The condition that installed those aliases, `p.find('/') != npos`, was always
+// true because normalisePath guarantees a leading slash.)
+bool HalStorage::remove(const char* path) {
+  const std::string key = path ? path : "";
+  auto it = files_.find(key);
+  if (it == files_.end()) return false;
+  const std::shared_ptr<Blob> victim = it->second;
+  for (auto i = files_.begin(); i != files_.end();) {
+    if (i->second == victim) {
+      i = files_.erase(i);
+    } else {
+      ++i;
+    }
+  }
+  return true;
+}
 
 bool HalStorage::rename(const char* oldPath, const char* newPath) {
   auto it = files_.find(oldPath ? oldPath : "");

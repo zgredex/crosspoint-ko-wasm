@@ -20,6 +20,13 @@
 #include "DitherUtils.h"
 #include "ImageDither.h"
 
+// Hostile-image ceiling. The decoders below read the WHOLE compressed file into a vector before any
+// dimension validation runs (validateImageDimensions happens later, on the header), so without a size
+// limit a single huge member inside a hostile EPUB can exhaust the module before anything looks at its
+// dimensions. 128 MiB is far above anything a 480x800 reader legitimately carries.
+static constexpr size_t MAX_IMAGE_FILE_BYTES = 128u * 1024u * 1024u;
+
+
 namespace {
 
 // Context struct passed through PNGdec callbacks to avoid global mutable state.

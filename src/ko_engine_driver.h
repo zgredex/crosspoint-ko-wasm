@@ -240,7 +240,15 @@ class EngineDriver {
     int t = epub_->getSpineIndexForTextReference();
     return t >= 0 && t < spineCount() ? t : 0;
   }
-  const std::string& title() const { return epub_->getTitle(); }
+  // Fail-closed book replacement made "driver alive, no book mounted" a legitimate state (see
+  // beginBookReplacement). These accessors used to assume the two were equivalent and dereferenced the
+  // EPUB unconditionally, so a title read after a failed replacement was a null dereference.
+  bool hasBook() const { return static_cast<bool>(epub_); }
+
+  const std::string& title() const {
+    static const std::string empty;
+    return epub_ ? epub_->getTitle() : empty;
+  }
   // RETURNS BY VALUE. This used to return `const std::string&` bound to
   // `epub_->getSpineItem(i).href`, but getSpineItem() returns BookMetadataCache::SpineEntry BY VALUE
   // (Epub.h:67), so the reference outlived the temporary that owned the string. Short hrefs live in the
