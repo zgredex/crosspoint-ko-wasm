@@ -287,15 +287,17 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
 
       ZipFile::SizeTarget t;
       t.hash = ZipFile::fnvHash64(path.c_str(), path.size());
-      t.len = static_cast<uint16_t>(path.size());
       // uint32_t, not uint16_t: SizeTarget::index was widened precisely because 16 bits wrapped above
       // 65535 spine items and a wrapped index writes the size into a DIFFERENT spine's slot.
       t.index = static_cast<uint32_t>(i);
+      // The path itself travels with the target, so the batch scanner can compare the actual bytes instead
+      // of accepting a hash+length bucket member — the difference between a filter and an identity.
+      t.path = path;
       targets[i] = t;
     }
 
     std::sort(targets.begin(), targets.end(), [](const ZipFile::SizeTarget& a, const ZipFile::SizeTarget& b) {
-      return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);
+      return a.hash < b.hash || (a.hash == b.hash && a.path < b.path);
     });
 
     spineSizes.resize(spineCount, 0);

@@ -237,8 +237,8 @@
       "blob": "beb14a1aec076dd734471ac6accff3f2c075e7f5",
       "port_path": "vendor-lib/Epub/Epub/BookMetadataCache.cpp",
       "divergence_kind": "amended",
-      "added_lines": 31,
-      "removed_lines": 3,
+      "added_lines": 35,
+      "removed_lines": 5,
       "changed_functions": [
         "beginTocPass",
         "buildBookBin",
@@ -249,7 +249,9 @@
       "reference_function_count": 21,
       "port_function_count": 21,
       "removed_line_sample": [
+        "t.len = static_cast<uint16_t>(path.size());",
         "t.index = static_cast<uint16_t>(i);",
+        "return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);",
         "int matched = zip.fillUncompressedSizes(targets, spineSizes);",
         "cumSize += itemSize;"
       ]

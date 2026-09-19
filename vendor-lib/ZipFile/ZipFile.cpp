@@ -29,6 +29,18 @@ inline uint32_t le32(const uint8_t* p) {
          (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
 }
 
+// CRC-32 (IEEE 802.3), computed bitwise so no 1 KiB table sits in the binary. A damaged DEFLATE stream can
+// still inflate "successfully" into wrong bytes, and for a converter whose output must be a function of the
+// EPUB bytes, silent corruption is worse than a clean rejection.
+inline uint32_t crc32Update(uint32_t crc, const uint8_t* p, size_t n) {
+  crc = ~crc;
+  while (n--) {
+    crc ^= *p++;
+    for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+  }
+  return ~crc;
+}
+
 constexpr uint32_t ZIP_SIG_EOCD = 0x06054b50;
 constexpr uint32_t ZIP_SIG_CENTRAL = 0x02014b50;
 constexpr uint32_t ZIP_SIG_LOCAL = 0x04034b50;
@@ -93,66 +105,29 @@ bool ZipFile::loadAllFileStatSlims() {
 
   const size_t cdEnd = static_cast<size_t>(zipDetails.centralDirOffset) + zipDetails.centralDirSize;
 
-  // TRANSACTIONAL: builds a candidate and commits it only after the WHOLE declared directory parsed.
-  // The previous version broke out of the loop on the first bad record and still returned true, so the
-  // cache became authoritative while holding only the entries up to the corruption — every later entry
-  // was then treated as absent, and the failure looked like "this book has no such file" rather than
-  // "this archive is malformed".
+  // TRANSACTIONAL: build a candidate and commit only after the WHOLE declared directory parsed. A version
+  // that broke out of the loop on the first bad record and still returned true made the cache authoritative
+  // while holding only the entries up to the corruption — every later entry then looked absent.
   std::unordered_map<std::string, FileStatSlim> candidate;
   candidate.reserve(zipDetails.totalEntries);
 
   for (uint32_t i = 0; i < zipDetails.totalEntries; ++i) {
-    const size_t here = file.position();
-    if (here > cdEnd || cdEnd - here < ZIP_CD_MIN_ENTRY) {
-      fileStatSlimCache.clear();
-      return false;                                              // ran off the declared directory
-    }
-
-    uint8_t fixed[ZIP_CD_MIN_ENTRY];
-    if (file.read(fixed, sizeof(fixed)) != static_cast<int>(sizeof(fixed))) {
-      fileStatSlimCache.clear();
-      return false;
-    }
-    if (le32(fixed) != ZIP_SIG_CENTRAL) {
+    CentralEntry e;
+    if (!readCentralEntry(e, cdEnd)) {
       fileStatSlimCache.clear();
       return false;
     }
 
     FileStatSlim fileStat = {};
-    fileStat.method = le16(fixed + 10);
-    fileStat.compressedSize = le32(fixed + 20);
-    fileStat.uncompressedSize = le32(fixed + 24);
-    // MEASURED, not assumed: the local-header offset is at record byte 42, and offset 42 of a real record
-    // points at PK\x03\x04 for every entry while byte 44 is garbage. Reading 44 here filled the stat cache
-    // with wrong offsets, which no fixture noticed because their reads go through the lazy per-name path.
-    fileStat.localHeaderOffset = le32(fixed + 42);
-    const uint16_t nameLen = le16(fixed + 28);
-    const uint16_t m = le16(fixed + 30);
-    const uint16_t k = le16(fixed + 32);
+    fileStat.flags = e.flags;
+    fileStat.method = e.method;
+    fileStat.crc32 = e.crc32;
+    fileStat.compressedSize = e.compressedSize;
+    fileStat.uncompressedSize = e.uncompressedSize;
+    fileStat.localHeaderOffset = e.localHeaderOffset;
 
-    char itemName[256];
-    if (nameLen < sizeof(itemName)) {
-      if (file.read(itemName, nameLen) != static_cast<int>(nameLen)) {
-        fileStatSlimCache.clear();
-        return false;
-      }
-      itemName[nameLen] = '\0';
-      if (!candidate.emplace(itemName, fileStat).second) {
-        // Two entries with one name would make lookups order-dependent.
-        LOG_ERR("ZIP", "Duplicate entry name in central directory");
-        fileStatSlimCache.clear();
-        return false;
-      }
-    } else if (!file.seekCur(nameLen)) {
-      fileStatSlimCache.clear();
-      return false;
-    }
-
-    if (!file.seekCur(static_cast<int64_t>(m) + k)) {
-      fileStatSlimCache.clear();
-      return false;
-    }
-    if (file.position() > cdEnd) {
+    if (!candidate.emplace(e.name, fileStat).second) {
+      LOG_ERR("ZIP", "duplicate central-directory name: %s", e.name.c_str());
       fileStatSlimCache.clear();
       return false;
     }
@@ -160,12 +135,47 @@ bool ZipFile::loadAllFileStatSlims() {
 
   // COMMIT — only after every declared record passed.
   fileStatSlimCache.swap(candidate);
-
   // Set cursor to start of central directory for sequential access
   lastCentralDirPos = zipDetails.centralDirOffset;
   lastCentralDirPosValid = true;
 
   return true;
+}
+
+// The single checked central-directory record reader. Every walker below consumes this instead of decoding
+// the fixed offsets itself: four independent re-decodings is how one of them came to read the local-header
+// offset two bytes late, and bounds checks that must stay in sync by hand are bounds checks that will drift.
+bool ZipFile::readCentralEntry(CentralEntry& out, size_t cdEnd) {
+  const size_t here = file.position();
+  if (here > cdEnd || cdEnd - here < ZIP_CD_MIN_ENTRY) return false;
+
+  uint8_t fixed[ZIP_CD_MIN_ENTRY];
+  if (file.read(fixed, sizeof(fixed)) != static_cast<int>(sizeof(fixed))) return false;
+  if (le32(fixed) != ZIP_SIG_CENTRAL) return false;
+
+  out.flags = le16(fixed + 8);
+  out.method = le16(fixed + 10);
+  out.crc32 = le32(fixed + 16);
+  out.compressedSize = le32(fixed + 20);
+  out.uncompressedSize = le32(fixed + 24);
+
+  const uint16_t nameLen = le16(fixed + 28);
+  const uint16_t extraLen = le16(fixed + 30);
+  const uint16_t commentLen = le16(fixed + 32);
+  out.localHeaderOffset = le32(fixed + 42);            // measured: byte 42, not 44
+
+  constexpr size_t MAX_ZIP_PATH = 4096;
+  if (nameLen == 0 || nameLen > MAX_ZIP_PATH) return false;
+
+  // The declared variable-length tail must fit inside the declared directory — a name/extra/comment that
+  // runs past cdEnd means the next "record" is really this record's leftovers.
+  if (static_cast<uint64_t>(nameLen) + extraLen + commentLen > cdEnd - file.position()) return false;
+
+  out.name.resize(nameLen);
+  if (file.read(out.name.data(), nameLen) != static_cast<int>(nameLen)) return false;
+  if (!file.seekCur(static_cast<int64_t>(extraLen) + commentLen)) return false;
+
+  return file.position() <= cdEnd;
 }
 
 bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
@@ -193,75 +203,46 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
   const size_t cdEnd = static_cast<size_t>(zipDetails.centralDirOffset) + zipDetails.centralDirSize;
   uint32_t walked = 0;
 
-  uint32_t sig;
-  char itemName[256];
-
   while (true) {
     // A hostile central directory must not be able to keep this loop running: it is bounded by the entry
-    // count the EOCD declared AND by the end of the declared directory.
-    if (++walked > zipDetails.totalEntries + 1u) break;
-    const size_t here = file.position();
-    if (here > cdEnd || cdEnd - here < ZIP_CD_MIN_ENTRY) break;
-    uint32_t entryStart = file.position();
+    // count the EOCD declared, and every record it hands out is bounds-checked against the declared end.
+    if (++walked > static_cast<uint32_t>(zipDetails.totalEntries) + 1u) break;
 
-    if (file.read(&sig, 4) != 4 || sig != 0x02014b50) {
-      // End of central directory
+    const size_t entryStart = file.position();
+    // If we've wrapped and reached our start position, stop
+    if (wrapped && entryStart >= startPos) break;
+
+    CentralEntry e;
+    if (!readCentralEntry(e, cdEnd)) {
+      // No usable record here: either the end of the declared directory (normal) or a malformed record. The
+      // sequential-cursor optimization resumes from the middle, so wrapping once is what makes an entry
+      // BEFORE the cursor reachable at all.
       if (!wrapped && lastCentralDirPosValid && startPos != zipDetails.centralDirOffset) {
-        // Wrap around to beginning
-        file.seek(zipDetails.centralDirOffset);
+        if (!file.seek(zipDetails.centralDirOffset)) break;
         wrapped = true;
         continue;
       }
       break;
     }
 
-    // If we've wrapped and reached our start position, stop
-    if (wrapped && entryStart >= startPos) {
+    if (e.name == filename) {
+      lastCentralDirPos = static_cast<uint32_t>(file.position());
+      lastCentralDirPosValid = true;
+      fileStat->flags = e.flags;
+      fileStat->method = e.method;
+      fileStat->crc32 = e.crc32;
+      fileStat->compressedSize = e.compressedSize;
+      fileStat->uncompressedSize = e.uncompressedSize;
+      fileStat->localHeaderOffset = e.localHeaderOffset;
+      found = true;
       break;
     }
-
-    if (!file.seekCur(6)) break;
-    if (file.read(&fileStat->method, 2) != 2) break;
-    if (!file.seekCur(8)) break;
-    if (file.read(&fileStat->compressedSize, 4) != 4) break;
-    if (file.read(&fileStat->uncompressedSize, 4) != 4) break;
-    uint16_t nameLen, m, k;
-    if (file.read(&nameLen, 2) != 2) break;
-    if (file.read(&m, 2) != 2) break;
-    if (file.read(&k, 2) != 2) break;
-    if (!file.seekCur(8)) break;
-    if (file.read(&fileStat->localHeaderOffset, 4) != 4) break;
-
-    if (nameLen < 256) {
-      if (file.read(itemName, nameLen) != static_cast<int>(nameLen)) break;
-      itemName[nameLen] = '\0';
-
-      if (strcmp(itemName, filename) == 0) {
-        // Found it! Update cursor to next entry
-        if (!file.seekCur(static_cast<int64_t>(m) + k)) break;
-        // m and k are attacker-controlled: a record whose extra field and comment run past the declared
-        // directory must not be accepted, and lastCentralDirPos must never point outside it — that cursor is
-        // where the NEXT lookup starts.
-        if (file.position() > cdEnd) break;
-        lastCentralDirPos = file.position();
-        lastCentralDirPosValid = true;
-        found = true;
-        break;
-      }
-    } else {
-      // Name too long, skip it
-      if (!file.seekCur(nameLen)) break;
-    }
-
-    // Skip extra field + comment
-    if (!file.seekCur(static_cast<int64_t>(m) + k)) break;
-    if (file.position() > cdEnd) break;
   }
 
   return found;
 }
 
-long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
+long ZipFile::getDataOffset(const FileStatSlim& fileStat, const char* expectName) {
   const ScopedOpenClose zip{*this};
   if (!zip) return -1;
 
@@ -295,6 +276,29 @@ long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
   const uint16_t filenameLength = pLocalHeader[26] + (pLocalHeader[27] << 8);
   const uint16_t extraOffset = pLocalHeader[28] + (pLocalHeader[29] << 8);
 
+  // The local header names the file too, and the two names must be the same one. A bounded read: the length
+  // is attacker-controlled, so it is checked against the header's own position first.
+  if (expectName != nullptr) {
+    constexpr size_t MAX_LOCAL_NAME = 4096;
+    if (filenameLength == 0 || filenameLength > MAX_LOCAL_NAME ||
+        static_cast<size_t>(fileOffset) + localHeaderSize + filenameLength > file.size()) {
+      LOG_ERR("ZIP", "local filename length is out of range");
+      return -1;
+    }
+    std::vector<uint8_t> localName(filenameLength);
+    if (file.read(localName.data(), filenameLength) != static_cast<int>(filenameLength)) {
+      LOG_ERR("ZIP", "could not read the local filename");
+      return -1;
+    }
+    if (strlen(expectName) != filenameLength ||
+        memcmp(localName.data(), expectName, filenameLength) != 0) {
+      LOG_ERR("ZIP", "local filename contradicts the central directory");
+      return -1;
+    }
+    // restore the cursor to the data offset: the name read consumed it
+    if (!file.seek(static_cast<size_t>(fileOffset) + localHeaderSize)) return -1;
+  }
+
   // Encrypted entries: unsupported, and MUST fail explicitly. An encrypted member's "compressed" bytes are
   // not a deflate stream, so treating them as one is how a hostile archive gets the reader to consume
   // arbitrary following bytes as entry content.
@@ -307,6 +311,14 @@ long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
   // something to interpret: the two records describe the same bytes.
   if (le16(pLocalHeader + 8) != fileStat.method) {
     LOG_ERR("ZIP", "local compression method contradicts the central directory");
+    return -1;
+  }
+  // ...and about the flags that change how the payload must be read. Encryption is checked above on the
+  // local record; the data-descriptor bit changes where the member's sizes come from, so a disagreement is
+  // a contradiction rather than something to resolve by preferring one record.
+  constexpr uint16_t ZIP_FLAG_RELEVANT = 0x0008;      // streaming data descriptor
+  if ((localFlags & ZIP_FLAG_RELEVANT) != (fileStat.flags & ZIP_FLAG_RELEVANT)) {
+    LOG_ERR("ZIP", "local/central flag contradiction");
     return -1;
   }
   // STORED means the member IS its bytes, so the two sizes must be equal. Without this, a record saying
@@ -488,70 +500,58 @@ int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<u
 
   int matched = 0;
   const int targetCount = static_cast<int>(targets.size());
-  char itemName[256];
 
-  // Same bounds as every other central-directory walker: exactly totalEntries records, never past the
-  // declared directory, every read verified. This loop is NOT dead code — BookMetadataCache uses it for
-  // books at or above LARGE_SPINE_THRESHOLD, so it was the last hostile-metadata path left unchecked, and
-  // a malformed record here used to be indistinguishable from "no match".
+  // Bounded by the declared entry count and parsed by the SAME record parser as every other walker. This
+  // loop is not dead code: BookMetadataCache uses it for books at or above LARGE_SPINE_THRESHOLD.
   for (uint32_t i = 0; i < zipDetails.totalEntries; ++i) {
-    const size_t here = file.position();
-    if (here > cdEnd || cdEnd - here < ZIP_CD_MIN_ENTRY) return -1;
+    CentralEntry e;
+    if (!readCentralEntry(e, cdEnd)) return -1;      // a malformed directory is fatal, not "no match"
 
-    uint8_t fixed[ZIP_CD_MIN_ENTRY];
-    if (file.read(fixed, sizeof(fixed)) != static_cast<int>(sizeof(fixed))) return -1;
-    if (le32(fixed) != ZIP_SIG_CENTRAL) return -1;
+    const uint64_t hash = fnvHash64(e.name.c_str(), e.name.size());
+    SizeTarget key;
+    key.hash = hash;
+    key.index = 0;
+    key.path = e.name;
 
-    const uint32_t uncompressedSize = le32(fixed + 24);
-    const uint16_t nameLen = le16(fixed + 28);
-    const uint16_t m = le16(fixed + 30);
-    const uint16_t k = le16(fixed + 32);
+    auto it = std::lower_bound(targets.begin(), targets.end(), key,
+                               [](const SizeTarget& a, const SizeTarget& b) {
+                                 return a.hash < b.hash || (a.hash == b.hash && a.path < b.path);
+                               });
 
-    if (nameLen < sizeof(itemName)) {
-      if (file.read(itemName, nameLen) != static_cast<int>(nameLen)) return -1;
-      itemName[nameLen] = '\0';
-
-      uint64_t hash = fnvHash64(itemName, nameLen);
-      SizeTarget key = {hash, nameLen, 0};
-
-      auto it = std::lower_bound(targets.begin(), targets.end(), key, [](const SizeTarget& a, const SizeTarget& b) {
-        return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);
-      });
-
-      // A bucket of MORE THAN ONE target means the hash+length pair is ambiguous for this name — either a
-      // genuine FNV-1a collision or simply two spine items with the same href. Writing this entry's size
-      // into every candidate would be guessing. Leave them at zero and let the exact per-path lookup
-      // resolve them: hash NARROWS the search, exact bytes DECIDE identity.
-      auto last = it;
-      while (last != targets.end() && last->hash == hash && last->len == nameLen) ++last;
-      if (std::distance(it, last) == 1) {
-        if (it->index < sizes.size()) {
-          sizes[it->index] = uncompressedSize;
-          matched++;
-        }
+    // Hash NARROWS the bucket; the exact path DECIDES. Comparing bytes is what closes the deliberate
+    // collision case — a bucket of one is not proof of identity, which is why the path is carried at all.
+    while (it != targets.end() && it->hash == hash) {
+      if (it->path == e.name && it->index < sizes.size()) {
+        sizes[it->index] = e.uncompressedSize;
+        matched++;
       }
-
-      if (matched >= targetCount) return matched;
-    } else if (!file.seekCur(nameLen)) {
-      return -1;
+      ++it;
     }
 
-    if (!file.seekCur(static_cast<int64_t>(m) + k)) return -1;
-    if (file.position() > cdEnd) return -1;
+    if (matched >= targetCount) return matched;
   }
 
   // Fewer matches than targets is legitimate (the caller falls back); a malformed directory is not.
   return matched;
 }
 
-uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const bool trailingNullByte) {
+uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const bool trailingNullByte,
+                                   const size_t maxOutputBytes) {
   const ScopedOpenClose zip{*this};
   if (!zip) return nullptr;
 
   FileStatSlim fileStat = {};
   if (!loadFileStatSlim(filename, &fileStat)) return nullptr;
 
-  const long fileOffset = getDataOffset(fileStat);
+  // BEFORE any allocation or inflation: the declared size is attacker-controlled, and a decoder-side check
+  // happens after the member already expanded into memory-backed storage.
+  if (static_cast<uint64_t>(fileStat.uncompressedSize) > static_cast<uint64_t>(maxOutputBytes)) {
+    LOG_ERR("ZIP", "entry declares %u bytes, above the caller's %zu byte budget", fileStat.uncompressedSize,
+            maxOutputBytes);
+    return nullptr;
+  }
+
+  const long fileOffset = getDataOffset(fileStat, filename);
   if (fileOffset < 0) return nullptr;
 
   file.seek(fileOffset);
@@ -629,19 +629,41 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
     return nullptr;
   }
 
+  // Integrity: the central directory's CRC, computed over the UNCOMPRESSED bytes. A damaged DEFLATE stream
+  // can inflate "successfully" into wrong content, which for a deterministic converter is worse than a clean
+  // rejection. A zero CRC field is treated as unset (an empty member, or a writer that never filled it) and
+  // is not used to reject a book; everything else must match.
+  if (fileStat.crc32 != 0) {
+    const uint32_t actual = crc32Update(0, data, inflatedDataSize);
+    if (actual != fileStat.crc32) {
+      LOG_ERR("ZIP", "CRC mismatch for %s: central %08x, computed %08x", filename, fileStat.crc32, actual);
+      free(data);
+      return nullptr;
+    }
+  }
+
   if (trailingNullByte) data[allocSize - 1] = '\0';   // allocSize carries the +1, never the wrapped form
   if (size) *size = inflatedDataSize;
   return data;
 }
 
-bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t chunkSize, const bool allowEarlyStop) {
+bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t chunkSize,
+                               const bool allowEarlyStop, const size_t maxOutputBytes) {
   const ScopedOpenClose zip{*this};
   if (!zip) return false;
 
   FileStatSlim fileStat = {};
   if (!loadFileStatSlim(filename, &fileStat)) return false;
 
-  const long fileOffset = getDataOffset(fileStat);
+  // Reject BEFORE the member expands: the sink here is memory-backed storage, so a "streaming" read of a
+  // hostile member still ends with the whole uncompressed payload resident.
+  if (static_cast<uint64_t>(fileStat.uncompressedSize) > static_cast<uint64_t>(maxOutputBytes)) {
+    LOG_ERR("ZIP", "entry declares %u bytes, above the caller's %zu byte budget", fileStat.uncompressedSize,
+            maxOutputBytes);
+    return false;
+  }
+
+  const long fileOffset = getDataOffset(fileStat, filename);
   if (fileOffset < 0) return false;
 
   file.seek(fileOffset);
@@ -656,6 +678,7 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
       return false;
     }
 
+    uint32_t crc = 0;
     size_t remaining = inflatedDataSize;
     while (remaining > 0) {
       const size_t want = remaining < chunkSize ? remaining : chunkSize;
@@ -672,9 +695,10 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
         return false;
       }
 
+      crc = crc32Update(crc, buffer, dataRead);
       if (out.write(buffer, dataRead) != dataRead) {
         free(buffer);
-        if (allowEarlyStop) return true;  // sink has what it needs
+        if (allowEarlyStop) return true;  // sink has what it needs; the member is left UNVERIFIED on purpose
         LOG_ERR("ZIP", "Failed to write all output bytes to stream");
         return false;
       }
@@ -682,6 +706,14 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
     }
 
     free(buffer);
+    // The whole member was consumed, so the central directory's CRC is meaningful and must match.
+    if (fileStat.crc32 != 0) {
+      const uint32_t actual = crc32Update(crc, nullptr, 0);
+      if (actual != fileStat.crc32) {
+        LOG_ERR("ZIP", "CRC mismatch for %s: central %08x, computed %08x", filename, fileStat.crc32, actual);
+        return false;
+      }
+    }
     return true;
   }
 
@@ -716,12 +748,16 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
 
     bool success = false;
     size_t totalProduced = 0;
+    uint32_t crc = 0;
 
     while (true) {
       size_t produced;
       const InflateStream::Status status = inflate.readAtMost(outputBuffer, chunkSize, &produced);
 
       totalProduced += produced;
+      // Integrity is accumulated as the bytes are produced, so a full decode can be verified without a
+      // second pass. An early-stop probe leaves this partial and is deliberately NOT verified (see below).
+      crc = crc32Update(crc, outputBuffer, produced);
       if (totalProduced > static_cast<size_t>(inflatedDataSize)) {
         LOG_ERR("ZIP", "Decompressed size exceeds expected (%zu > %zu)", totalProduced,
                 static_cast<size_t>(inflatedDataSize));
@@ -759,6 +795,14 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
 
     free(outputBuffer);
     free(fileReadBuffer);
+    // Only a COMPLETE decode can be verified: with allowEarlyStop the sink stopped the read on purpose, so
+    // the uncompressed member was never fully inspected and claiming CRC coverage for it would be a lie.
+    if (success && fileStat.crc32 != 0 && totalProduced == static_cast<size_t>(inflatedDataSize)) {
+      if (crc != fileStat.crc32) {
+        LOG_ERR("ZIP", "CRC mismatch for %s: central %08x, computed %08x", filename, fileStat.crc32, crc);
+        success = false;
+      }
+    }
     return success;  // inflate destructor frees the decompressor state + window
   }
 

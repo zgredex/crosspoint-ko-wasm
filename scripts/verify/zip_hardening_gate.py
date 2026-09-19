@@ -243,15 +243,118 @@ def data_overlaps_cd(d):
 
 mutant('entry data overlapping the central directory is rejected', data_overlaps_cd, 'overlaps')
 
+# ---- 10. corruption in a MIDDLE record (not the first, which the walker always touches) ----------
+def middle_record_corrupt(d):
+    entries = list(cd_entries(d))
+    pos = entries[len(entries) // 2][0]
+    d[pos:pos + 4] = b'\x00\x00\x00\x00'
+
+mutant('a corrupt MIDDLE central-directory record is rejected', middle_record_corrupt)
+
+# ---- 11. duplicate entry name -------------------------------------------------------------------
+def duplicate_name(d):
+    entries = list(cd_entries(d))
+    by_len = {}
+    for pos, name, _lho, _usz in entries:
+        by_len.setdefault(len(name), []).append((pos, name))
+    for _length, group in by_len.items():
+        if len(group) >= 2:
+            (p0, n0), (p1, _n1) = group[0], group[1]
+            d[p1 + 46:p1 + 46 + len(n0)] = n0          # same length, so every later offset stays valid
+            return
+    raise SystemExit('no two entries share a name length to make a duplicate from')
+
+# The duplicate-name rejection lives in the two ENUMERATING walkers (loadAllFileStatSlims and
+# enumerateFileEntries). The host CLI reaches neither for this fixture: the lazy per-name lookup stops at the
+# first match by construction, loadAllFileStatSlims needs a large-spine book, and discoverCssFilesFromZip()
+# only runs on the cache-hit CSS path. Reported as SKIP rather than PASS so the gate never claims a
+# rejection it did not observe.
+results.append((None, 'a duplicate central-directory name is rejected (reason: no walker reached)', '', ''))
+
+# ---- 12. central/local flag contradiction -------------------------------------------------------
+def flag_contradiction(d):
+    for pos, name, lho, _usz in cd_entries(d):
+        if name.lower().endswith(b'.opf'):
+            flags = struct.unpack_from('<H', d, pos + 8)[0]
+            struct.pack_into('<H', d, pos + 8, flags | 0x0008)   # data-descriptor bit only in the central record
+            return
+    raise SystemExit('no OPF entry found to mutate')
+
+mutant('a local/central flag contradiction is rejected', flag_contradiction, 'flag contradiction')
+
+# ---- 13. local filename contradicting the central directory -------------------------------------
+def local_name_contradiction(d):
+    for _pos, name, lho, _usz in cd_entries(d):
+        if name.lower().endswith(b'.opf'):
+            nlen = struct.unpack_from('<H', d, lho + 26)[0]
+            assert nlen == len(name)
+            d[lho + 30:lho + 30 + nlen] = b'x' * nlen          # same length, different bytes
+            return
+    raise SystemExit('no OPF entry found to mutate')
+
+mutant('a local filename contradicting the central directory is rejected', local_name_contradiction, 'local filename')
+
+# ---- 14. a corrupted payload byte: the CRC must catch it ----------------------------------------
+def corrupt_deflated_payload(d):
+    for _pos, name, lho, _usz in cd_entries(d):
+        if name.lower().endswith(b'.opf'):
+            nlen = struct.unpack_from('<H', d, lho + 26)[0]
+            elen = struct.unpack_from('<H', d, lho + 28)[0]
+            data = lho + 30 + nlen + elen
+            d[data + 8] ^= 0xFF                                 # a byte inside the deflate stream
+            return
+    raise SystemExit('no OPF entry found to mutate')
+
+mutant('a damaged DEFLATE payload is rejected (inflate failure or CRC)', corrupt_deflated_payload)
+
+def corrupt_stored_payload(d):
+    for _pos, name, lho, _usz in cd_entries(d):
+        if name.lower().endswith(b'.xhtml'):
+            nlen = struct.unpack_from('<H', d, lho + 26)[0]
+            elen = struct.unpack_from('<H', d, lho + 28)[0]
+            d[lho + 30 + nlen + elen + 16] ^= 0xFF              # one byte of a STORED member
+            return
+    raise SystemExit('no stored XHTML entry found to mutate')
+
+def run_stored_crc_mutant():
+    data = bytearray(STORED_BOOK)
+    corrupt_stored_payload(data)
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, 'c.epub'); out = os.path.join(td, 'c.xtch')
+        open(src, 'wb').write(bytes(data))
+        rc, tail = load(src, out)
+        produced = os.path.exists(out) and os.path.getsize(out) > 0
+        ok = rc != 0 and not produced
+        results.append((ok, 'a damaged STORED payload is rejected (CRC)', f'exit={rc} produced={produced}', tail))
+        if not ok:
+            problems.append('stored crc')
+
+run_stored_crc_mutant()
+
+# ---- 15. variable-length fields crossing the declared directory end ------------------------------
+def fields_cross_cd_end(d):
+    for pos, name, _lho, _usz in cd_entries(d):
+        if name.lower().endswith(b'.opf'):
+            struct.pack_into('<H', d, pos + 30, 0xFFF0)         # extraLen far past cdEnd
+            return
+    raise SystemExit('no OPF entry found to mutate')
+
+mutant('central fields crossing the directory end are rejected', fields_cross_cd_end)
+
 # ---- report -------------------------------------------------------------------------------------
 print(f'zip-hardening gate — {os.path.basename(BOOK)}')
 for ok, name, detail, tail in results:
-    print(f"  {'PASS' if ok else 'FAIL'}  {name}")
-    if not ok and tail:
+    label = 'PASS' if ok else ('SKIP' if ok is None else 'FAIL')
+    print(f"  {label}  {name}")
+    if ok is False and tail:
         print(f"         engine said: {tail[:160]}")
 print()
 if problems:
     print(f"FAIL — {len(problems)} control(s) did not behave: {', '.join(problems)}")
     sys.exit(1)
-print(f'PASS — all {len(results)} controls behave: the healthy book loads, and every hostile archive is '
-      f'rejected with a container never produced')
+skipped = [n for ok, n, _d, _t in results if ok is None]
+verdict = (f'PASS — {len(results) - len(skipped)} of {len(results)} controls behave: the healthy books load, '
+           f'and every hostile archive is rejected with a container never produced')
+if skipped:
+    verdict += f' | NOT PROVEN (path unreachable from this harness): {len(skipped)}'
+print(verdict)
