@@ -124,6 +124,59 @@
     return { beforeFailure: good, afterFailure: after };
   }
 
-  window.__defensive = { lastSelectionWins, workerLastWriterWins, failClosed, dispatch, dispatchCorrupt, settle };
+  // ---- spinner gate: the overlay must be gone once the call it describes has settled --------------
+  // The reported symptom was "EPUB 분석 중… 53s" over a book that had already opened. The overlay counts
+  // from a page-side timer, so it cannot itself say whether the engine is alive — these checks therefore
+  // assert the two things that CAN be checked: the overlay is cleared after a settled open (success AND
+  // failure), and a superseded load never clears a newer load's spinner.
+  async function spinnerClears(a) {
+    await waitForApp();
+    const out = {};
+
+    await dispatch(a);
+    await settle(8000);
+    out.afterSuccess = {
+      pending: !!window.__koOpenPending,
+      visible: window.__koLoadingVisible ? window.__koLoadingVisible() : null,
+      assert: (() => { try { return window.__koAssertOverlayClear('successful open'); }
+                       catch (e) { return 'THREW: ' + e.message; } })(),
+      status: (document.querySelector('#status') || {}).textContent || '',
+    };
+
+    await dispatchCorrupt('corrupt.epub');
+    await settle(8000);
+    out.afterFailure = {
+      pending: !!window.__koOpenPending,
+      visible: window.__koLoadingVisible ? window.__koLoadingVisible() : null,
+      assert: (() => { try { return window.__koAssertOverlayClear('failed open'); }
+                       catch (e) { return 'THREW: ' + e.message; } })(),
+    };
+
+    // A (slow) superseded by B: while B is still loading, A finishing must not hide B's spinner.
+    window.__koOpenSuperseded = 0;
+    const bBlob = (await (await fetch('demo-png.epub')).blob());
+    const seenDuringB = [];
+    await dispatch('demo.epub');                     // slow
+    await sleep(10);
+    const pB = dispatch('demo-png.epub');            // fast book, but still a full open
+    for (let i = 0; i < 12; i++) {
+      await sleep(120);
+      seenDuringB.push(window.__koLoadingVisible ? window.__koLoadingVisible() : null);
+    }
+    await pB;
+    await settle(6000);
+    out.overlap = {
+      superseded: window.__koOpenSuperseded || 0,
+      overlaySeenWhileWaiting: seenDuringB.some((v) => v === true),
+      finalPending: !!window.__koOpenPending,
+      finalVisible: window.__koLoadingVisible ? window.__koLoadingVisible() : null,
+      finalAssert: (() => { try { return window.__koAssertOverlayClear('overlap'); }
+                            catch (e) { return 'THREW: ' + e.message; } })(),
+    };
+    return out;
+  }
+
+  window.__defensive = { lastSelectionWins, workerLastWriterWins, failClosed, spinnerClears,
+                         dispatch, dispatchCorrupt, settle };
   return 'defensive probe ready';
 })()

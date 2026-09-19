@@ -74,7 +74,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=100');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=101');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -254,7 +254,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=100');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=101');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -543,6 +543,18 @@
     tick();
     busyTicker = setInterval(tick, 1000);
   }
+  // Stage 2 of the spinner audit. `busy()` is only safe if every exit clears it, so make that checkable
+  // rather than assumed: the overlay must never be visible once the call it describes has settled.
+  function loadingOverlayVisible() {
+    return !!els.loading && !els.loading.classList.contains('hidden');
+  }
+  window.__koLoadingVisible = loadingOverlayVisible;
+  window.__koAssertOverlayClear = function (what) {
+    if (window.__koOpenPending) return 'pending (engine still working — a counter here is honest)';
+    if (loadingOverlayVisible()) throw new Error((what || 'open') + ' left the loading overlay active');
+    return 'clear';
+  };
+
   function idle() {
     clearInterval(busyTicker);
     busyTicker = null;
@@ -972,6 +984,12 @@
     invalidateWarm();
     setStatus('EPUB 분석 중…');
     busy('EPUB 분석 중');
+    // Stage 3 of the spinner audit: the overlay text counts from a page-side timer, so it says nothing
+    // about whether the engine is alive. These two flags are what make the two cases distinguishable from
+    // outside: pending=true means the page is still WAITING on the engine (a counter here is honest);
+    // settledAt set means the call already came back and the overlay is stale if it is still visible.
+    window.__koOpenPending = true;
+    window.__koOpenSettledAt = null;
     try {
       // The preview engine is loaded authoritatively; the export engine reads the same Blob in
       // parallel, so the conversion can start the moment the reader can see page one. A failure there
@@ -1136,10 +1154,16 @@
       // describe a book no engine holds — and its "download" or page turn would fail confusingly later.
       clearLoadedBookAfterFailedOpen();
     } finally {
-      // Stage 12: loadBook owns the busy overlay. The one-round-trip SUCCESS path never called idle(),
-      // so the overlay and its 1 s interval stayed alive after every successful open. The token check
-      // matters: a superseded A must not hide B's spinner.
-      if (token === bookLoadToken) idle();
+      // Stage 1/12: loadBook owns the busy overlay, on BOTH outcomes. The one-round-trip SUCCESS path
+      // never called idle(), so the overlay and its 1 s interval used to stay alive after a successful
+      // open — a spinner counting forever over a book that had already opened underneath it.
+      //
+      // The token check is not optional: an older superseded A must never hide a newer B's spinner.
+      if (token === bookLoadToken) {
+        window.__koOpenPending = false;
+        window.__koOpenSettledAt = performance.now();
+        idle();
+      }
     }
   }
 
@@ -1803,7 +1827,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=100');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=101');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };
