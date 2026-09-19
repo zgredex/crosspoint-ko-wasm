@@ -9,6 +9,12 @@
     try { return new URLSearchParams(location.search).get('noEarlyRead') === '1'; } catch (_) { return false; }
   })();
 
+  // The other arm of the open-path A/B: `?bulkRead=1` forces the whole-file ingest, so the range-backed
+  // mount (?see web/ko.worker.js) can be measured against it in one build.
+  const NO_EXTERNAL = (() => {
+    try { return new URLSearchParams(location.search).get('bulkRead') === '1'; } catch (_) { return false; }
+  })();
+
   const $ = (id) => document.getElementById(id);
 
   const els = {
@@ -66,7 +72,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=93');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=97');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -225,7 +231,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=93');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=97');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -941,7 +947,8 @@
       let openFrame = null;
       try {
         r = await call('openPreview', Object.assign({ blob, spec: readSpec(), mode: state.mode },
-                                                    NO_EARLY_READ ? { noEarlyRead: true } : {}), null, 120000);
+                                                    NO_EARLY_READ ? { noEarlyRead: true } : {},
+                                                    NO_EXTERNAL ? { bulkRead: true } : {}), null, 120000);
         if (r && r.image) openFrame = r;
       } catch (e) {
         // A worker that predates the command, or any failure inside it, still opens — just in two steps.
@@ -1690,7 +1697,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=93');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=97');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };

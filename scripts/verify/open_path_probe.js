@@ -15,7 +15,7 @@
 (() => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  async function openArm({ book, noEarlyRead, label, timeoutMs = 120000 }) {
+  async function openArm({ book, noEarlyRead, bulkRead, label, timeoutMs = 180000 }) {
     const t0 = performance.now();
     const blob = await (await fetch(book)).blob();
     const fetchMs = performance.now() - t0;
@@ -40,7 +40,8 @@
       // Posted BEFORE the worker could have finished init: `new Worker()` returns immediately and the
       // message is queued behind module evaluation, so the read starts as early as the engine allows.
       worker.postMessage(Object.assign({ id: 1, cmd: 'openPreview', blob, mode: 1 },
-                                       noEarlyRead ? { noEarlyRead: true } : {}));
+                                       noEarlyRead ? { noEarlyRead: true } : {},
+                                       bulkRead ? { bulkRead: true } : {}));
     });
 
     const wallMs = performance.now() - startAt;
@@ -58,6 +59,14 @@
       blobBootOverlapMs: t.blobBootOverlapMs,
       wasmMemcpyMs: t.wasmMemcpyMs,
       engineLoadMs: t.engineLoadMs,
+      engineSpanMs: t.engineSpanMs,
+      earlyReadSkipReason: t.earlyReadSkipReason,
+      externalCrossings: t.externalCrossings,
+      externalPhysicalBytes: t.externalPhysicalBytes,
+      externalPctOfFile: t.externalPctOfFile,
+      externalRamReads: t.externalRamReads,
+      externalReadMs: t.externalReadMs,
+      heapAfterLoadBytes: t.heapAfterLoadBytes,
       buildMs: t.buildMs,
       renderMs: t.renderMs,
       composeMs: t.composeMs,
@@ -67,8 +76,9 @@
     };
   }
 
+  // The open-path A/B for the read-ahead, on the BULK path (the only one with a read to overlap).
   async function abPair(book) {
-    const base = { book };
+    const base = { book, bulkRead: true };
     const early = await openArm(Object.assign({}, base, { label: 'read-ahead ON', noEarlyRead: false }));
     const serial = await openArm(Object.assign({}, base, { label: 'read-ahead OFF (control)', noEarlyRead: true }));
     return {
@@ -82,7 +92,20 @@
     };
   }
 
+  // Range-backed mount vs whole-file ingest: the P4 measurement.
+  async function mountAB(book) {
+    const ext = await openArm({ book, label: 'range-backed mount' });
+    const bulk = await openArm({ book, label: 'whole-file ingest (control)', bulkRead: true });
+    return {
+      book,
+      external: ext,
+      bulk,
+      openWorkerMsSaved: +((bulk.totalOpenWorkerMs || 0) - (ext.totalOpenWorkerMs || 0)).toFixed(1),
+    };
+  }
+
   window.__openArm = openArm;
   window.__openAB = abPair;
+  window.__mountAB = mountAB;
   return 'harness ready';
 })()

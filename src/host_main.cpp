@@ -10,6 +10,7 @@
 #include <algorithm>   // std::sort, std::max_element (spine distribution)
 #include <numeric>     // std::accumulate
 #include <chrono>
+#include <fstream>   // --external: range reads straight off the real file
 #include <memory>
 #include <string>
 #include <sys/stat.h>
@@ -24,6 +25,13 @@
 // Layout (parse + paginate) and rasterize (glyphs + quantize) have completely
 // different optimization strategies, so measure before touching either.
 using Clock = std::chrono::steady_clock;
+
+// NEGATIVE CONTROL ONLY. `--drop-gray-planes` makes a 1-bit export skip the two gray passes, which is
+// what an audit once proposed as an optimization on the theory that a 1-bit consumer reads only the BW
+// plane. It does not: addMonoPage() turns grey pixels into ink dots and uses them to thin AA ink, and
+// the preview compositor reads the same planes. The flag exists so scripts/verify/mono_planes_gate.py
+// can DEMONSTRATE that dropping them changes the container; nothing in the product may set it.
+static bool g_dropGrayPlanes = false;
 static double msSince(const Clock::time_point& t0) {
   return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
@@ -38,20 +46,31 @@ int main(int argc, char** argv) {
             "          [--text-aa|--no-text-aa] [--font kopub|ridibatang] [--kopub-external blob]\n"
             "          [--external-font kopub|ridibatang blob] [--no-kern]\n"
             "          [--screen-margin N | --margin-bottom N]\n"
-            "[--manifest PATH] [--dump-planes DIR] [--max-pages N] [--external]\n",
+            "[--manifest PATH] [--dump-planes DIR] [--max-pages N] [--external] [--drop-gray-planes]\n",
             argv[0]);
     return 2;
   }
   const std::string epubPath = argv[1];
   const std::string outPath = argc > 2 ? argv[2] : "out.xtch";
 
+  // `--external` is pre-scanned because it changes how the book is read AT ALL: the range-backed mount
+  // must not be preceded by the very bulk read it exists to avoid, or the host would be measuring a
+  // memory cost it never pays. Everything else still reads the file the ordinary way.
+  bool preExternal = false;
+  for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--external") preExternal = true;
+
   FILE* f = fopen(epubPath.c_str(), "rb");
   if (!f) { fprintf(stderr, "cannot open %s\n", epubPath.c_str()); return 1; }
   fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
+  const long sz = ftell(f);
   fseek(f, 0, SEEK_SET);
-  std::vector<uint8_t> epubBytes(sz);
-  if (fread(epubBytes.data(), 1, sz, f) != static_cast<size_t>(sz)) { fclose(f); return 1; }
+  if (sz < 0) { fclose(f); fprintf(stderr, "cannot size %s\n", epubPath.c_str()); return 1; }
+  const size_t fileSizeBytes = static_cast<size_t>(sz);
+  std::vector<uint8_t> epubBytes;
+  if (!preExternal) {
+    epubBytes.resize(fileSizeBytes);
+    if (fread(epubBytes.data(), 1, fileSizeBytes, f) != fileSizeBytes) { fclose(f); return 1; }
+  }
   fclose(f);
 
   display.begin();
@@ -116,11 +135,37 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i++) {
     if (std::string(argv[i]) == "--owned") useOwned = true;
     if (std::string(argv[i]) == "--external") useExternal = true;
+    if (std::string(argv[i]) == "--drop-gray-planes") g_dropGrayPlanes = true;
     if (std::string(argv[i]) == "--three-pass") driver.setThreePass(true);
     if (std::string(argv[i]) == "--spine-hrefs") hrefSweep = true;
   }
   bool loaded;
-  if (useOwned) {
+  if (useExternal) {
+    // Range-backed mount: the file is NEVER read into memory. Every read the ZIP/OPF parser makes is
+    // served from a 256 KiB aligned window fetched through this callback, so the byte-identity gate
+    // exercises exactly the code path the browser's FileReaderSync bridge drives — without a browser.
+    if (fileSizeBytes == 0) {
+      fprintf(stderr, "empty file %s\n", epubPath.c_str());
+      return 1;
+    }
+    // A real pread per window, on a handle kept open for the life of the mount.
+    static std::ifstream reader;
+    reader.open(epubPath, std::ios::binary);
+    if (!reader) {
+      fprintf(stderr, "cannot open %s for range reads\n", epubPath.c_str());
+      return 1;
+    }
+    auto pread = [](void* ctx, size_t offset, uint8_t* dst, size_t len) -> int {
+      std::ifstream* f = static_cast<std::ifstream*>(ctx);
+      f->clear();                                   // a previous EOF must not poison the next read
+      f->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+      if (!*f) return -1;
+      f->read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(len));
+      const std::streamsize got = f->gcount();
+      return got > 0 ? static_cast<int>(got) : -1;
+    };
+    loaded = driver.loadEpubFromExternal(fileSizeBytes, epubPath, pread, &reader);
+  } else if (useOwned) {
     auto* owned = static_cast<uint8_t*>(std::malloc(epubBytes.size()));
     if (!owned) {
       fprintf(stderr, "out of memory for the owned mount\n");
@@ -139,6 +184,18 @@ int main(int argc, char** argv) {
   const double tLoad = msSince(tLoad0);
   fprintf(stderr, "loaded: title='%s' spines=%d  [load %.1f ms]\n", driver.title().c_str(),
           driver.spineCount(), tLoad);
+  if (useExternal) {
+    // The number that decides whether this is worth shipping: physical bytes against file size. A mount
+    // that reads the whole archive has gained nothing over the bulk path and should not be enabled.
+    const ExternalStats& es = externalStats();
+    fprintf(stderr,
+            "EXTERNAL file=%lld bytes, crossings=%zu, physical=%zu (%.1f%% of file), ram reads=%zu, "
+            "read %.1f ms\n",
+            static_cast<long long>(fileSizeBytes), es.calls, es.bytes,
+            fileSizeBytes == 0 ? 0.0
+                              : 100.0 * static_cast<double>(es.bytes) / static_cast<double>(fileSizeBytes),
+            es.hits, es.readMs);
+  }
 
   if (hrefSweep) {
     // Read every spine href, then read them AGAIN after stack-churning work. spineHref() used to return a
@@ -388,7 +445,10 @@ int main(int argc, char** argv) {
       ko::RenderedPage rp;
       ko::ManifestPage probe;
       t0 = Clock::now();
-      if (!driver.renderPage(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine)) {
+      // Gray planes are always rendered (see g_dropGrayPlanes): a 1-bit container's writer consumes
+      // them, so `monoOnly` is only ever true from the negative-control flag.
+      const bool monoOnly = g_dropGrayPlanes && writer.mode() == ko::XtcMode::Mono1Bit;
+      if (!driver.renderPage(p, spec, rp, manifestPath.empty() ? nullptr : &probe, spine, monoOnly)) {
         fprintf(stderr, "  page %d failed\n", p);
         continue;
       }

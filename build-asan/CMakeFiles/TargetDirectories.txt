@@ -1,7 +1,0 @@
-/Users/patryk/krxtc/ko-wasm/build-asan/CMakeFiles/libjpeg_turbo_ext.dir
-/Users/patryk/krxtc/ko-wasm/build-asan/CMakeFiles/koengine.dir
-/Users/patryk/krxtc/ko-wasm/build-asan/CMakeFiles/ko_xtch_host.dir
-/Users/patryk/krxtc/ko-wasm/build-asan/CMakeFiles/export_external_font.dir
-/Users/patryk/krxtc/ko-wasm/build-asan/CMakeFiles/verify_external_font.dir
-/Users/patryk/krxtc/ko-wasm/build-asan/CMakeFiles/edit_cache.dir
-/Users/patryk/krxtc/ko-wasm/build-asan/CMakeFiles/rebuild_cache.dir

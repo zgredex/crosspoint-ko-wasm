@@ -1,9 +1,15 @@
 # CMake build outputs
 build/
 build-wasm/
-# reference-build trees (compiled from the pinned CrossPoint-KO checkout)
+# Reference-build trees (compiled from the pinned CrossPoint-KO checkout)
 build-oracle/
 build-oracle-perturbed/
+
+# The ASAN host + its ExternalProject tree. This was MISSING, and on 2026-09-19 a `git add -A` swept the
+# whole directory into a commit: 733 files / 99.3 MB of object files, static libraries and CMake stamp
+# files, pushed to origin. Everything else here is a build output pattern for exactly this reason — an
+# untracked build directory must never be one .gitignore line away from being committed.
+build-asan/
 
 # Python caches
 __pycache__/

@@ -459,6 +459,15 @@ KO_EXPORT int ko_load_epub_owned(uint8_t* data, size_t size, const char* virtual
 // browser. Counting lives in Blob::fillWindow, so both hosts report the same numbers of the same events.
 typedef int (*KoExternalReadFn)(void* ctx, size_t offset, uint8_t* dst, size_t len);
 
+#if defined(__EMSCRIPTEN__)
+// The EM_JS bridge has no context parameter (the source is whatever the page installed), so it needs a
+// trampoline to match the storage's callback shape. The host passes EngineDriver its pread directly.
+static int ko_blob_read_trampoline(void* ctx, size_t offset, uint8_t* dst, size_t len) {
+  (void)ctx;
+  return ko_blob_read_sync(offset, dst, len);
+}
+#endif
+
 // Mount an EPUB whose bytes live outside this address space and parse it WITHOUT making it resident.
 // Nothing is adopted and nothing is copied, so there is no ownership transfer: the source must outlive
 // the mount. Returns the spine count, or -1.
@@ -470,7 +479,7 @@ KO_EXPORT int ko_load_epub_external(int size, const char* virtualPath) {
   // The reader is passed in, not looked up: the browser's is the EM_JS bridge and the host's is a pread,
   // and the storage must not care which. Counting happens in Blob::fillWindow for both.
 #if defined(__EMSCRIPTEN__)
-  const KoExternalReadFn reader = ko_blob_read_sync;
+  const KoExternalReadFn reader = ko_blob_read_trampoline;
 #else
   const KoExternalReadFn reader = nullptr;   // host passes its pread to EngineDriver directly
 #endif
@@ -649,12 +658,6 @@ KO_EXPORT double ko_image_perf(int which) {
   }
 }
 
-// 1-bit consumers (XTC preview, XTC export) only read the BW plane; monoOnly skips the gray passes.
-KO_EXPORT int ko_render_page_mode(int pageIndex, int monoOnly) {
-  if (!g_driver || g_currentSpine < 0) return -1;
-  return g_driver->renderPage(pageIndex, g_spec, g_page, nullptr, g_currentSpine, monoOnly != 0) ? 0 : -1;
-}
-
 KO_EXPORT int ko_render_page(int pageIndex) {
   if (!g_driver || g_currentSpine < 0) return -1;
   // (the per-render reset lives in Driver::renderPage, so it also covers ko_render_page_mode and export)
@@ -727,11 +730,13 @@ KO_EXPORT int ko_export_spine(int spine) {
   const int n = g_driver->buildSection(spine, g_spec);
   if (n < 0) return -1;
   const int before = g_totalPages;
-  // Same rule as ko_encode_spine: a 1-bit container never stores the gray planes, so do not render them.
-  const bool monoSerial = (g_xtch->mode() == ko::XtcMode::Mono1Bit);
+  // The gray planes are ALWAYS rendered, even for a 1-bit container. `addMonoPage` reads them: grey
+  // pixels become ink dots, and with AA on, solid ink is thinned using them, so a 1-bit page is not a
+  // function of the BW plane alone. Skipping the gray passes therefore changes the container — measured,
+  // and asserted by scripts/verify/mono_planes_gate.py. Do not "optimize" this away.
   for (int p = 0; p < n; p++) {
     ko::RenderedPage rp;
-    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0, monoSerial)) continue;
+    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0, false)) continue;
     g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
     g_totalPages++;
   }
@@ -827,10 +832,9 @@ KO_EXPORT int ko_encode_spine(int spine) {
   int rendered = 0;
   for (int p = 0; p < n; p++) {
     ko::RenderedPage rp;
-    // A 1-bit container stores no gray planes, so rendering them is dead work — and on an AA-off image
-    // page each gray pass is another full image decode. Only ever mono when the writer is Mono1Bit.
-    const bool mono = (w.mode() == ko::XtcMode::Mono1Bit);
-    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0, mono)) continue;
+    // Same rule as the serial path: the gray planes are consumed by the 1-bit writer, so they are always
+    // rendered. See the note in ko_export_spine().
+    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0, false)) continue;
     w.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
     rendered++;
   }

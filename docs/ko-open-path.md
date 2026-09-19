@@ -201,13 +201,16 @@ unattributed. It now measures the whole chain from the file being chosen to the 
 the accounting closes. Twelve MB novel, measured in the browser:
 
 ```
-worker totalOpenWorkerMs   55.1   render 34.0 + engineLoad 8.7 + build 4.5 + memcpy 1.4 + compose 1.3
-page side                   9.9   mainBeforeRenderMs 8.9 + canvasDrawMs 1.2 + frameWaitMs 0.2
-loadCallMs                 56.1   (the round trip the page waits on)
-firstFrameMs               67.2
+worker totalOpenWorkerMs   36.0   render 24.8 (+build 0.2 +compose 0.7) + engineLoad 1.8 + memcpy 1.7 + read 5.4
+page side                   6.5   mainBeforeRenderMs 5.6 + canvasDrawMs 0.7 + frameWaitMs 0.2
+loadCallMs                 36.3   (the round trip the page waits on)
+firstFrameMs               43.2
+                    36.3 + 5.6 + 0.7 + 0.2 = 42.8  ~= 43.2  (nothing unattributed)
 ```
 
-So the "missing ~29 ms" was not engine initialisation: it was the cover **render** — the earlier ~32 ms
+So the "missing ~29 ms" was not engine initialisation. The `initWaitMs` that the read-ahead was meant to
+overlap measures **0** in this flow (the module is initialised long before a file is picked), which rules
+engine startup out directly rather than by subtraction. What is left is the cover **render** — the earlier ~32 ms
 sum used a cached-cover figure of 16.5 ms for a page that costs ~34 ms on a cold open — plus ~10 ms of
 page-thread work (title, state, canvas blit) that nothing had been measuring at all.
 
@@ -218,30 +221,118 @@ work cannot sit between the user and page 1. `load` is unchanged and still what 
 Verified `singleRoundTrip: true` with no fallback taken; the page keeps a two-step fallback for a worker
 that predates the command.
 
-## The read/init overlap: implemented, measured, and smaller than it looks
+## The read/init overlap: measured against a control, and it fires
 
-The read now starts before `await initPromise` (reading a File needs no engine), and
-`blobBootOverlapMs` reports what that actually bought. Measured: **0.3 ms**. That is the honest size of the
-win here, and the reason is structural, not a missing optimisation: this app initialises the module when
-the page loads, while the user picks a file seconds later, so there is almost nothing left outstanding to
-overlap. It would only pay where the read genuinely competes with a cold init. Reported as mechanism
-verified, benefit ~0 in the picker flow — not as a latency win.
+The read starts before `await initPromise` (reading a Blob needs no engine), and `blobBootOverlapMs`
+reports what that bought. Measured with a fresh worker whose module is re-fetched and re-compiled, so
+init is genuinely still running when the load arrives — which is the only situation the overlap can pay in:
 
-## Mono-only rendering for 1-bit output
+```
+12 MB novel, one build, one flag (noEarlyRead)
+  read-ahead ON    initWaitMs 5.2   blobReadMs 10.6   blobWaitAfterInitMs 5.3   blobBootOverlapMs 5.3
+  read-ahead OFF   initWaitMs 4.1   blobReadMs  9.1   blobWaitAfterInitMs 9.0   blobBootOverlapMs 0.1
+```
 
-`ko_render_page_mode(page, mono)` plus a `monoOnly` path in `renderPage`: no capture, no gray passes, no
-plane copies. A 1-bit container stores no gray planes, so all of that is dead work. The export loops pass
-it only when the writer is `XtcMode::Mono1Bit`, never inferred from a number. `image_once_gate` covers
-1-bit byte-for-byte, so it verifies the polarity in both directions.
+Overlap = `min(read, init)` exactly, as arithmetic predicts: 5.3 ms of a 10.6 ms read is hidden.
 
-Measured decodes per image, one image per page, all four combinations: **1** — for 1-bit and 2-bit, AA on
-and AA off. The AA-off figure is not what this change predicts (AA-off was expected to keep decoding in
-the gray passes); it is recorded as measured and unexplained rather than presented as a win.
+In the *picker* flow it is ~0, for a structural reason worth stating: this app initialises the module when
+the page loads and the user picks a file seconds later, so there is nothing outstanding to overlap. The
+win exists on a cold first visit, and it is bounded by `min(read, cold-init)` — not by the book size.
+
+One interaction that had to be handled or the overlap would have destroyed the range-backed mount below:
+a read-ahead on a book that is about to be range-mounted would read all 80 MB into an ArrayBuffer nobody
+awaits. The threshold check needs only `blob.size` and `FileReaderSync`, both known before init, so the
+decision is made up front and `earlyReadSkipReason: 'external'` records why there is no overlap rather
+than leaving a missing number to be misread.
+
+## Not ingesting the file at all: the range-backed mount {#range-mount}
+
+The bulk path makes the whole archive resident before parsing starts: on the 80 MB fixture, **72.5 ms of
+read + 17.7 ms of copy** to make 80 MB available, when page 1 touches a fraction of it. The storage can
+instead mount a file whose bytes are *outside* the address space and fetch aligned 256 KiB windows on
+demand. Two hosts implement one callback — `FileReaderSync` over the page's Blob in the browser, `pread`
+on the host — so the same code path is gateable without a browser.
+
+Browser, engineSpanMs (read+copy+parse), and the demand counters:
+
+| book | bulk | range-backed | demand | crossings |
+|---|---|---|---|---|
+| 80 MB | 86.3 ms | **5.0 ms** | 796,920 B — **0.9 %** | 7 |
+| 12 MB | 8.1 / 10.0 ms | 3.6 / 5.5 ms | 1,032,332 B — 8.2 % | 4 |
+
+Whole open on the 80 MB fixture: `totalOpenWorkerMs` **93.3 → 17.3 ms**. The demand is ~1 MB and roughly
+*constant* (0.9 % of 80 MB, 8.2 % of 12 MB), which is why the saving grows with the book while the cost
+does not — and why `EXTERNAL_MIN_BYTES` is 6 MiB: measured bulk ≈ 1.15 ms/MB against a ~4-5 ms constant
+mount, so the crossover is ~4 MB. Below the threshold the bulk path is already a millisecond or two, and an
+aligned window can over-fetch past a small file (322 KB fixture: 118.8 %).
+
+Caveat, measured not assumed: the **first** external mount in a page pays a one-time cost (~3.5 ms per
+crossing on the earliest 12 MB run, ~0.7-1 ms warm), so a book just above the threshold can be a wash on
+the first open of a session. The 76 ms win at 80 MB is far outside that noise.
+
+Equivalence is gated, because a mount that changes the bytes would be worthless however fast it is:
+`external_gate.py` requires **external == owned == copy, byte-identical, on 7 fixtures × 2 modes**, plus a
+fired-instrumentation check, a window-cache-hit check, and a truncated file that must fail the mount
+rather than parse short. A `pread` out of range is refused by `Blob::externalSize`, not served.
+
+## Mono-only rendering for 1-bit output: rejected, with the evidence kept
+
+The proposal was that a 1-bit consumer reads only the BW plane, so a 1-bit preview or export could skip
+both gray passes and save a full extra image decode per page. **The premise is false in this codebase**,
+in two places:
+
+* `xtch_writer.h::addMonoPage()` reads `lsb`/`msb` — `thinSolid = textAa_ && haveGray` — turning grey
+  pixels into ink dots and thinning anti-aliased ink with them;
+* `wasm_api.cpp::ko_compose_rgba()` reads them too: *"A 1-bit page is never a pure function of the BW
+  plane: grey pixels become ink dots."*
+
+It was implemented anyway (an earlier batch took the premise on trust and `image_once_gate` cannot see it:
+that gate compares one build against itself, and the flag is not one of its variables). Measured with the
+control that does see it — 1-bit export with the gray planes dropped vs not:
+
+```
+ko-text        15,227 differing bytes
+ko-textref     26,950 differing bytes
+demo-png       26,950 differing bytes
+2-bit                0 differing bytes (the flag is 1-bit-specific)
+```
+
+So it was not free, it was a silent corruption of every 1-bit export and preview. `ko_render_page_mode`
+and the worker's `renderPageEngine(page, mono)` are **gone** rather than left as a switch, every product
+path passes `false`, and the capability survives only as `ko_xtch_host --drop-gray-planes` — the negative
+control that `mono_planes_gate.py` asserts is off by default and still able to demonstrate the corruption.
+
+## The spine-href accessor: real UB, and the gate that can actually see it
+
+`spineHref()` returned `const std::string&` bound to `epub_->getSpineItem(i).href`, but `getSpineItem()`
+returns `SpineEntry` **by value** — so the reference outlived the temporary that owned the string, and
+short hrefs were read out of a dead stack frame (the `䏆` / U+070F U+0006 garbage). It returns
+`std::string` by value now, and `ko_get_spine_href()` assigns directly instead of through a
+`const auto& item` binding that would silently reintroduce the UB if the accessor ever reverted.
+
+Two findings about the *evidence*, because the fix is the easy part:
+
+* **`--spine-hrefs` cannot fail.** With the reference form reinstated it printed
+  `SPINE_HREFS ok — 3 and 10 spines, 0 differing/ill-formed` on every fixture. It reads the href
+  immediately after the call, so it copies out of the poisoned slot while it is still intact.
+  `tools/spine_href_repro.cpp` row A is that case; row B is the same read with one intervening call, and
+  it corrupts. The sweep's docstring used to claim it "turns that UB into a plain failure — and under ASAN
+  it is a use-after-return report". Both halves were false and are corrected in place.
+* **ASAN does not work on this host.** A trivial `clang -fsanitize=address` program hangs (killed at 20 s).
+  So there is no stack-use-after-return report to point at, and no ASAN evidence is claimed anywhere.
+
+The gate is `spine_href_gate.py`: static assertions on the accessor and every caller, plus the repro
+compiled at `-O0` and `-O3` where the buggy arm must corrupt (or abort inside libc++ with a corrupted
+string length) and the fixed arm must hold. `spine_href_control.py` reinstates the bug and the gate fails
+by name — the check that the gate is not decorative.
 
 ## Knobs added for measuring
 
 * host `--mount-only` — isolate mount from parse (this is how the copy cost above was measured);
 * host `--image-rendering N` — 0 show / 1 placeholder / 2 hidden (isolates decode from the rest of the page);
-* host `--chunk N` and `--owned` — the incremental and adopting paths, for `incremental_gate.py` and the
-  owned-vs-copied comparison;
-* worker `streamEpub: true` and the `timing` command.
+* host `--chunk N`, `--owned` and `--external` — the incremental, adopting and range-backed paths, for
+  `incremental_gate.py`, the owned-vs-copied comparison and `external_gate.py`;
+* host `--drop-gray-planes` — the P5 negative control; never a product path.
+* worker `streamEpub`, `timing`, `openPreview`, `noEarlyRead` (the read-ahead control) and `bulkRead`
+  (the whole-file-ingest control) — each exists so a claim about the open path has a baseline in the same
+  build. `?noEarlyRead=1` / `?bulkRead=1` are the page-level spellings.

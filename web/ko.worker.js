@@ -350,10 +350,15 @@ function _frameFromEngine() {
   return img;
 }
 
-// 1-bit callers (XTC preview/export) read only the BW plane, so the engine can skip both gray passes.
-// Falls back to the plain entry point if this module predates ko_render_page_mode.
-function renderPageEngine(page, mono) {
-  if (api._ko_render_page_mode) return api._ko_render_page_mode(page, mono ? 1 : 0);
+// ONE render entry point for both modes.
+//
+// There used to be a `ko_render_page_mode(page, monoOnly)` here that skipped the two gray passes for
+// 1-bit output, on the theory that a 1-bit consumer reads only the BW plane. It does not: the XTG writer
+// turns grey pixels into ink dots and (with AA on) uses them to thin solid ink, and the preview
+// compositor reads the same two planes. Skipping them changed the exported 1-bit container by thousands
+// of pixels — measured, see scripts/verify/mono_planes_gate.py — so the entry point is gone rather than
+// left as a flag somebody could switch back on.
+function renderPageEngine(page) {
   return api._ko_render_page(page);
 }
 
@@ -407,7 +412,7 @@ function schedulePrefetch(spine, page, pages, mono, rk, fStamp, gen) {
     if (frameCache.has(nk)) return;
     // Always preceded by a real render of the requested page, so the engine's planes can never be
     // composed as the wrong page here.
-    if (renderPageEngine(next, mono) !== 0) return;
+    if (renderPageEngine(next) !== 0) return;
     const nextImg = mono ? composeMono() : composePage();
     frameCachePut(nk, nextImg.data, true);         // never transferred → the cache takes ownership
     COUNTERS.prefetches += 1;
@@ -891,6 +896,35 @@ function withCString(str, fn) {
 // section layout, so this is the difference between "wait for the chapter" and "wait for one page".
 const FIRST_PAGES = 1;      // enough for the requested page to exist
 const BUILD_CHUNK = 4;      // pages per continuation tick
+
+// Range-backed mounting threshold. MEASURED, not guessed.
+//
+// The parser's demand is ~0.8-1 MB of ZIP directory + OPF + TOC + one section almost REGARDLESS of book
+// size, so the cost of this path is roughly constant while the cost it replaces grows with the file:
+//
+//   bulk    ~= size x (read ~0.9 ms/MB + copy ~0.22 ms/MB)   (browser, memory-backed Blob)
+//   external ~= 4-7 window crossings, ~1 MB            ~= 3.6-5.5 ms for BOTH a 12 MB and an 80 MB book
+//
+// Measured engineSpanMs (read+copy+parse) in the browser: 12 MB — bulk 8.1/10.0 vs external 3.6/5.5;
+// 80 MB — bulk 86.3 vs external 5.0, which takes the whole open from 93.3 to 17.3 ms. Demand was 8.2%
+// of the 12 MB novel and 0.9% of the 80 MB archive. The crossover is therefore ~4 MB, and 6 MiB leaves
+// margin above it. Below the threshold the bulk path is already a millisecond or two and an aligned
+// window can over-fetch past a small file (322 KB fixture: 118.8%).
+//
+// Caveat, measured not assumed: the FIRST external mount in a page pays a one-time cost (~3.5 ms per
+// crossing on the earliest 12 MB run, ~0.7-1 ms once warm). A book just above this threshold may be a
+// wash on the very first open of a session; the win at 80 MB is 76 ms, which no such cost can erase.
+const EXTERNAL_MIN_BYTES = 6 * 1024 * 1024;
+
+// Why the read-ahead was not started for the load currently in flight: 'external' (the range-backed
+// mount will serve the bytes), 'none' (nothing to read ahead), or null when it did start.
+let earlyReadSkipReason = null;
+
+// Range-mount instrumentation: 0 window fetches, 1 bytes crossed, 2 reads served from RAM, 3 ms in reader.
+function extStat(which) {
+  if (!api || !api._ko_external_stat) return 0;
+  return Math.round(api._ko_external_stat(which));
+}
 let sectionGen = 0;         // bumped by anything that replaces the live section
 let sectionEstimates = {};
 
@@ -925,8 +959,14 @@ async function continueSection(spine, gen, chunk) {
 // `early` = {promise, startedAt} for a read the caller started BEFORE awaiting initPromise. The read needs
 // no engine, so on a cold page load the module's fetch/compile and the file read overlap instead of
 // running back to back. Everything below is otherwise unchanged, including the ownership contract.
+// `engineSpanMs` (set below on every path) is read+alloc+copy+parse. It is deliberately NOT called
+// totalLoadMs: the load COMMAND continues after this returns — font re-apply, title, spec, text
+// reference — and that tail is reported separately as `loadCommandMs`.
 async function loadEngineBook(data, timing, early) {
   const t0 = performance.now();
+  // A previous book's Blob must not stay referenced: the reader would keep 80 MB of File alive after
+  // the book was replaced. Each load path re-installs what it needs (the external branch, below).
+  self.__koBookBlob = null;
   if (data.epub) {
     const bytes = new Uint8Array(data.epub);
     const tCopy = performance.now();
@@ -938,7 +978,7 @@ async function loadEngineBook(data, timing, early) {
     const n = api._ko_load_epub(ptr, bytes.length, '/book.epub');
     timing.engineLoadMs = performance.now() - t;
     api._free(ptr);                       // ko_load_epub copies; this buffer stays ours
-    timing.totalLoadMs = performance.now() - t0;
+    timing.engineSpanMs = performance.now() - t0;
     return n;
   }
   const blob = data.blob;
@@ -963,12 +1003,49 @@ async function loadEngineBook(data, timing, early) {
         const t = performance.now();
         const n = api._ko_load_epub_owned(ptr, size, '/book.epub');
         timing.engineLoadMs = performance.now() - t;
-        timing.totalLoadMs = performance.now() - t0;
+        timing.engineSpanMs = performance.now() - t0;
         return n;   // ownership went with the call, in both outcomes
       }
       api._free(ptr);                     // streaming failed: the buffer is still ours
       timing.streamFallback = true;
     }
+  }
+
+  // ---- RANGE-BACKED MOUNT (P4) -------------------------------------------------------------------
+  // Before reading anything: if the engine can serve reads on demand, hand it the FILE itself and let
+  // the parser touch only what page 1 needs. Measured on the host: the 80 MB fixture mounts in 0.3 ms
+  // after fetching 0.9% of the file (7 crossings), against 44 ms of read + 14 ms of copy in the browser
+  // to make all 80 MB resident. The demand is roughly CONSTANT (~0.8-1 MB of ZIP directory + OPF + TOC +
+  // one section) regardless of book size, which is what makes the win scale: 8.2% of a 12 MB novel,
+  // 0.9% of an 80 MB archive, and 100% of a 322 KB one — where the bulk path is already ~1 ms and the
+  // aligned window would fetch more than the file. Hence the threshold below.
+  //
+  // FileReaderSync is what makes this possible: it is synchronous, exists in dedicated workers (which is
+  // all this file ever is), and reads a Blob slice without materialising the whole file.
+  if (!data.epub && blob && api._ko_load_epub_external && !data.bulkRead
+      && blob.size >= EXTERNAL_MIN_BYTES && typeof FileReaderSync !== 'undefined') {
+    self.__koBookBlob = blob;              // the reader bridge fetches windows out of this
+    const tExt = performance.now();
+    const n = api._ko_load_epub_external(blob.size, '/book.epub');
+    timing.engineLoadMs = performance.now() - tExt;
+    timing.path = 'range+external';
+    timing.blobReadMs = 0;                 // nothing is read up front; the windows are the read
+    timing.wasmMemcpyMs = 0;
+    timing.wasmAllocMs = 0;
+    if (n >= 0) {
+      timing.externalCrossings = extStat(0);
+      timing.externalPhysicalBytes = extStat(1);
+      timing.externalRamReads = extStat(2);
+      timing.externalReadMs = +extStat(3).toFixed(2);
+      timing.externalPctOfFile = blob.size ? +(100 * timing.externalPhysicalBytes / blob.size).toFixed(1) : 0;
+      timing.engineSpanMs = performance.now() - t0;
+      return n;
+    }
+    // The mount refused: fall through to the bulk path, which needs its own read. Nothing was adopted
+    // and nothing was freed (the storage only ever borrowed the Blob), so there is no ownership trap
+    // here — unlike the owned path, where a second read would be reading freed memory.
+    self.__koBookBlob = null;
+    timing.externalFallback = true;
   }
 
   // The read and the heap allocation are independent, so start the read first and allocate while it is
@@ -982,6 +1059,7 @@ async function loadEngineBook(data, timing, early) {
   } else {
     readStartedAt = performance.now();
     readPromise = blob.arrayBuffer();
+    timing.earlyReadSkipReason = earlyReadSkipReason || undefined;
   }
   const tAlloc = performance.now();
   const ptr = api._ko_epub_alloc ? api._ko_epub_alloc(blob.size) : api._malloc(blob.size);
@@ -1016,7 +1094,7 @@ async function loadEngineBook(data, timing, early) {
     const t = performance.now();
     const n = api._ko_load_epub_owned(ptr, bytes.length, '/book.epub');
     timing.engineLoadMs = performance.now() - t;
-    timing.totalLoadMs = performance.now() - t0;
+    timing.engineSpanMs = performance.now() - t0;
     return n;
   }
   // The copying path exists only for a module whose API predates ko_load_epub_owned: here the buffer
@@ -1026,7 +1104,7 @@ async function loadEngineBook(data, timing, early) {
   const n = api._ko_load_epub(ptr, bytes.length, '/book.epub');
   timing.engineLoadMs = performance.now() - t;
   api._free(ptr);
-  timing.totalLoadMs = performance.now() - t0;
+  timing.engineSpanMs = performance.now() - t0;
   return n;
 }
 
@@ -1041,8 +1119,21 @@ self.onmessage = async (ev) => {
     //
     // `noEarlyRead` is the CONTROL for measuring it: the same build, the same book, one variable — the
     // read either starts before `await initPromise` or after it, exactly as it did before this change.
+    //
+    // NOT WHEN THE RANGE-BACKED MOUNT WILL TAKE THE BOOK. That path never materialises the file, so
+    // starting `arrayBuffer()` here would read all 80 MB into an ArrayBuffer nobody awaits — paying the
+    // exact cost the mount exists to avoid, plus a transient allocation that survives until GC. The
+    // decision needs only the Blob's size and FileReaderSync, both of which are known NOW, so it is made
+    // now instead of after init. If the engine turns out not to have the entry point, the bulk path
+    // simply reads on the spot (`early` is null) and loses only the overlap.
+    const externalPlanned = (cmd === 'load' || cmd === 'openPreview') && !!ev.data.blob && !ev.data.epub
+        && !ev.data.bulkRead && !ev.data.streamEpub
+        && ev.data.blob.size >= EXTERNAL_MIN_BYTES
+        && (typeof api !== 'undefined' && api && api._ko_load_epub_external
+              ? true                                             // known-present engine: certain
+              : typeof FileReaderSync !== 'undefined');            // cold start: the entry point is in every shipped build
     if ((cmd === 'load' || cmd === 'openPreview') && ev.data.blob && !ev.data.streamEpub
-        && !ev.data.noEarlyRead && typeof ev.data.blob.arrayBuffer === 'function') {
+        && !externalPlanned && !ev.data.noEarlyRead && typeof ev.data.blob.arrayBuffer === 'function') {
       const promise = ev.data.blob.arrayBuffer();
       promise.catch(() => {});            // init may fail first; do not surface an unhandled rejection
       earlyRead = { promise, startedAt: performance.now() };
@@ -1050,6 +1141,9 @@ self.onmessage = async (ev) => {
     const tInit0 = performance.now();
     await initPromise;   // engine ready before any command
     const initWaitMs = performance.now() - tInit0;
+    // Say WHY there is no read-ahead when there is none. Without this, a missing blobBootOverlapMs reads
+    // as "the overlap stopped working" instead of "the range-backed mount owns the read".
+    earlyReadSkipReason = earlyRead ? null : (externalPlanned ? 'external' : 'none');
     switch (cmd) {      case 'ping': {
         const vp = api._ko_version();
         const ver = api.UTF8ToString ? api.UTF8ToString(vp) : String(vp);
@@ -1128,8 +1222,10 @@ self.onmessage = async (ev) => {
             return;
           }
         }
-        // totalLoadMs is set by loadEngineBook (it owns the whole sequence, including the font re-apply
-        // deadline above it); nothing to add here.
+        // `engineSpanMs` stops when the parse stops. It does NOT cover the font re-apply above, the
+        // title read, the spec apply or the text-reference lookup — none of which loadEngineBook can
+        // see. The command-wide number is loadCommandMs, taken here, so nothing is left implied.
+        loadTiming.loadCommandMs = +(performance.now() - t0Open).toFixed(2);
         // Spine labels are NOT sent here: one label per spine in front of the first page buys nothing,
         // and an omnibus has thousands. The page asks for them in batches once the first frame is up.
         // Where the reference reader would open: its own text reference, not always spine 0. The page
@@ -1217,7 +1313,7 @@ self.onmessage = async (ev) => {
         const buildMs = performance.now() - tBuild0;
         const wantMono = ev.data.mode === 0;
         const tRender0 = performance.now();
-        const rc = renderPageEngine(0, wantMono);
+        const rc = renderPageEngine(0);
         if (rc !== 0) {
           post(id, false, { error: 'first page render failed', timing: loadTiming });
           return;
@@ -1327,7 +1423,7 @@ self.onmessage = async (ev) => {
         tick('renderPage');
         COUNTERS.renders += 1;
         const tRenderStart = performance.now();
-        const rc = renderPageEngine(page, wantMono);
+        const rc = renderPageEngine(page);
         tock('renderPage');
         const renderMs = performance.now() - tRenderStart;
         const imgPerf = readImagePerf();

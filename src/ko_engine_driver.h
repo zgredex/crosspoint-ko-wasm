@@ -304,8 +304,12 @@ class EngineDriver {
     ko::setImageDitherOptions(opts);
   }
 
-  // `monoOnly` is for 1-bit output (XTC preview and export): the consumer reads only the BW plane, so the
-  // two gray planes are pure waste — and on an AA-off image page they are a full extra image decode each.
+  // `monoOnly` skips both gray passes. It is a NEGATIVE CONTROL, not an optimization — kept so
+  // scripts/verify/mono_planes_gate.py can demonstrate why. Dropping the gray passes changes a 1-bit
+  // container: the XTG writer's addMonoPage() reads them (grey pixels become ink dots; with AA on, solid
+  // ink is thinned with them) and so does the preview compositor, so a 1-bit page is not a function of
+  // the BW plane. Measured: thousands of differing pixels on a text fixture. Every product path passes
+  // false; only `ko_xtch_host --drop-gray-planes` passes true.
   bool renderPage(int pageIndex, const Spec& spec, RenderedPage& out, ManifestPage* probe = nullptr,
                   int spineIndex = 0, bool monoOnly = false) {
     if (!section_) return false;

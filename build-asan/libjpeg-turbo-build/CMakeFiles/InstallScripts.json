@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/Users/patryk/krxtc/ko-wasm/build-asan/libjpeg-turbo-build/cmake_install.cmake",
-		"/Users/patryk/krxtc/ko-wasm/build-asan/libjpeg-turbo-build/md5/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
