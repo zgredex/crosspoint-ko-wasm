@@ -13,6 +13,14 @@
 #     visible-text offsets, viewport geometry, spec. Enforced as byte-identical layout
 #     manifests, so there is no tolerance to argue about.
 #
+#   LAYER 2a — TEXT RASTER PARITY (MANDATORY, per page)
+#     the BW/LSB/MSB planes of every page that contains NO images must be byte-identical to the
+#     reference's. The Korean fork owns everything up to and including text rasterisation, so text
+#     coverage is not "ours to improve". Image-bearing pages are excluded BY CONTRACT (blue-noise
+#     dithering, a different decoder and the preview palette are XTCKO additions past the parity
+#     boundary) — which is exactly why this is per page and not per book: one illustration must not
+#     be able to hide a text-plane divergence on every other page.
+#
 #   LAYER 2 — PERCEPTUAL (the conformance requirement for pixels)
 #     a page fails only if a reader could SEE the difference as typography: content moved
 #     (best integer shift removes the difference), a pixel changed by a visible tone step
@@ -116,6 +124,19 @@ if [ -z "$FIXTURES" ]; then
   [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-symbols.epub"
 fi
 
+# --- 3a. text-plane comparator control ----------------------------------------
+# A comparator that cannot fail would report PASS for every book, so the first rendered fixture's planes are
+# perturbed by one bit and the comparison is required to catch it.
+if [ -d "$WORK/ko-text.port.planes" ]; then
+  echo "== control: the text-plane comparator must be able to fail =="
+  if python3 scripts/verify/text_plane_parity.py "$WORK/ko-text.port.planes" "$WORK/ko-text.oracle.planes" \
+       "$WORK/ko-text.port.json" --self-control 2>&1 | sed 's/^/  /'; then
+    ok "text-plane comparator control"
+  else
+    bad "text-plane comparator did not catch a flipped bit — the layer above certifies nothing"
+  fi
+fi
+
 # --- 3. sensitivity control ---------------------------------------------------
 if [ "$SENSITIVITY" = 1 ]; then
   echo "== sensitivity: perturb the reference's KoPub glyph advances =="
@@ -185,9 +206,13 @@ for fx in $FIXTURES; do
   fi
   name="$(basename "$fx" .epub)"
   echo "== $fx =="
+  # --dump-planes rides along with the render that is already happening, so the per-page text-raster
+  # comparison below costs a directory walk rather than a second render.
   "$PORT_BIN" "$REPO_ROOT/$fx" "$WORK/$name.port.xtch" --manifest "$WORK/$name.port.json" \
+    --dump-planes "$WORK/$name.port.planes" \
     >"$WORK/$name.port.log" 2>&1 || { bad "port failed on $fx (see $WORK/$name.port.log)"; continue; }
   "$ORACLE_BIN" "$REPO_ROOT/$fx" "$WORK/$name.oracle.xtch" --manifest "$WORK/$name.oracle.json" \
+    --dump-planes "$WORK/$name.oracle.planes" \
     >"$WORK/$name.oracle.log" 2>&1 || { bad "reference failed on $fx (see $WORK/$name.oracle.log)"; continue; }
 
   # CONTROL: a manifest that carries no pages certifies nothing.
@@ -208,6 +233,19 @@ for fx in $FIXTURES; do
     bad "$name: LAYER 1 FAILED — layout manifest differs"
     python3 scripts/verify/layout_diff.py "$WORK/$name.port.json" "$WORK/$name.oracle.json" | head -14 | sed 's/^/     /'
     continue
+  fi
+
+  # LAYER 2a — TEXT RASTER PARITY: MANDATORY, per page.
+  # The Korean fork owns everything up to and including text rasterisation, so on a page with no images
+  # the BW/LSB/MSB planes must be byte-identical to the reference's. Image-bearing pages are the ones
+  # where XTCKO is allowed to differ (blue-noise dithering, a different decoder), so they are reported
+  # and never judged. Whole-container equality cannot express that distinction: one illustration would
+  # hide a text divergence on every other page of the book.
+  if python3 scripts/verify/text_plane_parity.py "$WORK/$name.port.planes" "$WORK/$name.oracle.planes" \
+       "$WORK/$name.port.json" 2>&1 | sed 's/^/     /'; then
+    ok "$name: LAYER 2a text raster parity — every image-free page's planes are byte-identical"
+  else
+    bad "$name: LAYER 2a FAILED — a TEXT page's planes differ from the reference"
   fi
 
   # The mechanical figure, reported and NOT gated (see --strict-planes). Byte equality is

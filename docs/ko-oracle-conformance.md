@@ -409,3 +409,58 @@ Stated rather than glossed:
 - **Layer 2 is sampled on long books** (40 evenly spread pages above 60 pages). That is a
   deliberate trade: the exact layer covers every page, the perceptual layer is a smoke test
   for rasterization, and 1,690 pages × ~2 s in Python is an hour per run.
+
+
+---
+
+## The parity boundary, and the two raster tiers
+
+The normative reference is the default branch of `crosspoint-reader-ko/crosspoint-reader-ko` —
+`release/korean`, pinned at `84a39194dfce1ebd772ac9163df0a59daa0d72dc` (`1.5.0-ko.3`). `master` has no
+authority over XTCKO output; it is useful only for tracing history. The standard for every audit is:
+
+> Would `release/korean` put this exact glyph at this exact pixel, and break the line and the page here?
+> If not, the text path is wrong.
+
+The Korean fork owns everything up to and including text rasterisation. XTCKO's additions sit after that:
+
+```
+EPUB → KO parsing/CSS → KO font metrics → KO line breaking → KO pagination → KO glyph placement
+     → KO text coverage                         ──── PARITY BOUNDARY ────
+                                                 XTCKO: preview/compositing, image dithering,
+                                                 extra export formats, pooling, range-backed
+                                                 loading, custom fonts, UI, diagnostics
+```
+
+That is why we do not "improve" Korean typography even when an alternative looks nicer.
+
+### Raster is two tiers, not one
+
+| Tier | Contract | Gate |
+|---|---|---|
+| **Text raster** | MANDATORY, exact. BW/LSB/MSB planes of every image-free page, byte for byte. | `LAYER 2a` (`scripts/verify/text_plane_parity.py`) |
+| **Image raster** | XTCKO may intentionally differ: blue-noise dithering, decoder, preview palette. | excluded from 2a; measured in `LAYER 2` |
+
+`LAYER 3` whole-container equality remains a diagnostic (`--strict-planes` makes it a requirement for
+like-for-like host comparisons). Measuring the same thing per page is what makes the distinction
+enforceable: a single illustration would otherwise hide a text-plane divergence on every other page.
+Current state, enforced: `demo.epub` 1616 image-free pages byte-identical with 74 image pages excluded;
+`demo-images`/`demo-png` 4 and 9; each ko-* text fixture 1–3 pages, 0 exclusions.
+
+### The font object is proven, not assumed
+
+The reference face is not "KoPub at 14 pt" — it is the Korean fork's own runtime font data:
+
+1. the pin proves `lib/EpdFont/**` and `lib/EpdFont/builtinFonts/source/KoPub-Batang/KoPub Batang
+   Light.ttf` are **byte-identical** to the reference (93 font files, 0 divergent);
+2. the conformance gate REQUIRES `build/verify_external_font` and fails without it, asserting every
+   `advanceX` bit-identical (`U+AC00` = 437 fp4 = 27.3125 px, not `27 << 4`), the full kern matrix, and
+   exact bitmap bytes against that embedded face.
+
+Together those two steps mean the runtime font object is identical to the reference's by construction,
+not by measurement — there is no independent font implementation in the port to drift.
+
+`.epdfont` v1 stores `uint8_t advanceX` and reconstructs `advanceX << 4`, so it can express 27.0000 or
+28.0000 but never 27.3125. It must therefore never carry a reference face (hence EPD2), and the custom
+font feature is an explicit EXTENSION: same layout algorithm, different face, no parity claim. A future
+`.epdfont` v2 with fp4 advances plus kerning is the right place for that, not the reference path.
