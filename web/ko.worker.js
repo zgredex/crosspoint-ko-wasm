@@ -345,7 +345,13 @@ function _stage(name, fn) {
 // (~1.5 MB), not per-pixel work. The engine-side compose and its single 32-bit store per
 // pixel are unaffected.
 function _frameFromEngine() {
-  const src = new Uint8ClampedArray(api.HEAPU8.buffer, api._ko_rgba_ptr(), 480 * 800 * 4);
+  const rgbaPtr = api._ko_rgba_ptr();
+  if (!rgbaPtr) {
+    // Composing is the only thing that makes the framebuffer readable, and it reports its own failure. A
+    // null pointer here must not become a view at HEAP offset 0, which is a valid address holding garbage.
+    throw new Error('no committed RGBA frame: compose must succeed before reading it');
+  }
+  const src = new Uint8ClampedArray(api.HEAPU8.buffer, rgbaPtr, 480 * 800 * 4);
   const img = new ImageData(480, 800);
   img.data.set(src);
   return img;
@@ -1100,7 +1106,13 @@ async function loadEngineBook(data, timing, early) {
     timing.earlyReadSkipReason = (early && early.skipReason) || undefined;
   }
   const tAlloc = performance.now();
-  const ptr = api._ko_epub_alloc ? api._ko_epub_alloc(blob.size) : checkedMalloc(blob.size, 'loadEngineBook:buf');
+  let ptr = 0;
+  // The allocation and the read are independent, so the heap can be claimed while the read is in flight —
+  // but then a read that FAILS (a cancelled File, an I/O error) left the claim standing. `ownershipSettled`
+  // records that the normal path has already decided this buffer's fate; anything else is freed below.
+  let ownershipSettled = false;
+  try {
+  ptr = api._ko_epub_alloc ? api._ko_epub_alloc(blob.size) : checkedMalloc(blob.size, 'loadEngineBook:buf');
   timing.wasmAllocMs = performance.now() - tAlloc;
   if (!ptr) {
     await readPromise.catch(() => {});
@@ -1129,6 +1141,7 @@ async function loadEngineBook(data, timing, early) {
     // transferred memory, and the api._free() that path ends with would be a double free. A parse
     // failure is also not something a copy would fix: the same bytes would fail identically.
     timing.path = 'read+adopt';
+    ownershipSettled = true;             // the call consumes the buffer on success AND on failure
     const t = performance.now();
     const n = api._ko_load_epub_owned(ptr, bytes.length, '/book.epub');
     timing.engineLoadMs = performance.now() - t;
@@ -1142,8 +1155,12 @@ async function loadEngineBook(data, timing, early) {
   const n = api._ko_load_epub(ptr, bytes.length, '/book.epub');
   timing.engineLoadMs = performance.now() - t;
   api._free(ptr);
+  ownershipSettled = true;   // freed here, so the guard must not free it again
   timing.engineSpanMs = performance.now() - t0;
   return n;
+  } finally {
+    if (ptr && !ownershipSettled) api._free(ptr);
+  }
 }
 
 
@@ -1167,7 +1184,9 @@ let replacementsPending = 0;
 const SAFE_DURING_REPLACEMENT = new Set(['ping', 'bootstats', 'stats']);
 
 function checkedMalloc(size, what) {
-  if (!Number.isSafeInteger(size) || size <= 0) {
+  // Number.isSafeInteger() is a JS-integer test, not an ABI test: this module is memory32 and its file I/O
+  // is `int`, so anything above MAX_WASM_BOOK_BYTES is not representable in the layer being allocated for.
+  if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_WASM_BOOK_BYTES) {
     throw new Error(what + ': invalid allocation size ' + size);
   }
   const ptr = api._malloc(size);          // the ONE place that calls the allocator directly
@@ -1239,19 +1258,33 @@ function requireWorkerBook(id, op) {
 // book, so the two disagree about what is loaded. openPreview is ONE transaction: either there is a usable
 // first page, or there is no book.
 function abortBookOpen() {
-  try {
-    if (api && api._ko_unload_book) api._ko_unload_book();
-  } catch (_) {}
   self.__koBookBlob = null;
   invalidateSection();
-  bookGen += 1;                 // anything already posted for the abandoned attempt is stale now
+  if (!api || !api._ko_unload_book) {
+    // Without an unload entry point there is no way to reach the invariant this function exists to
+    // enforce, so continuing would leave a half-book behind while the page believes otherwise.
+    const e = new Error('fatal: cannot roll back book transaction');
+    e.fatal = true;
+    throw e;
+  }
+  // If THIS throws, the engine is not trustworthy and continuing is not defensive.
+  api._ko_unload_book();
+  // beginWorkerBookReplacement() performs the single bookGen increment, so stale frames and already-posted
+  // progress for the abandoned attempt are invalidated exactly once.
   beginWorkerBookReplacement();
 }
 
 async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
-  // ONE transaction: either this book ends up usable, or there is no book. A failure AFTER the
-  // EPUB parsed (font re-apply, spec, startSpine, first render, compose) used to leave the worker
-  // holding the new book while the page had already cleared itself and reported failure.
+  // ONE transaction: either this book ends up usable, or there is no book. A failure AFTER the EPUB parsed
+  // (font re-apply, spec, startSpine, first render, compose) used to leave the worker holding the new book
+  // while the page had already cleared itself and reported failure.
+  //
+  // The rollback lives in `finally`, NOT in a catch. Every expected failure below reports itself with
+  // `post(id, false, ...); return;` — and a return never enters a catch, so an exception-only rollback was
+  // bypassed by exactly the most likely failures. `committed` is set only after the success reply has been
+  // posted, so there is no exit path that has to remember to clean up.
+  let transactionStarted = false;
+  let committed = false;
   try {
   if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); return; }
   if (!api) await init();
@@ -1265,11 +1298,12 @@ async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
   // Each worker reads the same Blob instead.
   dropWarmResult();     // §3: warm bytes belong to the previous book
   invalidateSection();
-  beginWorkerBookReplacement();     // BEFORE the engine is touched, so a failed parse cannot leave A
+  // BEFORE the engine is touched, so a failed parse cannot leave the previous book's state in place.
+  beginWorkerBookReplacement();
+  transactionStarted = true;
   loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
   spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
   loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength : (ev.data.blob ? ev.data.blob.size : 0);
-  void 0;   // (see validateBookInput: the size contract is enforced before any allocation)
   loadTiming.heapAfterLoadBytes = api.HEAPU8.buffer.byteLength;
   if (spineCount < 0) {
     post(id, false, { error: 'Epub::load failed' });
@@ -1303,10 +1337,10 @@ async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
   const startSpine = api._ko_text_reference_spine ? api._ko_text_reference_spine() : 0;
   finishWorkerBookLoad();
   post(id, true, { bookGen, spineCount, title, startSpine, timing: loadTiming });
+  committed = true;                    // the reply is out: this transaction is committed
 
-  } catch (e) {
-    abortBookOpen();
-    throw e;
+  } finally {
+    if (transactionStarted && !committed) abortBookOpen();
   }
 }
 
@@ -1314,13 +1348,17 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
   // ONE transaction: either this book ends up usable, or there is no book. A failure AFTER the
   // EPUB parsed (font re-apply, spec, startSpine, first render, compose) used to leave the worker
   // holding the new book while the page had already cleared itself and reported failure.
+  let transactionStarted = false;
+  let committed = false;
   try {
   if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); return; }
   if (!api) await init();
   await stopWarmBeforeMutation();
   dropWarmResult();
   invalidateSection();
-  beginWorkerBookReplacement();     // BEFORE the engine is touched, so a failed parse cannot leave A
+  // BEFORE the engine is touched, so a failed parse cannot leave the previous book's state in place.
+  beginWorkerBookReplacement();
+  transactionStarted = true;
   loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
   spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
   loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength
@@ -1380,12 +1418,12 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
                           renderTiming(tRender0, buildMs, renderMs, composeMs, false, readImagePerf()),
                           { totalOpenWorkerMs: +(performance.now() - t0Open).toFixed(2) }),
   }, [tx]);
+  committed = true;                     // the reply is out: this transaction is committed
   // The rest of the spine keeps building behind the drawn frame.
   continueSection(startSpine, gen, BUILD_CHUNK);
 
-  } catch (e) {
-    abortBookOpen();
-    throw e;
+  } finally {
+    if (transactionStarted && !committed) abortBookOpen();
   }
 }
 
@@ -1422,6 +1460,9 @@ self.onmessage = async (ev) => {
     // now instead of after init. If the engine turns out not to have the entry point, the bulk path
     // simply reads on the spot (`early` is null) and loses only the overlap.
     const loadCmd = cmd === 'load' || cmd === 'openPreview';
+    // Before the early read is created, not inside loadEngineBook: an early `arrayBuffer()` would otherwise
+    // start pulling a book this ABI cannot represent, and the rejection would arrive after the read.
+    if (loadCmd) validateBookInput(ev.data);
     const externalPlanned = loadCmd && !!ev.data.blob && !ev.data.epub
         && !ev.data.bulkRead && !ev.data.streamEpub
         && ev.data.blob.size >= EXTERNAL_MIN_BYTES
@@ -2118,7 +2159,7 @@ case 'openPreview': {
     // under -fno-exceptions). The engine is poisoned after an abort — flag
     // fatal so the app respawns the worker instead of retrying a dead engine.
     const msg = String(e && e.message || e);
-    const fatal = /abort|runtime|out of memory|allocation/i.test(msg);
+    const fatal = e?.fatal === true || /abort|runtime|out of memory|allocation/i.test(msg);
     try { post(id, false, { error: msg, fatal }); } catch (_) {}
     if (fatal) {
       // give the reply a moment to flush, then die loudly (app respawns)

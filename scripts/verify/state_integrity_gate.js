@@ -111,7 +111,86 @@ function check(ok, label, detail) {
   const oneshot = api._ko_render_xtch();
   check(oneshot > 0 || oneshot === 0, 'ko_render_xtch succeeds on a healthy book', `pages=${oneshot}`);
 
-  // ---- 6. valid E, and the state is still coherent ------------------------------------------------
+  // ---- 6. a failed render must invalidate the COMPOSED frame too ----------------------------------
+  // The planes and the RGBA framebuffer are committed separately: clearing g_page on failure used to leave
+  // the previous page's pixels readable through ko_rgba_ptr().
+  loadBytes(good);
+  check(api._ko_build_spine(0) >= 0, 'build spine 0 for the rgba test');
+  check(api._ko_render_page(0) === 0, 'render page 0');
+  check(api._ko_compose_rgba(1) === 0, 'compose page 0');
+  const rgbaGood = api._ko_rgba_ptr();
+  check(rgbaGood !== 0, 'rgba_ptr is non-null after a successful compose');
+  check(api._ko_render_page(99999) < 0, 'render of an out-of-range page fails');
+  check(api._ko_plane_size(0) === 0, 'failed render cleared the planes');
+  check(api._ko_rgba_ptr() === 0, 'failed render ALSO invalidated the composed frame');
+  check(api._ko_compose_rgba(1) < 0, 'compose after the failed render is refused');
+
+  // ---- 7. invalid spine indices are refused everywhere (they used to clamp to spine 0) ------------
+  loadBytes(good);
+  const count = api._ko_load_epub ? loadBytes(good) : 0;
+  for (const bad of [-1, count, 2147483647]) {
+    check(api._ko_build_spine(bad) < 0, `build_spine(${bad}) refused`);
+    check(api._ko_start_spine(bad, 1) < 0, `start_spine(${bad}) refused`);
+    check(api._ko_encode_spine(bad) < 0, `encode_spine(${bad}) refused`);
+    check(api._ko_export_begin() > 0, 'export_begin for the invalid-spine case');
+    check(api._ko_export_spine(bad) < 0, `export_spine(${bad}) refused`);
+    check(api._ko_export_finish() < 0, `export_finish refused after export_spine(${bad})`);
+    check(api._ko_xtch_size() === 0, `no container after export_spine(${bad})`);
+    api._ko_export_abort();
+  }
+
+  // ---- 8. a replacement kills an in-flight export ------------------------------------------------
+  check(api._ko_export_begin() > 0, 'export_begin for the replacement case');
+  loadBytes(good);                                        // simulates the book being replaced mid-export
+  check(api._ko_export_finish() < 0, 'export_finish refused after a book replacement');
+  check(api._ko_xtch_size() === 0, 'no container after the replacement-invalidated export');
+  api._ko_export_abort();
+
+  // ---- 9. the assembler is a transaction --------------------------------------------------------
+  // This module exposes HEAPU8 only, so 32-bit fields are written through a view over the heap buffer.
+  const u32 = (ptr, n = 1) => new Uint32Array(api.HEAPU8.buffer, ptr, n);
+  const rec = new Uint8Array(64);
+  const recPtr = api._malloc(rec.length); api.HEAPU8.set(rec, recPtr);
+  const offPtr = api._malloc(4); u32(offPtr)[0] = 0;
+  const lenPtr = api._malloc(4); u32(lenPtr)[0] = rec.length;
+  check(api._ko_assemble_begin(1) === 0, 'assemble_begin on a valid book');
+  check(api._ko_assemble_add_spine(recPtr, rec.length, 1, offPtr, lenPtr) > 0, 'one valid page record');
+  // a truncated record: off + len deliberately past the end of the buffer
+  u32(offPtr)[0] = rec.length;                           // off == size, so off + len > size
+  check(api._ko_assemble_add_spine(recPtr, rec.length, 1, offPtr, lenPtr) < 0,
+        'a truncated page record is refused');
+  check(api._ko_assemble_finish() < 0, 'assemble_finish REFUSES after a bad record');
+  check(api._ko_xtch_size() === 0, 'no container published by the failed assembly');
+  api._ko_export_abort();
+  api._free(recPtr); api._free(offPtr); api._free(lenPtr);
+
+  // ---- 10. the prefix planner is a transaction --------------------------------------------------
+  const lens = new Uint32Array([64, 64]);
+  const lensPtr = api._malloc(lens.length * 4); u32(lensPtr, lens.length).set(lens);
+  check(api._ko_plan_begin(1) === 0, 'plan_begin on a valid book');
+  check(api._ko_plan_add_spine(lensPtr, 2) > 0, 'two planned pages');
+  check(api._ko_plan_add_spine(0, 1) < 0, 'a null length array is refused');
+  check(api._ko_plan_finish() < 0, 'plan_finish REFUSES after a bad add');
+  check(api._ko_plan_prefix_size() === 0, 'no prefix published by the failed plan');
+  api._free(lensPtr);
+
+  // ---- 11. the 16-bit page limit is enforced, not wrapped ---------------------------------------
+  const many = 65536;
+  const bigPtr = api._malloc(many * 4);
+  { const view = u32(bigPtr, many); for (let i = 0; i < many; i++) view[i] = 64; }
+  api._ko_plan_begin(1);
+  check(api._ko_plan_add_spine(bigPtr, many) < 0,
+        '65536 planned pages are refused (the header count is 16 bits)');
+  check(api._ko_plan_finish() < 0, 'the over-limit plan cannot finish');
+  check(api._ko_plan_prefix_size() === 0, 'no prefix for an over-limit plan');
+  api._free(bigPtr);
+
+  // ---- 12. with no book, the assembler and planner refuse ---------------------------------------
+  loadBytes(truncated);
+  check(api._ko_assemble_begin(1) < 0, 'assemble_begin refused with no book');
+  check(api._ko_plan_begin(1) < 0, 'plan_begin refused with no book');
+
+  // ---- 13. valid E, and the state is still coherent ------------------------------------------------
   const nE = loadBytes(good);
   check(nE === nA, 'valid E still loads after everything', `spines=${nE}`);
 

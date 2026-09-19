@@ -135,8 +135,19 @@ static int g_xtchFullReady = 0;
 
 // Export poisoning: while an export is active, an error marks it failed and it can never be finalized.
 // A partial container must be impossible to obtain, not merely unlikely.
+// The RGBA output is a SEPARATE commit from the planes: a failed render clears g_page, but the last
+// composed framebuffer stayed readable through ko_rgba_ptr().
+static bool g_rgbaReady = false;
 static bool g_exportActive = false;
 static bool g_exportFailed = false;
+// Assembler/planner are transactions too: a malformed record must make finishing impossible, so a caller
+// that ignores one -1 cannot publish a partial container or prefix.
+static bool g_asmActive = false;
+static bool g_asmFailed = false;
+static bool g_planActive = false;
+static bool g_planFailed = false;
+static ko::Spec g_exportSpec;             // snapshotted at ko_export_begin()
+static ko::XtcMode g_exportMode = ko::XtcMode::Gray2Bit;
 static std::vector<uint8_t> g_xtchOut;      // finished container bytes (ko_xtch_ptr)
 static std::vector<uint8_t> g_coverData;   // cover BMP bytes (ko_generate_cover)
 static std::string g_coverPath;
@@ -453,7 +464,20 @@ static void clearBookOutputs();
 static void beginBookReplacement() {
   if (g_driver) g_driver->resetBook();
   Storage.clearAll();
-  if (g_xtch) g_xtch->reset();
+  if (g_xtch) {
+    g_xtch->reset();
+    // reset() clears PAGES, not the metadata strings. Without this, a plan/assemble started after a failed
+    // replacement could still adopt the previous book's title/author through adoptMetadataFrom(*g_xtch).
+    g_xtch->setMetadata("", "", "", "");
+  }
+  // Every transaction is over: none of them may be resumed or finalized across a replacement.
+  g_exportActive = false;
+  g_exportFailed = false;
+  g_asmActive = false;
+  g_asmFailed = false;
+  g_planActive = false;
+  g_planFailed = false;
+  g_rgbaReady = false;
   g_chapters.clear();
   g_spineFallback.clear();
   g_chapterCandidates.clear();
@@ -675,8 +699,20 @@ KO_EXPORT size_t ko_cover_size() { return g_coverSize; }
 // ---- pagination + page capture ----------------------------------------------
 
 // Build spine (0-based). Returns page count, or -1 on failure.
+// ONE spine validator. The EPUB accessor clamps an out-of-range index to spine 0, so an unchecked index
+// does not fail — it silently builds, starts, encodes or exports a DIFFERENT spine and reports success.
+static bool requireSpine(int spine, const char* operation) {
+  if (!requireBook(operation)) return false;
+  const int count = g_driver->spineCount();
+  if (spine < 0 || spine >= count) {
+    setError(std::string(operation) + ": spine " + std::to_string(spine) + " out of range");
+    return false;
+  }
+  return true;
+}
+
 KO_EXPORT int ko_build_spine(int spineIndex) {
-  if (!requireBook("build_spine")) return -1;
+  if (!requireSpine(spineIndex, "build_spine")) return -1;
   const int n = g_driver->buildSection(spineIndex, g_spec);
   if (n < 0) {
     setError("section build failed");
@@ -692,7 +728,7 @@ KO_EXPORT int ko_build_spine(int spineIndex) {
 // Lay out enough of a spine for its first page, then extend in chunks. Without this the browser
 // paginates an entire chapter before it may show page 1.
 KO_EXPORT int ko_start_spine(int spine, int initialPages) {
-  if (!requireBook("start_spine")) return -1;
+  if (!requireSpine(spine, "start_spine")) return -1;
   const int n = g_driver->startSection(spine, g_spec, initialPages < 1 ? 1 : initialPages);
   if (n < 0) {
     setError("progressive section start failed");
@@ -746,6 +782,9 @@ KO_EXPORT double ko_image_perf(int which) {
 }
 
 KO_EXPORT int ko_render_page(int pageIndex) {
+  // Every render attempt invalidates the previous compose: the planes and the framebuffer are committed
+  // separately, and a caller that composes nothing must not be able to read the previous page's pixels.
+  g_rgbaReady = false;
   if (!requireBook("render_page") || g_currentSpine < 0) {
     // No book means no page: clear the output rather than leave the previous book's planes readable
     // through ko_plane_ptr/ko_compose_rgba.
@@ -821,11 +860,29 @@ KO_EXPORT void ko_unload_book() {
   beginBookReplacement();
 }
 
+// The ONE way an export becomes failed. It also drops the accumulated container, so a failed export cannot
+// leave bytes readable through ko_xtch_ptr() even if the caller ignores every -1 it was given.
+static int failExport(const std::string& why) {
+  g_exportFailed = true;
+  g_xtchFullReady = 0;
+  g_xtchOut.clear();
+  setError(why);
+  return -1;
+}
+
 KO_EXPORT int ko_export_begin() {
   if (!requireBook("export_begin")) return -1;
   if (!g_driver || !g_xtch) return -1;
+  if (g_exportActive) {
+    setError("export already active");
+    return -1;
+  }
   g_exportActive = true;
   g_exportFailed = false;
+  // Snapshot the settings for the whole transaction: "every page of one export uses one spec" is an engine
+  // invariant here, not a convention the caller has to keep.
+  g_exportSpec = g_spec;
+  g_exportMode = g_xtch->mode();
   g_xtch->reset();
   g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
   g_chapters.clear();
@@ -842,20 +899,19 @@ KO_EXPORT int ko_export_begin() {
 // ACTUALLY added (>=0), or -1 on build failure — the JS side maps spine→page
 // ranges from this return, so it must reflect real page count.
 KO_EXPORT int ko_export_spine(int spine) {
-  if (!requireBook("export_spine") || !g_xtch) return -1;
+  if (!g_xtch) return -1;
+  // No healthy export means no bytes: this refuses a spine appended outside begin()/finish(), and a spine
+  // appended after an earlier failure — either of which would otherwise be finalized as a valid container.
+  if (!g_exportActive || g_exportFailed) return failExport("export_spine: no healthy export");
   // An index outside the book is a caller bug, and buildSection() clamps it: the export used to "succeed"
-  // with a page built from a DIFFERENT spine. Reject it and poison the export like any other failure.
-  if (spine < 0 || spine >= g_driver->spineCount()) {
-    g_exportFailed = true;
-    setError("export spine " + std::to_string(spine) + " is out of range");
-    return -1;
-  }
+  // with a page built from a DIFFERENT spine.
+  if (!requireSpine(spine, "export_spine")) return failExport("export_spine: invalid spine");
   // Re-assert the switch here as well: it can be flipped between
   // ko_export_set_mode() and the page loop, and this is the only place that is
   // guaranteed to run for every exported page.
   g_xtch->setTextAa(textAaEnabled());
-  const int n = g_driver->buildSection(spine, g_spec);
-  if (n < 0) return -1;
+  const int n = g_driver->buildSection(spine, g_exportSpec);
+  if (n < 0) return failExport("section build failed at spine " + std::to_string(spine));
   const int before = g_totalPages;
   // The gray planes are ALWAYS rendered, even for a 1-bit container. `addMonoPage` reads them: grey
   // pixels become ink dots, and with AA on, solid ink is thinned using them, so a 1-bit page is not a
@@ -866,12 +922,14 @@ KO_EXPORT int ko_export_spine(int spine) {
     // FAIL THE WHOLE EXPORT. `continue` here meant a 100-page spine with one bad page produced a
     // "successful" 99-page book — silently wrong output, which is worse than an error, because nothing
     // downstream can tell the difference. The caller gets an error naming the spine and page instead.
-    if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) {
-      g_exportFailed = true;
-      setError("render failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
-      return -1;
+    if (!g_driver->renderPage(p, g_exportSpec, rp, nullptr, 0)) {
+      return failExport("render failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
     }
-    g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
+    // The writer REFUSES past the format's page limit, and an ignored `false` here would ship a container
+    // whose header page count wrapped to zero.
+    if (!g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb)) {
+      return failExport("page encoder refused a page (container page limit or bad planes)");
+    }
     g_totalPages++;
   }
   const int added = g_totalPages - before;
@@ -921,11 +979,12 @@ KO_EXPORT int ko_export_finish() {
     return -1;
   }
   if (!g_xtch) return -1;
-  if (!requireBook("export_finish")) return -1;
+  if (!requireBook("export_finish")) return failExport("book disappeared during export");
   g_chapters = buildChapters(g_chapterCandidates, g_spineFallback,
                              static_cast<uint32_t>(g_totalPages));
   g_xtchOut = g_xtch->finish(g_chapters);
   g_xtchFullReady = 1;
+  g_exportActive = false;                 // the transaction is over; a new export needs a new begin()
   return g_totalPages;
 }
 
@@ -964,8 +1023,10 @@ static std::vector<ko::XtchChapter> g_asmFallback;
 
 // Layout+render+encode one spine into g_enc. Returns the page count, or -1.
 KO_EXPORT int ko_encode_spine(int spine) {
-  if (!requireBook("encode_spine") || !g_xtch) return -1;
+  // Clear the previous encoded spine FIRST: a refused request must not leave the previous spine's bytes
+  // readable through ko_enc_ptr(), which is how a caller that ignores -1 would publish the wrong spine.
   g_enc.reset();
+  if (!requireSpine(spine, "encode_spine") || !g_xtch) return -1;
   // A local writer: a worker's spine must not touch any shared writer state.
   ko::XtchWriter w(g_xtch->mode());
   w.setTextAa(textAaEnabled());
@@ -981,7 +1042,12 @@ KO_EXPORT int ko_encode_spine(int spine) {
       setError("render failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
       return -1;
     }
-    w.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
+    if (!w.addPageFromPlanes(rp.bw, rp.lsb, rp.msb)) {
+      g_enc.reset();
+      g_exportFailed = true;
+      setError("page encode failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
+      return -1;
+    }
     rendered++;
   }
   const int pages = static_cast<int>(w.pageCount());
@@ -1049,12 +1115,20 @@ KO_EXPORT const char* ko_spine_fallback_name() { return g_enc.fallbackName.c_str
 // order the serial path accumulates them in — the shared buildChapters() then caps and stable-sorts
 // exactly as before. Assembly order must not depend on which worker finished first.
 KO_EXPORT int ko_assemble_begin(int mode) {
-  if (!g_xtch) return -1;
+  // A book is REQUIRED: without this, a plan/assemble after a failed replacement could adopt the previous
+  // book's metadata out of g_xtch (reset() clears pages, not the metadata strings).
+  if (!requireBook("assemble_begin") || !g_xtch) return -1;
+  if (g_asmActive) {
+    setError("assemble already active");
+    return -1;
+  }
   g_asm.reset(new ko::XtchWriter(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit));
   g_asm->setTextAa(textAaEnabled());
   g_asm->adoptMetadataFrom(*g_xtch);      // the header carries the book's title/author
   g_asmCandidates.clear();
   g_asmFallback.clear();
+  g_asmActive = true;
+  g_asmFailed = false;
   return 0;
 }
 
@@ -1062,13 +1136,36 @@ KO_EXPORT int ko_assemble_begin(int mode) {
 KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCount,
                                     const uint32_t* offsets, const uint32_t* lengths) {
   if (!g_asm) return -1;
+  if (!g_asmActive || g_asmFailed) {
+    g_asmFailed = true;
+    setError("assemble_add_spine: no healthy assembly");
+    return -1;
+  }
   if (pageCount <= 0) return static_cast<int>(g_asm->pageCount());
-  if (data == nullptr || offsets == nullptr || lengths == nullptr) return -1;
+  if (data == nullptr || offsets == nullptr || lengths == nullptr) {
+    g_asmFailed = true;
+    setError("assemble_add_spine: null record");
+    return -1;
+  }
+  // The format's page count is 16 bits on disk; refuse rather than wrap the header to zero.
+  if (g_asm->pageCount() + static_cast<size_t>(pageCount) > ko::MAX_XTC_PAGES) {
+    g_asmFailed = true;
+    setError("assemble_add_spine: container page limit exceeded");
+    return -1;
+  }
   for (int i = 0; i < pageCount; i++) {
     const uint64_t off = offsets[i];
     const uint64_t len = lengths[i];
-    if (off + len > size) return -1;              // a truncated record must never be assembled
-    if (!g_asm->addRawPage(data + off, static_cast<size_t>(len))) return -1;
+    if (off + len > size) {                       // a truncated record must never be assembled
+      g_asmFailed = true;
+      setError("assemble_add_spine: truncated page record");
+      return -1;
+    }
+    if (!g_asm->addRawPage(data + off, static_cast<size_t>(len))) {
+      g_asmFailed = true;
+      setError("assemble_add_spine: page rejected");
+      return -1;
+    }
   }
   return static_cast<int>(g_asm->pageCount());
 }
@@ -1092,12 +1189,18 @@ KO_EXPORT void ko_assemble_add_fallback(int spineBase, const char* name, int pag
 }
 
 KO_EXPORT int ko_assemble_finish() {
-  if (!g_asm) return -1;
+  // A missed error check upstream must not be able to produce a valid-looking partial file.
+  if (!g_asmActive || g_asmFailed) {
+    setError("cannot finalize failed assembly");
+    return -1;
+  }
+  if (!g_asm || !requireBook("assemble_finish")) return -1;
   const uint32_t total = static_cast<uint32_t>(g_asm->pageCount());
   g_chapters = buildChapters(g_asmCandidates, g_asmFallback, total);
   g_xtchOut = g_asm->finish(g_chapters);
   g_xtchFullReady = 1;
   g_totalPages = static_cast<int>(total);   // the container is now the assembler's
+  g_asmActive = false;
   return g_totalPages;
 }
 
@@ -1123,6 +1226,13 @@ static std::vector<uint8_t> g_planPrefix;
 static int g_planMode = 1;
 
 KO_EXPORT int ko_plan_begin(int mode) {
+  if (!requireBook("plan_begin")) return -1;
+  if (g_planActive) {
+    setError("plan already active");
+    return -1;
+  }
+  g_planActive = true;
+  g_planFailed = false;
   g_planSizes.clear();
   g_planCandidates.clear();
   g_planFallback.clear();
@@ -1133,7 +1243,21 @@ KO_EXPORT int ko_plan_begin(int mode) {
 
 // One spine's page SIZES, in page order. Add spines in spine order.
 KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
-  if (count < 0 || (count > 0 && lengths == nullptr)) return -1;
+  if (!g_planActive || g_planFailed) {
+    g_planFailed = true;
+    setError("plan_add_spine: no healthy plan");
+    return -1;
+  }
+  if (count < 0 || (count > 0 && lengths == nullptr)) {
+    g_planFailed = true;
+    setError("plan_add_spine: null lengths");
+    return -1;
+  }
+  if (g_planSizes.size() + static_cast<size_t>(count) > ko::MAX_XTC_PAGES) {
+    g_planFailed = true;
+    setError("plan_add_spine: container page limit exceeded");
+    return -1;
+  }
   for (int i = 0; i < count; i++) g_planSizes.push_back(lengths[i]);
   return static_cast<int>(g_planSizes.size());
 }
@@ -1155,12 +1279,23 @@ KO_EXPORT void ko_plan_add_fallback(int spineBase, const char* name, int pages) 
 }
 
 KO_EXPORT int ko_plan_finish() {
-  if (!g_xtch) return -1;
+  if (!g_planActive || g_planFailed) {
+    setError("cannot finalize failed plan");
+    g_planPrefix.clear();
+    return -1;
+  }
+  if (!g_xtch || !requireBook("plan_finish")) return -1;
   ko::XtchWriter w(g_planMode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit);
   w.adoptMetadataFrom(*g_xtch);          // the header carries the book's title/author
   const uint32_t total = static_cast<uint32_t>(g_planSizes.size());
   g_chapters = ko::buildChapters(g_planCandidates, g_planFallback, total);
   g_planPrefix = w.buildPrefix(g_chapters, g_planSizes);
+  if (g_planPrefix.empty()) {                 // buildPrefix refuses an over-limit page count
+    g_planFailed = true;
+    setError("plan_finish: prefix build refused");
+    return -1;
+  }
+  g_planActive = false;
   return static_cast<int>(total);
 }
 
@@ -1297,6 +1432,13 @@ static std::vector<uint32_t> g_rgbaOut;  // 480*800 packed RGBA words, allocated
 // reachable through an exported accessor, and a failure half-way through a replacement must not leave
 // bytes from the old book obtainable.
 static void clearBookOutputs() {
+  g_exportActive = false;
+  g_exportFailed = false;
+  g_asmActive = false;
+  g_asmFailed = false;
+  g_planActive = false;
+  g_planFailed = false;
+  g_rgbaReady = false;
   g_enc.reset();
   g_asm.reset();
   g_asmCandidates.clear();
@@ -1311,13 +1453,18 @@ static void clearBookOutputs() {
 
 // Placed after the LAST of the globals it clears, so every identifier is declared above it.
 KO_EXPORT uint8_t* ko_rgba_ptr() {
-  if (g_rgbaOut.size() != 480u * 800u) g_rgbaOut.assign(480u * 800u, 0);
+  // An accessor DESCRIBES committed state; it does not manufacture one. This used to allocate a blank
+  // 480x800 framebuffer on demand, so after a failed render or a book replacement it handed out a
+  // valid-looking all-black page — and JS then built a typed-array view over it.
+  if (!g_rgbaReady || g_rgbaOut.size() != 480u * 800u) return nullptr;
   return reinterpret_cast<uint8_t*>(g_rgbaOut.data());
 }
 
 // mono: 0 = 2-bit page (four shades), 1 = 1-bit page (the ink the XTG file carries:
 // grey pixels blue-noise halftoned to 2 levels, solid ink thinned only with text AA on).
 KO_EXPORT int ko_compose_rgba(int mono) {
+  // Any compose attempt invalidates the previous result; it is re-established below only on success.
+  g_rgbaReady = false;
   // All three planes must be complete. After a book replacement g_page is reset, so the BW plane can
   // exist while the grey ones are empty; composing then read past the end of the smaller buffers. The
   // sizes are the contract, not just the pointers.
@@ -1408,6 +1555,7 @@ KO_EXPORT int ko_compose_rgba(int mono) {
       }
     }
   }
+  g_rgbaReady = true;      // committed: ko_rgba_ptr() may hand this out now
   return 0;
 }
 

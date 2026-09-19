@@ -111,6 +111,12 @@ inline uint64_t transpose8x8(uint64_t x) {
 namespace ko {
 
 // Output mode of the container (mirrors the device's two file magics).
+// The container header stores the page count in 16 bits (out[6] | out[7] << 8) and chapters store their
+// page range as uint16 on disk. So 65535 pages is a hard FORMAT limit and 65536 would wrap the header to
+// zero — a container that says it has no pages while carrying them. Defined once, used by the writer and
+// by both transaction entry points in the wasm API.
+inline constexpr size_t MAX_XTC_PAGES = 65535;
+
 enum class XtcMode {
   Mono1Bit = 0,   // "XTC\0", XTG pages (1-bit fast)
   Gray2Bit = 1,   // "XTCH", XTH pages (2-bit high quality)
@@ -159,6 +165,8 @@ class XtchWriter {
 
   bool addPageFromPlanes(const std::vector<uint8_t>& bw, const std::vector<uint8_t>& lsb,
                          const std::vector<uint8_t>& msb) {
+    if (pageCount() >= MAX_XTC_PAGES) return false;   // see MAX_XTC_PAGES: the header count wraps
+
     constexpr uint16_t LOGICAL_W = 480;
     constexpr uint16_t LOGICAL_H = 800;
     if (mode_ == XtcMode::Mono1Bit) {
@@ -304,6 +312,8 @@ class XtchWriter {
 
   // Append an already-encoded page record verbatim.
   bool addRawPage(const uint8_t* data, size_t size) {
+    if (pageCount() >= MAX_XTC_PAGES) return false;   // see MAX_XTC_PAGES
+
     if (data == nullptr || size < 22) return false;   // every record carries its 22-byte header
     pendingPages_.emplace_back(data, data + size);
     return true;
@@ -333,6 +343,7 @@ class XtchWriter {
   std::vector<uint8_t> buildPrefix(const std::vector<XtchChapter>& chapters,
                                    const std::vector<uint32_t>& pageSizes) const {
     const size_t pageCount = pageSizes.size();
+    if (pageCount > MAX_XTC_PAGES) return {};      // refuse rather than truncate chapter pages
     const size_t chapterCount = chapters.size();
     const uint64_t metadataOffset = 56;
     const uint64_t chapterOffset = metadataOffset + 256;
