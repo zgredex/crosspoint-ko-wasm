@@ -40,6 +40,29 @@ void HalStorage::mountOwnedBlob(const std::string& path, uint8_t* data, size_t s
   }
 }
 
+void HalStorage::mountExternalBlob(const std::string& path, size_t size,
+                                   int (*readFn)(void* ctx, size_t offset, uint8_t* dst, size_t len),
+                                   void* ctx) {
+  const std::string p = normalisePath(path);
+  auto blob = std::make_shared<Blob>();
+  blob->external = true;
+  blob->externalSize = size;
+  blob->readFn = readFn;
+  blob->readCtx = ctx;
+  blob->refresh();                 // sets `size` from externalSize; data stays null on purpose
+  files_[p] = std::move(blob);
+  if (p.find('/') != std::string::npos) {
+    std::string base = p.substr(p.rfind('/') + 1);
+    files_["/" + base] = files_[p];
+  }
+}
+
+// One process-wide counter set: the numbers describe the mount, and there is at most one mounted book.
+ExternalStats& externalStats() {
+  static ExternalStats stats;
+  return stats;
+}
+
 String HalStorage::readFile(const char* path) {
   auto it = files_.find(path ? path : "");
   if (it == files_.end()) return String();

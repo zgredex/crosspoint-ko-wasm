@@ -194,6 +194,50 @@ match. That is consistent with the gate's own design — layout manifests are co
 the reference, raster content perceptually — so the correct control for image work is the port's own
 pre-change build, not the oracle build.
 
+## Startup: what the first frame is actually made of
+
+The profiler used to stop at the worker boundary, which left a large part of a 60 ms first page
+unattributed. It now measures the whole chain from the file being chosen to the first presented frame, and
+the accounting closes. Twelve MB novel, measured in the browser:
+
+```
+worker totalOpenWorkerMs   55.1   render 34.0 + engineLoad 8.7 + build 4.5 + memcpy 1.4 + compose 1.3
+page side                   9.9   mainBeforeRenderMs 8.9 + canvasDrawMs 1.2 + frameWaitMs 0.2
+loadCallMs                 56.1   (the round trip the page waits on)
+firstFrameMs               67.2
+```
+
+So the "missing ~29 ms" was not engine initialisation: it was the cover **render** — the earlier ~32 ms
+sum used a cached-cover figure of 16.5 ms for a page that costs ~34 ms on a cold open — plus ~10 ms of
+page-thread work (title, state, canvas blit) that nothing had been measuring at all.
+
+## One round trip instead of two
+
+`openPreview` returns the book metadata AND the first composed frame together, so title and chapter-list
+work cannot sit between the user and page 1. `load` is unchanged and still what export/pool workers use.
+Verified `singleRoundTrip: true` with no fallback taken; the page keeps a two-step fallback for a worker
+that predates the command.
+
+## The read/init overlap: implemented, measured, and smaller than it looks
+
+The read now starts before `await initPromise` (reading a File needs no engine), and
+`blobBootOverlapMs` reports what that actually bought. Measured: **0.3 ms**. That is the honest size of the
+win here, and the reason is structural, not a missing optimisation: this app initialises the module when
+the page loads, while the user picks a file seconds later, so there is almost nothing left outstanding to
+overlap. It would only pay where the read genuinely competes with a cold init. Reported as mechanism
+verified, benefit ~0 in the picker flow — not as a latency win.
+
+## Mono-only rendering for 1-bit output
+
+`ko_render_page_mode(page, mono)` plus a `monoOnly` path in `renderPage`: no capture, no gray passes, no
+plane copies. A 1-bit container stores no gray planes, so all of that is dead work. The export loops pass
+it only when the writer is `XtcMode::Mono1Bit`, never inferred from a number. `image_once_gate` covers
+1-bit byte-for-byte, so it verifies the polarity in both directions.
+
+Measured decodes per image, one image per page, all four combinations: **1** — for 1-bit and 2-bit, AA on
+and AA off. The AA-off figure is not what this change predicts (AA-off was expected to keep decoding in
+the gray passes); it is recorded as measured and unexplained rather than presented as a win.
+
 ## Knobs added for measuring
 
 * host `--mount-only` — isolate mount from parse (this is how the copy cost above was measured);

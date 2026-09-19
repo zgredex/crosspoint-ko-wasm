@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
             "          [--text-aa|--no-text-aa] [--font kopub|ridibatang] [--kopub-external blob]\n"
             "          [--external-font kopub|ridibatang blob] [--no-kern]\n"
             "          [--screen-margin N | --margin-bottom N]\n"
-            "          [--manifest PATH] [--dump-planes DIR] [--max-pages N]\n",
+            "[--manifest PATH] [--dump-planes DIR] [--max-pages N] [--external]\n",
             argv[0]);
     return 2;
   }
@@ -111,9 +111,11 @@ int main(int argc, char** argv) {
   // --owned exercises the path the browser now takes: an allocation the storage adopts instead of
   // copying. Its bytes must be the same bytes, so the container is compared against the copied mount.
   bool useOwned = false;
+  bool useExternal = false;
   bool hrefSweep = false;
   for (int i = 1; i < argc; i++) {
     if (std::string(argv[i]) == "--owned") useOwned = true;
+    if (std::string(argv[i]) == "--external") useExternal = true;
     if (std::string(argv[i]) == "--three-pass") driver.setThreePass(true);
     if (std::string(argv[i]) == "--spine-hrefs") hrefSweep = true;
   }

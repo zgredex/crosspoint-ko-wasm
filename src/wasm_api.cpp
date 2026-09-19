@@ -19,6 +19,7 @@
 #include "converters/ImagePerf.h"
 #include <cstring>
 #include <algorithm>
+#include <chrono>   // external-read timing (range-backed mount)
 #include <memory>
 #include <string>
 #include <vector>
@@ -29,6 +30,43 @@
 #else
 #define KO_EXPORT
 #endif
+
+// ---- Range-backed EPUB mount (P4) ----------------------------------------------------------------
+// The storage can mount a file whose bytes are NOT in this address space: every read is served from a
+// window the host fills on demand. Two hosts implement the same callback:
+//
+//   * browser — `ko_blob_read_sync` below, reading straight out of the page's File/Blob with
+//     FileReaderSync (worker-only API, and this module only ever runs in a worker).
+//   * host CLI — a pread over the real file, so the byte-identity gate runs without a browser.
+//
+// This is what makes "don't ingest the whole archive before page 1" possible: an 80 MB EPUB costs the
+// ZIP directory plus one section, instead of 44 ms of read + 14 ms of copy to make all 80 MB resident.
+#if defined(__EMSCRIPTEN__)
+EM_JS(int, ko_blob_read_sync, (size_t offset, uint8_t* dst, size_t length), {
+  const blob = self.__koBookBlob;
+  if (!blob) return -1;
+  if (length === 0) return 0;
+  // Blobs are immutable, so slicing is a view, not a copy; FileReaderSync is the only synchronous read
+  // the platform offers and it exists in dedicated workers. Read as a Blob so the browser can satisfy it
+  // from disk rather than materialising the whole file.
+  if (!self.__koBookReader) {
+    if (typeof FileReaderSync === 'undefined') return -1;
+    self.__koBookReader = new FileReaderSync();
+  }
+  const end = Math.min(blob.size, offset + length);
+  if (end <= offset) return 0;
+  let buf;
+  try {
+    buf = self.__koBookReader.readAsArrayBuffer(blob.slice(offset, end));
+  } catch (e) {
+    return -1;                                  // I/O error: surfaced as a failed read, never as EOF
+  }
+  const src = new Uint8Array(buf);
+  HEAPU8.set(src, dst);
+  return src.byteLength;
+});
+#endif
+
 #include <SdFontFamily.h>
 #include "ko_engine_driver.h"
 #include "external_font_loader.h"   // §6: lossless EPD2 built-in font blobs
@@ -415,6 +453,53 @@ KO_EXPORT int ko_load_epub_owned(uint8_t* data, size_t size, const char* virtual
   return resetForNewBook();
 }
 
+// ---- Range-backed mount entry point (P4) ---------------------------------------------------------
+// The reader: in the browser it is the FileReaderSync bridge above; on the host the CLI passes a pread
+// straight to EngineDriver::loadEpubFromExternal, so the same storage code path is gateable without a
+// browser. Counting lives in Blob::fillWindow, so both hosts report the same numbers of the same events.
+typedef int (*KoExternalReadFn)(void* ctx, size_t offset, uint8_t* dst, size_t len);
+
+// Mount an EPUB whose bytes live outside this address space and parse it WITHOUT making it resident.
+// Nothing is adopted and nothing is copied, so there is no ownership transfer: the source must outlive
+// the mount. Returns the spine count, or -1.
+KO_EXPORT int ko_load_epub_external(int size, const char* virtualPath) {
+  if (!g_driver || size <= 0) return -1;
+  Storage.clearAll();                       // fresh FS per book, same as every other load path
+  externalStats().reset();
+  const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
+  // The reader is passed in, not looked up: the browser's is the EM_JS bridge and the host's is a pread,
+  // and the storage must not care which. Counting happens in Blob::fillWindow for both.
+#if defined(__EMSCRIPTEN__)
+  const KoExternalReadFn reader = ko_blob_read_sync;
+#else
+  const KoExternalReadFn reader = nullptr;   // host passes its pread to EngineDriver directly
+#endif
+  if (!reader) {
+    setError("no external reader installed");
+    return -1;
+  }
+  if (!g_driver->loadEpubFromExternal(static_cast<size_t>(size), vp, reader, nullptr)) {
+    setError("Epub::load failed");
+    return -1;
+  }
+  return resetForNewBook();
+}
+
+// Range-mount instrumentation. `which`: 0 window fetches, 1 bytes crossed, 2 reads served from RAM,
+// 3 milliseconds inside the reader. Returns 0 for an unknown index rather than reading out of bounds,
+// because a JS caller passing a bad index must not be able to read arbitrary memory.
+KO_EXPORT double ko_external_stat(int which) {
+  const ExternalStats& s = externalStats();
+  switch (which) {
+    case 0: return static_cast<double>(s.calls);
+    case 1: return static_cast<double>(s.bytes);
+    case 2: return static_cast<double>(s.hits);
+    case 3: return s.readMs;
+    default: return 0.0;
+  }
+}
+
+
 KO_EXPORT int ko_spine_count() { return g_driver ? g_driver->spineCount() : 0; }
 
 // The spine the REFERENCE reader opens at: EpubReaderActivity::onEnter, when opening a book for the
@@ -572,7 +657,7 @@ KO_EXPORT int ko_render_page_mode(int pageIndex, int monoOnly) {
 
 KO_EXPORT int ko_render_page(int pageIndex) {
   if (!g_driver || g_currentSpine < 0) return -1;
-  ko::imagePerfReset();
+  // (the per-render reset lives in Driver::renderPage, so it also covers ko_render_page_mode and export)
   if (!g_driver->renderPage(pageIndex, g_spec, g_page)) {
     setError("page render failed");
     return -1;

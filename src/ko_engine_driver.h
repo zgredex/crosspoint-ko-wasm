@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <Epub.h>
+#include "converters/ImagePerf.h"   // per-render image accounting (reset in renderPage)
 #include <GfxRenderer.h>
 #include <HalDisplay.h>
 #include <HalStorage.h>
@@ -183,6 +184,17 @@ class EngineDriver {
     return openEpub(virtualPath);
   }
 
+  // Range-backed mount: the EPUB is never made resident. `readFn` serves aligned windows on demand from
+  // wherever the bytes actually live (the page's File, a real file on the host). Nothing is copied and
+  // nothing is adopted, so there is no ownership question — the source outlives the mount by contract.
+  bool loadEpubFromExternal(size_t size, const std::string& virtualPath,
+                            int (*readFn)(void* ctx, size_t offset, uint8_t* dst, size_t len),
+                            void* ctx) {
+    if (!readFn || size == 0) return false;
+    Storage.mountExternalBlob(virtualPath, size, readFn, ctx);
+    return openEpub(virtualPath);
+  }
+
   // Shared tail of both entry points; kept in one place so the two cannot drift apart in what they set
   // up (image extractor hook, Epub construction, load arguments).
   bool openEpub(const std::string& virtualPath) {
@@ -297,6 +309,10 @@ class EngineDriver {
   bool renderPage(int pageIndex, const Spec& spec, RenderedPage& out, ManifestPage* probe = nullptr,
                   int spineIndex = 0, bool monoOnly = false) {
     if (!section_) return false;
+    // Per-render image accounting starts here, in the ONE function every entry point goes through. It used
+    // to live in ko_render_page, so when the worker switched to ko_render_page_mode the counters silently
+    // accumulated across renders and reported nonsense (5, 6, 7, 8 for one image per page).
+    ko::imagePerfReset();
     applyImageDitherOptions(spec);
     auto page = section_->loadPage(pageIndex);
     if (!page) return false;

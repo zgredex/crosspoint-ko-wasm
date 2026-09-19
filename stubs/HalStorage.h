@@ -6,6 +6,7 @@
 
 #include <Arduino.h>  // Print, String
 
+#include <chrono>   // range-window read timing
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -22,19 +23,56 @@ constexpr int O_TRUNC = 0x200;
 
 class HalStorage;
 
+// ---- External source statistics -------------------------------------------------------------
+// Counters for the range-backed mount. `calls` is how many times C++ asked the outside world for bytes;
+// `bytes` how many bytes actually crossed; `misses` how many windows had to be fetched. A ZIP walk that
+// reads a whole 80 MB archive through this should show a handful of calls, not thousands — if it does
+// not, the window is too small for the parser's access pattern and the cache is not doing its job.
+struct ExternalStats {
+  // `calls` is window fetches: how many times the outside world was asked for bytes. `hits` is the reads
+  // that did NOT need one — the cache working. `bytes` is what actually crossed, and the number to hold
+  // against the file size: an 80 MB archive whose first page needs 1 MB must not show 80 MB here.
+  size_t calls = 0;
+  size_t bytes = 0;
+  size_t hits = 0;
+  double readMs = 0.0;
+  void reset() { calls = bytes = hits = 0; readMs = 0.0; }
+};
+ExternalStats& externalStats();
+
 // ---- In-memory file handle ------------------------------------------------
-// One in-memory file. Two shapes, because they have different costs:
+// One in-memory file. THREE shapes, because they have different costs:
 //   * writable  — a std::vector, used by everything the engine GENERATES (section caches, extracted
 //                 HTML, metadata cache). Unchanged from before.
 //   * owned     — a view over a buffer somebody else allocated, with a shared_ptr that frees it. This
 //                 exists for the mounted EPUB: the browser streams it straight into the wasm heap, so
 //                 the bytes the ZIP reader walks ARE the bytes the page wrote, with no C++ copy. A
 //                 100 MB book used to be copied again here (vector<uint8_t>(data, data + size)).
+//   * external  — the bytes are NOT in this address space. `readFn` fetches an aligned window on demand
+//                 from whatever holds them (the page's File, a real file on the host). This exists so a
+//                 large EPUB does not have to be made resident before page 1 is parsed: the reader walks
+//                 the ZIP directory and the OPF, and nothing else is ever touched. On the 80 MB fixture
+//                 the bulk path pays 44 ms of read + 14 ms of copy before parsing starts.
 struct Blob {
   const uint8_t* data = nullptr;
   size_t size = 0;
   std::shared_ptr<void> owner;                     // frees `data` when the last reference goes away
   std::shared_ptr<std::vector<uint8_t>> writable;  // non-null iff this file may be written/extended
+
+  // EXTERNAL backing. data stays null and every read is served by readFn through the window below.
+  bool external = false;
+  size_t externalSize = 0;
+  int (*readFn)(void* ctx, size_t offset, uint8_t* dst, size_t len) = nullptr;
+  void* readCtx = nullptr;
+
+  // ONE aligned window, shared by every handle on this file (they share the Blob). The ZIP reader's
+  // access pattern is many small reads around a moving position: per-window rather than per-read
+  // fetching is the whole difference between a few fetches and tens of thousands.
+  static constexpr size_t kWindow = 256 * 1024;
+  std::vector<uint8_t> windowBytes;
+  size_t windowStart = 0;
+  size_t windowValid = 0;
+  bool windowFilled = false;
 
   // A writable file's vector can be reallocated by resize(), so the view is re-derived on demand.
   // BOTH fields are re-read every time: a vector that grows or shrinks WITHIN ITS CAPACITY keeps the
@@ -42,9 +80,56 @@ struct Blob {
   // real content. That bug was caught by the spine count dropping from 10 to 6 with a parse error,
   // because reads were running past the bytes actually written.
   void refresh() {
+    if (external) { size = externalSize; return; }
     if (!writable) return;
     data = writable->data();
     size = writable->size();
+  }
+
+  // Fetch the aligned window containing absolute offset `at`. Returns false when the source refuses.
+  bool fillWindow(size_t at) {
+    if (!readFn || externalSize == 0) return false;
+    const size_t aligned = (at / kWindow) * kWindow;
+    size_t len = externalSize - aligned;
+    if (len > kWindow) len = kWindow;
+    if (windowBytes.size() < len) windowBytes.resize(len);
+    // Counted HERE, once, so the browser bridge and the host CLI produce identical numbers — a wrapper
+    // in the caller would have to be written twice and could drift.
+    ExternalStats& stats = externalStats();
+    const auto t0 = std::chrono::steady_clock::now();
+    stats.calls++;
+    const int got = readFn(readCtx, aligned, windowBytes.data(), len);
+    stats.readMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (got <= 0) return false;
+    stats.bytes += static_cast<size_t>(got);
+    windowStart = aligned;
+    windowValid = static_cast<size_t>(got);
+    windowFilled = true;
+    return true;
+  }
+
+  // Copy `n` bytes at absolute `off` out of the external source. Straddles windows when it has to, and
+  // never reads past externalSize.
+  bool readExternal(size_t off, void* dst, size_t n) {
+    if (!external || !readFn) return false;
+    if (off > externalSize || n > externalSize - off) return false;   // never past the end
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    size_t done = 0;
+    while (done < n) {
+      const size_t at = off + done;
+      if (windowFilled && at >= windowStart && at < windowStart + windowValid) {
+        externalStats().hits++;
+      } else if (!fillWindow(at)) {
+        return false;
+      }
+      const size_t inWindow = at - windowStart;
+      if (inWindow >= windowValid) return false;      // short window at EOF
+      size_t take = windowValid - inWindow;
+      if (take > n - done) take = n - done;
+      memcpy(out + done, windowBytes.data() + inWindow, take);
+      done += take;
+    }
+    return true;
   }
 };
 
@@ -97,6 +182,14 @@ class HalFile : public Print {
   int read(void* buf, size_t count) {
     if (!blob_ || pos_ >= blob_->size) return -1;
     size_t n = std::min(count, blob_->size - pos_);
+    if (blob_->external) {
+      // Range-backed: position alone decides what is fetched, so the caller's read pattern is
+      // unchanged. A window fetch that fails is an I/O error, not EOF — report it as -1 the way the
+      // memory path never has to.
+      if (!blob_->readExternal(pos_, buf, n)) return -1;
+      pos_ += n;
+      return static_cast<int>(n);
+    }
     memcpy(buf, blob_->data + pos_, n);
     pos_ += n;
     return static_cast<int>(n);
@@ -152,6 +245,15 @@ class HalStorage {
   // into the wasm heap, and `owner`'s deleter releases them when the file is dropped (clearAll on the
   // next book). A whole-book copy used to happen here on every open.
   void mountOwnedBlob(const std::string& path, uint8_t* data, size_t size);
+
+  // Mount a file whose bytes live OUTSIDE this address space, fetched a window at a time by `readFn`.
+  // Nothing is made resident: the ZIP directory and one spine's CSS/XHTML are all that a first page
+  // needs, so an 80 MB archive costs a few hundred KB of windows instead of 80 MB of heap plus the
+  // 44 ms read and 14 ms copy it takes to get there. `readFn` returns the bytes written, or <= 0 on
+  // failure; it must not read past `size`.
+  void mountExternalBlob(const std::string& path, size_t size,
+                         int (*readFn)(void* ctx, size_t offset, uint8_t* dst, size_t len),
+                         void* ctx);
 
   std::vector<String> listFiles(const char* path = "/", int maxFiles = 200) { (void)path;
     (void)maxFiles;
@@ -219,7 +321,13 @@ class HalStorage {
       // capacity() for the writable files (a released vector's slack still occupies the heap) and the
       // view size for adopted ones, which own exactly what they claim.
       const_cast<Blob&>(*blob).refresh();
-      total += blob->writable ? blob->writable->capacity() : blob->size;
+      if (blob->external) {
+        // Only the window is actually resident — the book itself is not in this heap. Counting the
+        // whole file here was the shape of claim this accounting exists to refuse.
+        total += blob->windowBytes.capacity();
+      } else {
+        total += blob->writable ? blob->writable->capacity() : blob->size;
+      }
     }
     return total;
   }
