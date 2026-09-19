@@ -108,9 +108,7 @@
     "lib/EpdFont/scripts/requirements.txt": "ef4f32716cb53527fe82297f68c253fee4afc21d",
     "lib/EpdFont/scripts/ttf_to_epdfont.py": "608c88eb56c8914fb7d344b4af48d05c97c1930d",
     "lib/EpdFont/scripts/verify_compression.py": "c2320c78be29fdb3bb57b3e281210f222f49ed21",
-    "lib/Epub/Epub.cpp": "f1b8537485013f3efae5d174db31aefe536c9ac5",
     "lib/Epub/Epub.h": "40ab6f257d75bb63310a33be09e9db646851f05c",
-    "lib/Epub/Epub/BookMetadataCache.cpp": "beb14a1aec076dd734471ac6accff3f2c075e7f5",
     "lib/Epub/Epub/BookMetadataCache.h": "3a479f8e0fcf1fb53ca9b64fd939ad3762f53679",
     "lib/Epub/Epub/FootnoteEntry.h": "6034a6a5c3937d01dc016db504cf1a13e3f1a683",
     "lib/Epub/Epub/Page.cpp": "89dc65eb45e9f69ab387e5aeae16df4b2fd5018d",
@@ -217,6 +215,41 @@
         "// table directly on the SD file instead. Only the most-recently matched",
         "// interval is cached so runs of same-script text resolve with zero SD I/O.",
         "// Note: glyphs are NOT preloaded - loaded on-demand to save memory"
+      ]
+    },
+    "lib/Epub/Epub.cpp": {
+      "blob": "f1b8537485013f3efae5d174db31aefe536c9ac5",
+      "port_path": "vendor-lib/Epub/Epub.cpp",
+      "divergence_kind": "additive",
+      "added_lines": 34,
+      "removed_lines": 0,
+      "changed_functions": [
+        "findContentOpfFile",
+        "parseContentOpf",
+        "parseTocNavFile",
+        "parseTocNcxFile"
+      ],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 33,
+      "port_function_count": 33
+    },
+    "lib/Epub/Epub/BookMetadataCache.cpp": {
+      "blob": "beb14a1aec076dd734471ac6accff3f2c075e7f5",
+      "port_path": "vendor-lib/Epub/Epub/BookMetadataCache.cpp",
+      "divergence_kind": "amended",
+      "added_lines": 14,
+      "removed_lines": 2,
+      "changed_functions": [
+        "buildBookBin"
+      ],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 21,
+      "port_function_count": 21,
+      "removed_line_sample": [
+        "int matched = zip.fillUncompressedSizes(targets, spineSizes);",
+        "cumSize += itemSize;"
       ]
     },
     "lib/Epub/Epub/blocks/ImageBlock.cpp": {
@@ -346,7 +379,7 @@
       "blob": "b6b3bd9734a5bb39206381c49c60320821bf3c76",
       "port_path": "vendor-lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp",
       "divergence_kind": "amended",
-      "added_lines": 164,
+      "added_lines": 169,
       "removed_lines": 184,
       "changed_functions": [
         "decodeToFramebuffer",
@@ -382,7 +415,7 @@
       "blob": "8bb2067d1584bd3ae804983a6cfada6cadc27956",
       "port_path": "vendor-lib/Epub/Epub/converters/PngToFramebufferConverter.cpp",
       "divergence_kind": "amended",
-      "added_lines": 164,
+      "added_lines": 169,
       "removed_lines": 90,
       "changed_functions": [
         "decodeToFramebuffer",
@@ -546,8 +579,8 @@
     ]
   },
   "counts": {
-    "identical": 154,
-    "divergent": 13,
+    "identical": 152,
+    "divergent": 15,
     "missing_from_port": 1,
     "reference_engine_files": 168
   }

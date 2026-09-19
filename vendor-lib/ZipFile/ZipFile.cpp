@@ -122,7 +122,10 @@ bool ZipFile::loadAllFileStatSlims() {
     fileStat.method = le16(fixed + 10);
     fileStat.compressedSize = le32(fixed + 20);
     fileStat.uncompressedSize = le32(fixed + 24);
-    fileStat.localHeaderOffset = le32(fixed + 44);
+    // MEASURED, not assumed: the local-header offset is at record byte 42, and offset 42 of a real record
+    // points at PK\x03\x04 for every entry while byte 44 is garbage. Reading 44 here filled the stat cache
+    // with wrong offsets, which no fixture noticed because their reads go through the lazy per-name path.
+    fileStat.localHeaderOffset = le32(fixed + 42);
     const uint16_t nameLen = le16(fixed + 28);
     const uint16_t m = le16(fixed + 30);
     const uint16_t k = le16(fixed + 32);
@@ -286,7 +289,26 @@ long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
 
   const uint16_t filenameLength = pLocalHeader[26] + (pLocalHeader[27] << 8);
   const uint16_t extraOffset = pLocalHeader[28] + (pLocalHeader[29] << 8);
-  return fileOffset + localHeaderSize + filenameLength + extraOffset;
+
+  // Validate the DATA RANGE this returns, not merely the 30-byte header it was computed from: a hostile
+  // filename/extra length used to push the offset past EOF, where the "data" is whatever follows — and the
+  // caller then inflated from there. Every step is a widening, checked addition.
+  const size_t base = static_cast<size_t>(fileOffset);
+  if (filenameLength > SIZE_MAX - base - localHeaderSize) {
+    LOG_ERR("ZIP", "Local header name length overflows the offset");
+    return -1;
+  }
+  size_t dataOffset = base + localHeaderSize + filenameLength;
+  if (extraOffset > SIZE_MAX - dataOffset) {
+    LOG_ERR("ZIP", "Local header extra length overflows the offset");
+    return -1;
+  }
+  dataOffset += extraOffset;
+  if (dataOffset > file.size() || fileStat.compressedSize > file.size() - dataOffset) {
+    LOG_ERR("ZIP", "Compressed data lies outside the file");
+    return -1;
+  }
+  return static_cast<long>(dataOffset);
 }
 
 bool ZipFile::loadZipDetails() {
@@ -346,9 +368,16 @@ bool ZipFile::loadZipDetails() {
   // offset (4). All of them are attacker-controlled until proven otherwise, so nothing here is stored
   // before it has been checked against the file the record claims to describe.
   const uint8_t* eocd = &buffer[foundOffset];
+  const uint16_t diskNumber = le16(eocd + 4);
+  const uint16_t cdStartDisk = le16(eocd + 6);
+  const uint16_t entriesOnDisk = le16(eocd + 8);
   const uint16_t entries = le16(eocd + 10);
   const uint32_t centralDirSize = le32(eocd + 12);
   const uint32_t centralDirOffset = le32(eocd + 16);
+  // Absolute offset of the EOCD RECORD. The central directory has to end before the record that describes
+  // it, not merely before physical EOF — otherwise a directory could be declared into the slack after the
+  // record and still satisfy every "inside the file" test.
+  const size_t eocdAbsolute = fileSize - scanRange + static_cast<size_t>(foundOffset);
   free(buffer);
 
   // ZIP64 sentinels: rejected explicitly rather than interpreted as if they were ordinary values.
@@ -356,8 +385,18 @@ bool ZipFile::loadZipDetails() {
     LOG_ERR("ZIP", "ZIP64 archives are not supported");
     return false;
   }
+  // Multi-disk archives: every offset in them is relative to a disk we do not have, so "the CD is inside
+  // the file" is not even the right question. Reject outright rather than misread the first disk.
+  if (diskNumber != 0 || cdStartDisk != 0 || entriesOnDisk != entries) {
+    LOG_ERR("ZIP", "Multi-disk archives are not supported");
+    return false;
+  }
   if (centralDirOffset > fileSize || centralDirSize > fileSize - centralDirOffset) {
     LOG_ERR("ZIP", "Central directory lies outside the file");
+    return false;
+  }
+  if (centralDirOffset > eocdAbsolute || centralDirSize > eocdAbsolute - centralDirOffset) {
+    LOG_ERR("ZIP", "Central directory does not end before the EOCD record");
     return false;
   }
   if (entries != 0 && static_cast<size_t>(entries) > centralDirSize / ZIP_CD_MIN_ENTRY) {

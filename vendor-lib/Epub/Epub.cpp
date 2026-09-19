@@ -14,6 +14,17 @@
 #include "Epub/parsers/TocNavParser.h"
 #include "Epub/parsers/TocNcxParser.h"
 
+namespace {
+// Generous ceilings for attacker-controlled XML metadata. These are not "keep it tidy" limits: they are the
+// line past which a claimed size stops describing a document and starts being a way to make the engine
+// allocate. CSS already had one (MAX_CSS_FILE_SIZE, below); container.xml, the OPF and the NAV/NCX were the
+// remaining unbounded metadata paths, and they are read before anything has been validated about them.
+constexpr size_t MAX_CONTAINER_XML = 1u * 1024 * 1024;      // META-INF/container.xml
+constexpr size_t MAX_OPF_XML = 16u * 1024 * 1024;           // the OPF package document
+constexpr size_t MAX_TOC_XML = 16u * 1024 * 1024;           // the navigation document (NAV or NCX)
+constexpr size_t MAX_COVER_WRAPPER_XML = 4u * 1024 * 1024;  // the XHTML page wrapping a guide cover
+}  // namespace
+
 bool Epub::findContentOpfFile(std::string* contentOpfFile) const {
   const auto containerPath = "META-INF/container.xml";
   size_t containerSize;
@@ -24,6 +35,12 @@ bool Epub::findContentOpfFile(std::string* contentOpfFile) const {
     return false;
   }
 
+// Refuse before the parser is constructed: a hostile archive controls this number, and the
+// parser allocates from it. (Matching the CSS ceiling above; these paths had none.)
+if (containerSize > MAX_CONTAINER_XML) {
+  LOG_ERR("EBP", "META-INF/container.xml is too large (%zu bytes > %zu max)", containerSize, MAX_CONTAINER_XML);
+  return false;
+}
   ContainerParser containerParser(containerSize);
 
   if (!containerParser.setup()) {
@@ -63,6 +80,12 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, const 
     return false;
   }
 
+// Refuse before the parser is constructed: a hostile archive controls this number, and the
+// parser allocates from it. (Matching the CSS ceiling above; these paths had none.)
+if (contentOpfSize > MAX_OPF_XML) {
+  LOG_ERR("EBP", "the OPF package document is too large (%zu bytes > %zu max)", contentOpfSize, MAX_OPF_XML);
+  return false;
+}
   ContentOpfParser opfParser(getCachePath(), getBasePath(), contentOpfSize,
                              writeSpineEntries ? bookMetadataCache.get() : nullptr);
   if (!opfParser.setup()) {
@@ -160,6 +183,12 @@ bool Epub::parseTocNcxFile() const {
     return false;
   }
 
+// Refuse before the parser is constructed: a hostile archive controls this number, and the
+// parser allocates from it. (Matching the CSS ceiling above; these paths had none.)
+if (ncxSize > MAX_TOC_XML) {
+  LOG_ERR("EBP", "the NCX table of contents is too large (%zu bytes > %zu max)", ncxSize, MAX_TOC_XML);
+  return false;
+}
   TocNcxParser ncxParser(contentBasePath, ncxSize, bookMetadataCache.get());
 
   if (!ncxParser.setup()) {
@@ -196,6 +225,12 @@ bool Epub::parseTocNavFile() const {
   // Note: We can't use `contentBasePath` here as the nav file may be in a different folder to the content.opf
   // and the HTMLX nav file will have hrefs relative to itself
   const std::string navContentBasePath = tocNavItem.substr(0, tocNavItem.find_last_of('/') + 1);
+// Refuse before the parser is constructed: a hostile archive controls this number, and the
+// parser allocates from it. (Matching the CSS ceiling above; these paths had none.)
+if (navSize > MAX_TOC_XML) {
+  LOG_ERR("EBP", "the NAV table of contents is too large (%zu bytes > %zu max)", navSize, MAX_TOC_XML);
+  return false;
+}
   TocNavParser navParser(navContentBasePath, navSize, bookMetadataCache.get());
 
   if (!navParser.setup()) {

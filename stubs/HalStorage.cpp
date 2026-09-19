@@ -147,12 +147,32 @@ bool HalStorage::remove(const char* path) {
   return true;
 }
 
+// Same rule as remove(): the mount functions install a BASENAME alias for every nested mount, so moving
+// only the named key left every other alias holding the old Blob under the old name. The named key moves
+// to the requested path; the other aliases move to their own basename under the new directory, so
+// remove()/exists()/open() keep agreeing about what is mounted where.
 bool HalStorage::rename(const char* oldPath, const char* newPath) {
-  auto it = files_.find(oldPath ? oldPath : "");
+  const std::string oldKey = normalisePath(oldPath ? oldPath : "");
+  const std::string newKey = normalisePath(newPath ? newPath : "");
+  auto it = files_.find(oldKey);
   if (it == files_.end()) return false;
-  auto blob = it->second;
-  files_.erase(it);
-  files_[newPath ? newPath : ""] = std::move(blob);
+
+  const std::shared_ptr<Blob> blob = it->second;
+  const std::string newBase = newKey.substr(newKey.rfind('/') + 1);
+
+  std::vector<std::pair<std::string, std::shared_ptr<Blob>>> moved;
+  for (auto i = files_.begin(); i != files_.end();) {
+    if (i->second != blob) {
+      ++i;
+      continue;
+    }
+    const std::string alias = i->first;
+    const std::string aliasBase = alias.substr(alias.rfind('/') + 1);
+    // The explicitly named key takes the requested path; a flat alias keeps its own basename.
+    moved.emplace_back(alias == oldKey ? newKey : "/" + aliasBase, blob);
+    i = files_.erase(i);
+  }
+  for (auto& [key, b] : moved) files_[key] = b;
   return true;
 }
 

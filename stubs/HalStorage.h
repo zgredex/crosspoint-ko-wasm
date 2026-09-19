@@ -5,6 +5,7 @@
 #pragma once
 
 #include <Arduino.h>  // Print, String
+#include <climits>   // INT_MAX for the HalFile int contract
 
 #include <chrono>   // range-window read timing
 #include <cstdint>
@@ -186,11 +187,22 @@ class HalFile : public Print {
     return true;
   }
   bool seekSet(size_t offset) { return seek(offset); }
-  int available() const { return blob_ ? static_cast<int>(blob_->size - pos_) : 0; }
+  // The HalFile ABI reports sizes and counts as int. A Blob can exceed INT_MAX (a large book on the
+  // wasm32 side), so the contract is explicit here: clamp to INT_MAX instead of truncating into a
+  // negative "plainly not available" answer, which is what an unchecked cast produces.
+  int available() const {
+    if (!blob_ || pos_ >= blob_->size) return 0;
+    const size_t remaining = blob_->size - pos_;
+    return remaining > static_cast<size_t>(INT_MAX) ? INT_MAX : static_cast<int>(remaining);
+  }
   size_t position() const { return pos_; }
   int read(void* buf, size_t count) {
     if (!blob_ || pos_ >= blob_->size) return -1;
     size_t n = std::min(count, blob_->size - pos_);
+    // A single read above INT_MAX cannot be reported through an int return, so clamp what is transferred
+    // rather than let the count truncate. Callers loop on the returned count (see the external read
+    // helpers), so a short read is progress, not a failure.
+    n = std::min(n, static_cast<size_t>(INT_MAX));
     if (blob_->external) {
       // Range-backed: position alone decides what is fetched, so the caller's read pattern is
       // unchanged. A window fetch that fails is an I/O error, not EOF — report it as -1 the way the
@@ -212,6 +224,7 @@ class HalFile : public Print {
     // Read-only files (the mounted EPUB) REFUSE writes rather than silently growing: a write into an
     // owned view would have to reallocate somebody else's buffer.
     if (!blob_ || !blob_->writable) return 0;
+    if (count > SIZE_MAX - pos_) return 0;                 // a wrap here would resize to a small buffer
     if (pos_ + count > blob_->writable->size()) blob_->writable->resize(pos_ + count);
     blob_->refresh();
     memcpy(blob_->writable->data() + pos_, buf, count);

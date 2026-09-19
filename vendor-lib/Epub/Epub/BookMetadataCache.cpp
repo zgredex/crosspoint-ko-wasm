@@ -337,7 +337,13 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
       }
     }
 
-    cumSize += itemSize;
+    // Attacker-controlled arithmetic: on wrap every later reader sees a small, plausible cumulative total
+    // while the item sizes say otherwise, which is exactly the disagreement a hostile archive wants.
+    if (itemSize > UINT32_MAX - cumSize) {
+      LOG_ERR("BMC", "cumulative spine size overflow");
+      return false;
+    }
+    cumSize += static_cast<uint32_t>(itemSize);
     spineEntry.cumulativeSize = cumSize;
 
     // Write out spine data to book.bin

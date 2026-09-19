@@ -26,7 +26,8 @@ class ZipFile {
   struct SizeTarget {
     uint64_t hash;   // FNV-1a 64-bit hash of normalized path
     uint16_t len;    // Length of path for collision reduction
-    uint16_t index;  // Caller's index (e.g. spine index)
+    uint32_t index;  // Caller's index (e.g. spine index). 16 bits wrapped above 65535 spines, and a
+                     // wrapped index writes the size into a DIFFERENT spine's slot.
   };
 
   // FNV-1a 64-bit hash computed from char buffer (no std::string allocation)

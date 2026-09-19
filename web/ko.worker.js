@@ -982,7 +982,22 @@ function reportSectionFailure(spine, error) {
 // `engineSpanMs` (set below on every path) is read+alloc+copy+parse. It is deliberately NOT called
 // totalLoadMs: the load COMMAND continues after this returns — font re-apply, title, spec, text
 // reference — and that tail is reported separately as `loadCommandMs`.
+// The wasm module is memory32 and its file I/O interfaces are `int` (`HalFile::available/read`), so a book
+// bigger than INT_MAX is representable in NEITHER. Number.isSafeInteger() is not that check — it accepts
+// sizes this ABI cannot carry, and the truncation would happen somewhere deep inside it. Reject at the
+// boundary, before arrayBuffer(), _ko_epub_alloc, checkedMalloc or the external mount see the Blob.
+const MAX_WASM_BOOK_BYTES = 0x7fffffff;
+
+function validateBookInput(data) {
+  const n = data && data.epub ? data.epub.byteLength : (data && data.blob ? data.blob.size : -1);
+  if (!Number.isSafeInteger(n) || n <= 0 || n > MAX_WASM_BOOK_BYTES) {
+    throw new Error(`EPUB size ${n} exceeds the supported limit of ${MAX_WASM_BOOK_BYTES} bytes`);
+  }
+  return n;
+}
+
 async function loadEngineBook(data, timing, early) {
+  const bookBytes = validateBookInput(data);     // every path below depends on this being representable
   const t0 = performance.now();
   // A previous book's Blob must not stay referenced: the reader would keep 80 MB of File alive after
   // the book was replaced. Each load path re-installs what it needs (the external branch, below).
@@ -1254,6 +1269,7 @@ async function handleLoad(ev, id, initWaitMs, earlyRead, t0Open) {
   loadTiming = { initWaitMs: +initWaitMs.toFixed(2) };
   spineCount = await loadEngineBook(ev.data, loadTiming, earlyRead);
   loadTiming.bookBytes = ev.data.epub ? ev.data.epub.byteLength : (ev.data.blob ? ev.data.blob.size : 0);
+  void 0;   // (see validateBookInput: the size contract is enforced before any allocation)
   loadTiming.heapAfterLoadBytes = api.HEAPU8.buffer.byteLength;
   if (spineCount < 0) {
     post(id, false, { error: 'Epub::load failed' });
@@ -1357,6 +1373,9 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
     image: tx,
     mono: wantMono,
     cached: false,
+    // The first frame states whether the build is finished, so navigation never has to guess from an
+    // undefined value (which used to mean "cross freely").
+    sectionComplete: api._ko_spine_build_complete() === 1,
     timing: Object.assign({}, loadTiming,
                           renderTiming(tRender0, buildMs, renderMs, composeMs, false, readImagePerf()),
                           { totalOpenWorkerMs: +(performance.now() - t0Open).toFixed(2) }),
@@ -1576,6 +1595,15 @@ case 'openPreview': {
         if (page >= currentPages) page = currentPages - 1;
         // Repeat navigation: the composed frame is a pure function of these five inputs, and
         // the cached copy is already out of wasm memory.
+        // Unknown must mean NOT PROVEN COMPLETE. The old fallback below claimed complete:true whenever no
+        // estimate existed (i.e. before the first progress message), so a fast Next could cross into the
+        // next chapter while this spine was still building — the one direction that always "worked".
+        // Computed BEFORE the cache-hit branch, so a cache hit answers the same question as a fresh render.
+        const est = sectionEstimates[currentSpine] || {
+          pages: currentPages,
+          estimated: currentPages,
+          complete: api._ko_spine_build_complete() === 1,
+        };
         const rk = renderKey(currentSpec || {});
         const frameKey = bookGen + ':' + currentSpine + ':' + page + ':' + (wantMono ? 1 : 0) + ':' + rk + ':' + builtFontStamp;
         const cachedFrame = frameCacheGet(frameKey);
@@ -1584,6 +1612,7 @@ case 'openPreview': {
           const reply = new Uint8ClampedArray(cachedFrame.data.length);
           reply.set(cachedFrame.data);
           post(id, true, { page, pages: currentPages, image: reply.buffer, mono: wantMono, cached: true,
+                           sectionComplete: est.complete === true,
                            timing: renderTiming(tRender0, 0, 0, 0, true, null),
                            viewport: vpInfo ? vpInfo.viewport : null,
                            margins: vpInfo ? vpInfo.margins : null },
@@ -1615,7 +1644,6 @@ case 'openPreview': {
         COUNTERS.framesPosted += 1;
         // §2: user-visible work is finished — send it NOW. The prefetch is speculative and must never
         // delay the requested frame (it used to run between compose() and post()).
-        const est = sectionEstimates[currentSpine] || { pages: currentPages, estimated: currentPages, complete: true };
         post(id, true, { page, pages: currentPages, image: tx, mono: wantMono,
                          // `pages` is what EXISTS (navigation clamps to it); `total` is what to display —
                          // a giant spine still building knows its estimate, not its final count.

@@ -74,7 +74,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=102');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=103');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -254,7 +254,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=102');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=103');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -631,7 +631,7 @@
     try { return JSON.stringify(readSpec()); } catch (_) { return null; }
   }
 
-  async function refresh(keepPage = true, quiet = false) {
+  async function refresh(keepPage = true, quiet = false, opts = {}) {
     if (!book) return;
     const tok = ++renderToken;
     viewingCover = false;
@@ -646,6 +646,9 @@
       const spine = Math.min(state.spine, book.spineCount - 1);
       const page = keepPage ? state.page : 0;
       const payload = { spine, page, mode: state.mode };
+      // Correctness beats progressive behaviour for a backward chapter crossing: the caller needs to know
+      // where "last" actually is, which requires the whole spine to be laid out first.
+      if (opts.progressive === false) payload.progressive = false;
       if (spec) payload.spec = spec;
       const tRenderCall = performance.now();
       const r = await call('render', payload);
@@ -662,6 +665,9 @@
       state.page = r.page;
       state.pages = r.pages;                       // pages that EXIST (navigation clamps to this)
       state.total = r.total || r.pages;             // what to display: the estimate while building
+      // Every render reply states the build state; `=== true` makes anything else (including a missing
+      // field from an older reply) mean "not proven complete", which is the safe reading.
+      state.sectionComplete = r.sectionComplete === true;
       if (els.page.width !== 480 || els.page.height !== 800) {
         els.page.width = 480;
         els.page.height = 800;
@@ -728,7 +734,7 @@
                       state.pages > 0 && state.page >= state.pages - 1;
     // At the build frontier, Next must not promise the next chapter: the current spine still has pages
     // arriving, so the button is disabled until the build completes for that spine.
-    const atBuildFrontier = state.sectionComplete === false && state.pages > 0 && state.page >= state.pages - 1;
+    const atBuildFrontier = !state.sectionComplete && state.pages > 0 && state.page >= state.pages - 1;
     els.prevBtn.disabled = !book || viewingCover || atBookStart;
     els.nextBtn.disabled = !book || atBookEnd || atBuildFrontier;
   }
@@ -1094,6 +1100,7 @@
         const tDraw = performance.now();
         state.page = openFrame.page || 0;
         state.pages = openFrame.pages || 0;
+        state.sectionComplete = openFrame.sectionComplete === true;
         state.total = openFrame.total || openFrame.pages || 0;
         if (els.page.width !== 480 || els.page.height !== 800) {
           els.page.width = 480;
@@ -1500,15 +1507,20 @@
     }
     let target = state.page + delta;
     let targetSpine = state.spine;
+    let backwardCrossing = false;
     if (target < 0) {
       if (targetSpine <= 0) return;               // already at book start
       targetSpine -= 1;
       target = 1 << 30;   // worker clamps over-range → that spine's last page
+      // "Last page of the previous chapter" is only knowable once that spine is FULLY built. Progressive
+      // layout starts the previous spine and only builds its first page, so the over-range clamp resolved
+      // to page 0 — going back a chapter landed on its FIRST page instead of its last.
+      backwardCrossing = true;
     } else if (target >= state.pages) {
       // Reaching the frontier of a spine that is STILL BUILDING is not "go to the next chapter": more
-      // pages of this spine are on their way. state.sectionComplete is set by sectionProgress, so an
-      // undefined value (no progress seen yet) keeps the old crossing behaviour.
-      if (state.sectionComplete === false) return;
+      // pages of this spine are on their way. Every render reply now carries sectionComplete, so unknown
+      // (undefined, e.g. a reply from before this field existed) fails CLOSED here.
+      if (!state.sectionComplete) return;
       if (targetSpine >= book.spineCount - 1) return;  // at book end
       targetSpine += 1;
       target = 0;
@@ -1518,7 +1530,7 @@
     if (els.spineSel.value !== String(targetSpine)) {
       els.spineSel.value = String(targetSpine);   // keep the chapter picker honest
     }
-    refresh(true);
+    refresh(true, false, backwardCrossing ? { progressive: false } : {});
   }
   els.prevBtn.addEventListener('click', () => goPage(-1));
   els.nextBtn.addEventListener('click', () => goPage(1));
@@ -1830,7 +1842,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=102');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=103');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };
