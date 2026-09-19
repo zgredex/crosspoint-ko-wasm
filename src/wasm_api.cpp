@@ -660,7 +660,7 @@ KO_EXPORT double ko_image_perf(int which) {
 
 KO_EXPORT int ko_render_page(int pageIndex) {
   if (!g_driver || g_currentSpine < 0) return -1;
-  // (the per-render reset lives in Driver::renderPage, so it also covers ko_render_page_mode and export)
+  // (the per-render reset lives in Driver::renderPage, so it covers the preview and both export loops)
   if (!g_driver->renderPage(pageIndex, g_spec, g_page)) {
     setError("page render failed");
     return -1;
