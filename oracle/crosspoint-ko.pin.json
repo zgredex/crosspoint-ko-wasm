@@ -64,7 +64,6 @@
     "lib/EpdFont/builtinFonts/notoserif_18_regular.h": "a533dfac53f1df4f04ffa1867cf4f67da216ee0b",
     "lib/EpdFont/builtinFonts/pretendard_10_regular.h": "dd58faf22ae6b34fd5bcd657268c54b5f2432d76",
     "lib/EpdFont/builtinFonts/source/.gitignore": "bf88ca90333cdbdda3ac67f37d4563730d2d3d69",
-    "lib/EpdFont/builtinFonts/source/KoPub-Batang/KoPub Batang Light.ttf": "642d22a912551f83707eb4118dde172cc34c1b96",
     "lib/EpdFont/builtinFonts/source/NotoSans/NotoSans-Bold.ttf": "07f0d257e31568cdf49729ec1ef4683889c0be4a",
     "lib/EpdFont/builtinFonts/source/NotoSans/NotoSans-BoldItalic.ttf": "e538eaed23a62c7a717de45c33b8423730da6978",
     "lib/EpdFont/builtinFonts/source/NotoSans/NotoSans-Italic.ttf": "d9b9e148c8fad03c2d6ba128bae2ef62dd5e7e19",
@@ -86,8 +85,6 @@
     "lib/EpdFont/builtinFonts/source/OpenDyslexic/OpenDyslexic-BoldItalic.otf": "99b4b1d10fcbb915147d338341d4aa42d401202e",
     "lib/EpdFont/builtinFonts/source/OpenDyslexic/OpenDyslexic-Italic.otf": "8f53b2909e54c76c318834d9c1b6ef1c994e70ca",
     "lib/EpdFont/builtinFonts/source/OpenDyslexic/OpenDyslexic-Regular.otf": "039cedaf9623e7215ff40356b3cb0cf973429a51",
-    "lib/EpdFont/builtinFonts/source/Pretendard/Pretendard-Bold.ttf": "fb07fc65e8e568c60dfd985fb6fcdfd114da4d64",
-    "lib/EpdFont/builtinFonts/source/Pretendard/Pretendard-Regular.ttf": "01147e9991c91198235e8deefe9c3145dfad8d2a",
     "lib/EpdFont/builtinFonts/source/Ubuntu/UFL.txt": "6e722c88daa5e66b0b037de6ffa1bda86cc21f6e",
     "lib/EpdFont/builtinFonts/source/Ubuntu/Ubuntu-Bold.ttf": "c2293d5c8b81de044a73eeb80e461d7df177e726",
     "lib/EpdFont/builtinFonts/source/Ubuntu/Ubuntu-Regular.ttf": "b5505e6786fd98c24c32c461268eb0b430431579",
@@ -577,6 +574,23 @@
   "missing_from_port": {
     "lib/Epub/Epub/converters/PixelCache.h": "354840d5f1d38209c30f60b94ed0950547632877"
   },
+  "source_inputs": {
+    "lib/EpdFont/builtinFonts/source/KoPub-Batang/KoPub Batang Light.ttf": {
+      "reference_blob": "642d22a912551f83707eb4118dde172cc34c1b96",
+      "local_sha": "642d22a912551f83707eb4118dde172cc34c1b96"
+    },
+    "lib/EpdFont/builtinFonts/source/Pretendard/Pretendard-Bold.ttf": {
+      "reference_blob": "fb07fc65e8e568c60dfd985fb6fcdfd114da4d64",
+      "local_sha": "fb07fc65e8e568c60dfd985fb6fcdfd114da4d64"
+    },
+    "lib/EpdFont/builtinFonts/source/Pretendard/Pretendard-Regular.ttf": {
+      "reference_blob": "01147e9991c91198235e8deefe9c3145dfad8d2a",
+      "local_sha": "01147e9991c91198235e8deefe9c3145dfad8d2a"
+    }
+  },
+  "normative_artifacts": [
+    "vendor-lib/EpdFont/builtinFonts/kopub_14_regular.h \u2014 the generated KoPub runtime table. This is what the renderer reads, it IS tracked, and it IS byte-compared. Source TTFs are provenance."
+  ],
   "layout_critical": {
     "GfxRenderer/GfxRenderer.cpp": [
       "getTextWidth",
@@ -595,9 +609,10 @@
     ]
   },
   "counts": {
-    "identical": 151,
+    "identical": 148,
     "divergent": 16,
     "missing_from_port": 1,
+    "source_inputs": 3,
     "reference_engine_files": 168
   }
 }

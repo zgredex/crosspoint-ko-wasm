@@ -464,3 +464,87 @@ not by measurement — there is no independent font implementation in the port t
 28.0000 but never 27.3125. It must therefore never carry a reference face (hence EPD2), and the custom
 font feature is an explicit EXTENSION: same layout algorithm, different face, no parity claim. A future
 `.epdfont` v2 with fp4 advances plus kerning is the right place for that, not the reference path.
+
+---
+
+## What the proof harness guarantees, and what it does not
+
+An audit of the harness itself — not of the renderer — found seven holes. They are fixed, and the fixes are
+themselves gated, because a harness that can emit a non-reproducible or false PASS is worse than none.
+
+### The pin no longer depends on one machine's disk
+
+The pin used to record the KoPub Batang and Pretendard source TTFs under `identical`, because those files
+existed in the tree that generated it. The **reference tracks them; this repo does not** — its own
+`builtinFonts/source/.gitignore` ignores every family except a handful — so `--check` failed on a clean
+clone and "all gates green" quietly became a claim about one working copy.
+
+They are now `source_inputs`: compared against the reference when a copy is present, reported as
+*unavailable on this checkout* when absent. The normative rendering artifact is the generated runtime table
+`vendor-lib/EpdFont/builtinFonts/kopub_14_regular.h`, which **is** tracked and **is** byte-compared. A
+source TTF is provenance; the table is proof.
+
+Verified the way it has to be: with the old pin committed, a real `git clone` FAILS with *missing from
+vendor-lib* for all three fonts; with this pin and checker it PASSES there and states the scope —
+`source inputs NOT on this checkout (3): KoPub Batang Light.ttf, Pretendard-Bold.ttf,
+Pretendard-Regular.ttf — provenance only, unverifiable here`.
+
+### The gate rebuilds both binaries, always
+
+`build-oracle` used to be built **only when the executable was missing**, and the port binary was never
+rebuilt at all. Source HEAD could move while the gate compared yesterday's binaries and called the result
+"oracle conformance". Both are rebuilt unconditionally now: a conformance gate that can certify an unbuilt
+tree is stop-ship, and the rebuild is cheap next to rendering the large fixture.
+
+### Nothing-compared must never read as agreement
+
+Two controls of that shape now exist:
+
+* the fixture loop counts what it actually compared and **fails** with *no fixture was compared at all — an
+  empty or unreadable fixture list is NOT agreement* when the count is zero;
+* the plane layer compares the page set against the **manifest**, by `(spine, page)` identity. Comparing
+  the two plane directories only against each other was insufficient: two renderers that omit the same page
+  agree perfectly and certify nothing.
+
+Both were earned. A span-edit of `oracle_conformance.sh` during this work deleted the default fixture list,
+and the gate printed PASS while comparing **zero** fixtures.
+
+### LAYER 2a: mandatory where proven, and honestly not proven where not
+
+The layer now compares **every** page, not only image-free ones, with the image rectangles blanked out of
+both copies first (interior bytes in full, boundary bytes bit-masked, so the text bits sharing a byte with
+an image are still compared). The rectangles come from the layout manifest, which LAYER 1 has already
+proven identical.
+
+That design rests on an assumption, so the assumption was measured — and it is **false**:
+
+> Rendering the port twice with a different `--image-dither` moves **183,057 pixel bits outside the image
+> rectangles**, and the knob moves pages the manifest says contain no images at all (spine 0, 5 and 9 of
+> `demo-images`). An image perturbs the whole page, so a rectangle cannot isolate its text.
+
+Consequently the layer is split, and the split is reported rather than smoothed over:
+
+| Pages | Status |
+|---|---|
+| image-free | **MANDATORY, exact.** Byte-identical text pixels, every page, every fixture. |
+| image-bearing | **NOT PROVEN.** Differences outside the rectangles are counted and named, and never certified. |
+
+Current state, enforced: `ko-text` 3 pages, `ko-ruby` 1, `ko-mixed` 1, `ko-glyphs` 1, `ko-glyphs` at 1-bit 1,
+`ko-symbols` 1, `demo-png` 13, `demo-images` 13 (27 image-page planes NOT PROVEN), `demo.epub` **1690
+pages, image-free pages byte-identical** (213 image-page planes NOT PROVEN). `--require-image-page-text`
+turns the unproven half into a failure for anyone who wants to work on it.
+
+Closing that half properly needs a **text-only capture**: render the page with the image contribution
+suppressed, on *both* implementations, and compare that plane on every page. A rectangle mask cannot do it;
+engine-level suppression can, which means it needs a mechanism the pinned reference build cannot gain by
+patching. That is the remaining work, recorded as a gap rather than papered over with a padded mask.
+
+### The glyph-branch fixture
+
+`oracle/fixtures/ko-glyphs.epub` exists because a Korean prose fixture never reaches the glyph-raster
+branches: superscript and subscript scaled glyphs, synthesized bold (the fork synthesizes weight — there is
+no bold KoPub), italic, and codepoints KoPub does not cover (the fallback path). Those are precisely the
+branches `GfxRenderer::renderCharImpl` and `renderCharScaled` own, and those two functions **cannot** be
+held byte-identical in the pin because they carry the port's capture fast path. The fixture is rendered in
+**both** 1-bit and 2-bit (different glyph paths again) via the loop's `path:flags` syntax, so the exact
+text-pixel comparison is what proves the fast path behaviour-preserving.

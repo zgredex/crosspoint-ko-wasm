@@ -152,7 +152,7 @@ def stage_storage_path_normalisation():
     The absolute arm is the control: it certifies the two containers are comparable at all, so a relative
     arm that "passes" by producing nothing cannot pass this check.
     """
-    rel_out, abs_out = OUT / "rel.xtch", OUT / "abs.xtch"
+    rel_out, bare_out, abs_out = OUT / "relative.xtch", OUT / "bare.xtch", OUT / "absolute.xtch"
     env = dict(os.environ)
 
     def invoke(book_arg, out, extra=(), cwd=None):
@@ -168,7 +168,7 @@ def stage_storage_path_normalisation():
     # The host reads the file from the real filesystem with fopen BEFORE mounting it, so a bare filename
     # only resolves when the book's own directory is the working directory. That cwd is the point: the
     # mount key then has no slash at all, which is the other half of the contract under test.
-    bare = invoke(Path(BOOK).name, rel_out, cwd=(ROOT / BOOK).parent)
+    bare = invoke(Path(BOOK).name, bare_out, cwd=(ROOT / BOOK).parent)
     check(bare.returncode == 0 and rel_out.exists(),
           "a BARE filename (no slash) loads", (bare.stderr or b"").decode()[-200:])
 
@@ -177,6 +177,11 @@ def stage_storage_path_normalisation():
     if rel.returncode == 0 and abso.returncode == 0 and rel_out.exists() and abs_out.exists():
         check(masked_sha(rel_out) == masked_sha(abs_out),
               "relative and absolute paths produce a byte-identical container")
+    if bare.returncode == 0 and abso.returncode == 0 and bare_out.exists() and abs_out.exists():
+        # Three SEPARATE outputs. Writing the bare arm into rel_out deleted the relative result, so this
+        # check used to compare bare-vs-absolute while claiming to compare relative-vs-absolute.
+        check(masked_sha(bare_out) == masked_sha(abs_out),
+              "bare-filename and absolute paths produce a byte-identical container")
 
 
 def main():

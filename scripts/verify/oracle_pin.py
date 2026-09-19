@@ -163,14 +163,51 @@ def line_changes(ref_src, port_src):
     return added, removed
 
 
+def is_local_only(local_path):
+    """True when a path is deliberately NOT in this repo's git tree.
+
+    Why this exists: the reference TRACKS the KoPub Batang and Pretendard source TTFs (a .gitignore does not
+    apply to files already committed), while the port does not — vendor-lib/EpdFont/builtinFonts/source/
+    .gitignore ignores every family except a handful, so those two arrive as local, untracked files. The pin
+    used to record them under `identical` because they happened to exist on the machine that generated it, so
+    --check failed on a clean clone and "all gates green" quietly became a claim about one disk.
+
+    The generated runtime table (kopub_14_regular.h) IS tracked and IS byte-compared, and that is the artifact
+    rendering actually consumes — so it stays normative. A source TTF is provenance: compared when present,
+    reported as unavailable when not, and never a silent pass.
+    """
+    rel = os.path.relpath(local_path, REPO_ROOT)
+    try:
+        # IGNORED is the precise signal, and it is deliberately the only one. "Untracked" would also cover a
+        # reference header the port simply never copied (PixelCache.h), and reclassifying THAT as provenance
+        # would hide a real gap. The font sources are covered by the repo's own ignore rules, so check-ignore
+        # separates "deliberately not here" from "not here yet".
+        return subprocess.run(['git', 'check-ignore', '-q', '--', rel], cwd=REPO_ROOT,
+                              capture_output=True).returncode == 0
+    except Exception:
+        # No git available: fall back to the STRICT reading, so an unverifiable tree cannot silently pass.
+        return False
+
+
 def classify(repo, commit, blobs, cache_dir):
-    """Return (identical, divergent, missing) for the reference's engine files."""
-    identical, divergent, missing = {}, {}, {}
+    """Return (identical, divergent, missing, source_inputs) for the reference's engine files.
+
+    `source_inputs` holds reference-tracked files this repo deliberately does not track (font sources). They
+    are provenance, not proof: see is_local_only(). Anything genuinely missing still lands in `missing`.
+    """
+    identical, divergent, missing, source_inputs = {}, {}, {}, {}
     for ref_path, sha in sorted(engine_blobs(blobs).items()):
         rel = ref_path[len(REF_PREFIX):]
         local = os.path.join(VENDOR, rel)
+        local_only = is_local_only(local)
         if not os.path.exists(local):
-            missing[ref_path] = sha
+            if local_only:
+                source_inputs[ref_path] = {'reference_blob': sha, 'local_sha': None}
+            else:
+                missing[ref_path] = sha
+            continue
+        if local_only:
+            source_inputs[ref_path] = {'reference_blob': sha, 'local_sha': blob_sha(local)}
             continue
         if blob_sha(local) == sha:
             identical[ref_path] = sha
@@ -201,11 +238,11 @@ def classify(repo, commit, blobs, cache_dir):
                 n for n in lc if n in rf and n in pf and normalise(rf[n]) == normalise(pf[n]))
             entry['layout_critical_missing'] = sorted(n for n in lc if n not in rf or n not in pf)
         divergent[ref_path] = entry
-    return identical, divergent, missing
+    return identical, divergent, missing, source_inputs
 
 
 def write_pin(repo, branch, commit, blobs, out_path):
-    identical, divergent, missing = classify(repo, commit, blobs, None)
+    identical, divergent, missing, source_inputs = classify(repo, commit, blobs, None)
     pin = {
         'repo': repo, 'branch': branch, 'commit': commit,
         'role': ('Normative typography/layout oracle. Text rhythm, spacing, break decisions, '
@@ -221,9 +258,17 @@ def write_pin(repo, branch, commit, blobs, out_path):
         'identical': identical,
         'divergent': divergent,
         'missing_from_port': missing,
+        # Reference-tracked files this repo does not track. Compared when a copy is present, reported as
+        # unavailable when not — a fresh clone must still be able to verify the pin.
+        'source_inputs': source_inputs,
+        'normative_artifacts': [
+            'vendor-lib/EpdFont/builtinFonts/kopub_14_regular.h — the generated KoPub runtime table. This is'
+            ' what the renderer reads, it IS tracked, and it IS byte-compared. Source TTFs are provenance.',
+        ],
         'layout_critical': LAYOUT_CRITICAL,
         'counts': {'identical': len(identical), 'divergent': len(divergent),
-                   'missing_from_port': len(missing), 'reference_engine_files': len(identical) + len(divergent) + len(missing)},
+                   'missing_from_port': len(missing), 'source_inputs': len(source_inputs),
+                   'reference_engine_files': len(identical) + len(divergent) + len(missing) + len(source_inputs)},
     }
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'w', encoding='utf-8') as fh:
@@ -364,13 +409,42 @@ def check_pin(repo, commit, blobs, cache_dir):
     notes.append(f'divergent: {len(pin["divergent"])} files re-audited at function level')
 
     # 3. files the reference has and the port does not: keep the list honest.
-    live_missing = {p: s for p, s in live.items() if not os.path.exists(os.path.join(VENDOR, p[len(REF_PREFIX):]))}
+    # A local-only input (a font source this repo does not track) is NOT "missing from the port": it was
+    # never expected here. Conflating the two is what made the pin unverifiable on a clean clone.
+    live_missing = {p: s for p, s in live.items()
+                    if not os.path.exists(os.path.join(VENDOR, p[len(REF_PREFIX):]))
+                    and not is_local_only(os.path.join(VENDOR, p[len(REF_PREFIX):]))}
     if sorted(live_missing) != sorted(pin['missing_from_port']):
         failures.append('missing-from-port set changed\n'
                         f'      pin: {sorted(pin["missing_from_port"])}\n'
                         f'      now: {sorted(live_missing)}')
     if live_missing:
         notes.append('missing from the port (headers only): ' + ', '.join(sorted(live_missing)))
+
+    # 4. source inputs: reference-tracked files this repo deliberately does not track. ABSENT is not a
+    #    failure — a fresh clone has neither KoPub Batang nor Pretendard, and that must not turn "green" into
+    #    a claim about one machine. PRESENT but different IS a failure: a swapped font source would change
+    #    metrics, and recording the sha is what keeps that comparable.
+    unavailable, tampered = [], []
+    for ref_path, entry in sorted(pin.get('source_inputs', {}).items()):
+        local = os.path.join(VENDOR, ref_path[len(REF_PREFIX):])
+        if not os.path.exists(local):
+            unavailable.append(ref_path)
+            continue
+        h = blob_sha(local)
+        if entry.get('local_sha') and h != entry['local_sha']:
+            tampered.append(f'{ref_path}: local font source changed {entry["local_sha"][:12]} -> {h[:12]}')
+        elif h != entry['reference_blob']:
+            tampered.append(f'{ref_path}: local font source differs from the reference blob '
+                            f'({h[:12]} vs {entry["reference_blob"][:12]})')
+    failures.extend(tampered)
+    if unavailable:
+        notes.append(f'source inputs NOT on this checkout ({len(unavailable)}): '
+                     + ', '.join(os.path.basename(p) for p in unavailable)
+                     + ' — provenance only, unverifiable here; the generated runtime table '
+                       '(builtinFonts/kopub_14_regular.h) is normative, is tracked, and IS compared')
+    elif pin.get('source_inputs'):
+        notes.append(f'source inputs verified against the reference: {len(pin["source_inputs"])} file(s)')
     return failures, notes
 
 
@@ -413,7 +487,8 @@ def main():
         c = pin['counts']
         print(f"  {repo} {branch} @ {commit}")
         print(f"  engine files {c['reference_engine_files']}: identical {c['identical']}, "
-              f"divergent {c['divergent']}, missing from port {c['missing_from_port']}")
+              f"divergent {c['divergent']}, missing from port {c['missing_from_port']}, "
+              f"source inputs {c.get('source_inputs', 0)}")
         return 0
 
     cache_dir = os.environ.get('KO_ORACLE_SRC', '')

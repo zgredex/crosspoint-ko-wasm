@@ -13,13 +13,14 @@
 #     visible-text offsets, viewport geometry, spec. Enforced as byte-identical layout
 #     manifests, so there is no tolerance to argue about.
 #
-#   LAYER 2a — TEXT RASTER PARITY (MANDATORY, per page)
-#     the BW/LSB/MSB planes of every page that contains NO images must be byte-identical to the
-#     reference's. The Korean fork owns everything up to and including text rasterisation, so text
-#     coverage is not "ours to improve". Image-bearing pages are excluded BY CONTRACT (blue-noise
-#     dithering, a different decoder and the preview palette are XTCKO additions past the parity
-#     boundary) — which is exactly why this is per page and not per book: one illustration must not
-#     be able to hide a text-plane divergence on every other page.
+#   LAYER 2a — TEXT RASTER PARITY (MANDATORY, every page)
+#     the TEXT pixels of every page's BW/LSB/MSB planes must be byte-identical to the reference's — on
+#     every page, whether or not it also holds an image. The Korean fork owns everything up to and
+#     including text rasterisation, so text coverage is not "ours to improve".
+#     Only IMAGE RECTANGLES are exempt (blue-noise dithering, a different decoder and the preview
+#     palette are XTCKO additions past the parity boundary), and the rectangles come from the layout
+#     manifest, which LAYER 1 has already proven identical. Exempting whole pages was too broad: one
+#     small illustration beside twenty lines of prose could hide wrong glyph rasterisation.
 #
 #   LAYER 2 — PERCEPTUAL (the conformance requirement for pixels)
 #     a page fails only if a reader could SEE the difference as typography: content moved
@@ -76,6 +77,8 @@ ok()   { printf '  OK %s\n' "$*"; }
 bad()  { printf '  x  %s\n' "$*"; FAIL=$((FAIL + 1)); }
 
 mkdir -p "$WORK"
+PLANE_CONTROL_DONE=0
+COMPARED=0
 
 # --- 1. the pin must hold before anything is compared -------------------------
 echo "== oracle pin =="
@@ -87,25 +90,28 @@ else
 fi
 
 # --- 2. builds ----------------------------------------------------------------
+# ALWAYS rebuild BOTH. Source HEAD can move while a stale executable sits in build/, and build-oracle used to
+# be built only when it was MISSING — so this gate could compare yesterday's binaries and call the result
+# "oracle conformance". That is stop-ship for a conformance gate; the rebuild is cheap next to rendering the
+# large fixture.
 echo "== builds =="
-[ -x "$PORT_BIN" ] || { bad "missing $PORT_BIN (cmake -S . -B build && cmake --build build)"; exit 1; }
-if [ ! -x "$ORACLE_BIN" ]; then
-  echo "  building the reference from the pinned checkout..."
-  if [ ! -d "$ORACLE_CMAKE_ROOT" ]; then
-    bad "no reference checkout at $ORACLE_CMAKE_ROOT — fetch the pinned tarball first (see oracle/README.md)"
-    exit 1
-  fi
-  cmake -S . -B build-oracle -DCMAKE_BUILD_TYPE=Release -DKO_ENGINE_ROOT="$ORACLE_CMAKE_ROOT" >"$WORK/oracle-cmake.log" 2>&1
-  cmake --build build-oracle -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" >"$WORK/oracle-build.log" 2>&1 \
-    || { bad "reference build failed (see $WORK/oracle-build.log)"; exit 1; }
-fi
-# CONTROL: the two binaries must not be the same program.
-if cmp -s "$PORT_BIN" "$ORACLE_BIN"; then
-  bad "port and reference binaries are identical — the comparison would be vacuous"
+JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+[ -x "$PORT_BIN" ] || { bad "missing $PORT_BIN — configure it first: cmake -S . -B build"; exit 1; }
+cmake --build build -j"$JOBS" >"$WORK/port-build.log" 2>&1 \
+  || { bad "port build failed (see $WORK/port-build.log)"; exit 1; }
+if [ ! -d "$ORACLE_CMAKE_ROOT" ]; then
+  bad "no reference checkout at $ORACLE_CMAKE_ROOT — fetch the pinned tarball first (see oracle/README.md)"
   exit 1
 fi
-note "port    $(shasum -a 256 "$PORT_BIN" | cut -c1-16)"
-note "oracle  $(shasum -a 256 "$ORACLE_BIN" | cut -c1-16)"
+if [ ! -f build-oracle/CMakeCache.txt ]; then
+  echo "  configuring the reference build from the pinned checkout..."
+  cmake -S . -B build-oracle -DCMAKE_BUILD_TYPE=Release -DKO_ENGINE_ROOT="$ORACLE_CMAKE_ROOT" >"$WORK/oracle-cmake.log" 2>&1 \
+    || { bad "reference configure failed (see $WORK/oracle-cmake.log)"; exit 1; }
+fi
+cmake --build build-oracle -j"$JOBS" >"$WORK/oracle-build.log" 2>&1 \
+  || { bad "reference build failed (see $WORK/oracle-build.log)"; exit 1; }
+note "port      rebuilt  $(shasum -a 256 "$PORT_BIN" | cut -c1-16)"
+note "reference rebuilt  $(shasum -a 256 "$ORACLE_BIN" | cut -c1-16)"
 
 FIXTURES="$FIXTURES_OVERRIDE"
 # Fixtures this repo does not ship: the commercial Korean book used for the end-to-end measurement.
@@ -120,21 +126,13 @@ if [ -z "$FIXTURES" ]; then
   # continuation — it is a second command, and the first line silently wins, which is how a "full"
   # gate run compared three fixtures and reported PASS for six.
   FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub"
+  #   ko-glyphs TWICE: sup/sub scaled glyphs, synthesized bold and the fallback face take a DIFFERENT raster
+  #   path from ordinary prose, and 1-bit and 2-bit take different paths again — yet those are exactly the
+  #   functions the pin cannot hold byte-identical (they carry the port's capture fast path). `path:flags` is
+  #   the loop's syntax for "same fixture, different mode".
+  FIXTURES="$FIXTURES oracle/fixtures/ko-glyphs.epub oracle/fixtures/ko-glyphs.epub:--1bit"
   FIXTURES="$FIXTURES oracle/fixtures/ko-symbols.epub web/demo-images.epub web/demo-png.epub web/demo.epub"
-  [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-symbols.epub"
-fi
-
-# --- 3a. text-plane comparator control ----------------------------------------
-# A comparator that cannot fail would report PASS for every book, so the first rendered fixture's planes are
-# perturbed by one bit and the comparison is required to catch it.
-if [ -d "$WORK/ko-text.port.planes" ]; then
-  echo "== control: the text-plane comparator must be able to fail =="
-  if python3 scripts/verify/text_plane_parity.py "$WORK/ko-text.port.planes" "$WORK/ko-text.oracle.planes" \
-       "$WORK/ko-text.port.json" --self-control 2>&1 | sed 's/^/  /'; then
-    ok "text-plane comparator control"
-  else
-    bad "text-plane comparator did not catch a flipped bit — the layer above certifies nothing"
-  fi
+  [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-glyphs.epub oracle/fixtures/ko-glyphs.epub:--1bit"
 fi
 
 # --- 3. sensitivity control ---------------------------------------------------
@@ -191,6 +189,14 @@ fi
 
 # --- 4. fixtures --------------------------------------------------------------
 for fx in $FIXTURES; do
+  # `path:extra-flags` — the mode is part of the fixture spec, so a 1-bit pass cannot collide with the 2-bit
+  # pass of the same book (they would otherwise share $name and overwrite each other's planes). Parsed BEFORE
+  # the existence check below, which is what the first version got wrong: it looked for a file literally named
+  # "ko-glyphs.epub:--1bit" and reported the fixture missing.
+  extra=""
+  case "$fx" in
+    *:*) extra="${fx#*:}"; fx="${fx%%:*}" ;;
+  esac
   # A fixture that is absent BY DESIGN (a commercial book this repo does not redistribute) is not a
   # gate failure; a fixture that should be in the checkout and is not, is. Without this distinction a
   # fresh clone reported "missing fixture web/demo.epub" as a failure — technically true, and wrong
@@ -204,15 +210,22 @@ for fx in $FIXTURES; do
     bad "missing fixture $fx"
     continue
   fi
-  name="$(basename "$fx" .epub)"
+  name="$(basename "$fx" .epub)$(printf '%s' "$extra" | tr -d '-')"
   echo "== $fx =="
   # --dump-planes rides along with the render that is already happening, so the per-page text-raster
   # comparison below costs a directory walk rather than a second render.
+  # EMPTIED first: the host only mkdir's the directory, so stale p00000_00000.* files from a longer earlier
+  # render would survive a shorter or failed one and make the page set look complete.
+  PORT_PLANES="$WORK/$name.port.planes"
+  REF_PLANES="$WORK/$name.oracle.planes"
+  rm -rf "$PORT_PLANES" "$REF_PLANES"
+  mkdir -p "$PORT_PLANES" "$REF_PLANES"
+
   "$PORT_BIN" "$REPO_ROOT/$fx" "$WORK/$name.port.xtch" --manifest "$WORK/$name.port.json" \
-    --dump-planes "$WORK/$name.port.planes" \
+    --dump-planes "$PORT_PLANES" $extra \
     >"$WORK/$name.port.log" 2>&1 || { bad "port failed on $fx (see $WORK/$name.port.log)"; continue; }
   "$ORACLE_BIN" "$REPO_ROOT/$fx" "$WORK/$name.oracle.xtch" --manifest "$WORK/$name.oracle.json" \
-    --dump-planes "$WORK/$name.oracle.planes" \
+    --dump-planes "$REF_PLANES" $extra \
     >"$WORK/$name.oracle.log" 2>&1 || { bad "reference failed on $fx (see $WORK/$name.oracle.log)"; continue; }
 
   # CONTROL: a manifest that carries no pages certifies nothing.
@@ -228,6 +241,7 @@ for fx in $FIXTURES; do
   # offsets, viewport and spec. Byte-identical manifests, and it is the strongest of the three
   # layers precisely because nothing here is a tolerance.
   if cmp -s "$WORK/$name.port.json" "$WORK/$name.oracle.json"; then
+    COMPARED=$((COMPARED + 1))
     ok "$name: LAYER 1 exact — layout manifest identical ($pages pages, $lines lines)"
   else
     bad "$name: LAYER 1 FAILED — layout manifest differs"
@@ -241,11 +255,24 @@ for fx in $FIXTURES; do
   # where XTCKO is allowed to differ (blue-noise dithering, a different decoder), so they are reported
   # and never judged. Whole-container equality cannot express that distinction: one illustration would
   # hide a text divergence on every other page of the book.
-  if python3 scripts/verify/text_plane_parity.py "$WORK/$name.port.planes" "$WORK/$name.oracle.planes" \
+  if python3 scripts/verify/text_plane_parity.py "$PORT_PLANES" "$REF_PLANES" \
        "$WORK/$name.port.json" 2>&1 | sed 's/^/     /'; then
-    ok "$name: LAYER 2a text raster parity — every image-free page's planes are byte-identical"
+    ok "$name: LAYER 2a text raster parity — image-free pages byte-identical (any image-page gap is named below)"
   else
-    bad "$name: LAYER 2a FAILED — a TEXT page's planes differ from the reference"
+    bad "$name: LAYER 2a FAILED — text pixels differ on an IMAGE-FREE page (a real divergence)"
+  fi
+
+  # CONTROL, right here and not before the loop: the comparator must be able to fail. Placing this in the
+  # preamble made it conditional on a plane directory left over from an EARLIER run, so on a clean $WORK the
+  # "mandatory" control silently did not execute at all.
+  if [ "$PLANE_CONTROL_DONE" = 0 ]; then
+    PLANE_CONTROL_DONE=1
+    if python3 scripts/verify/text_plane_parity.py "$WORK/$name.port.planes" \
+         "$WORK/$name.oracle.planes" "$WORK/$name.port.json" --self-control 2>&1 | sed 's/^/     /'; then
+      ok "$name: text-plane comparator control (one flipped bit must be caught)"
+    else
+      bad "$name: the text-plane comparator did not catch a flipped bit — LAYER 2a certifies nothing"
+    fi
   fi
 
   # The mechanical figure, reported and NOT gated (see --strict-planes). Byte equality is
@@ -365,6 +392,15 @@ if [ "$FONT_LAYERS" = 1 ]; then
       note "font($FACE): containers byte-identical too (expected — EPD2 stores no quantized copy)"
     fi
   done
+fi
+
+# CONTROL: a gate that compared nothing must not report agreement. An empty fixture list, a moved repo
+# root or a typo in a path would otherwise sail through every check and print PASS — which is exactly how a
+# span-edit of this script deleted the default fixture list without anything noticing.
+if [ "$COMPARED" -lt 1 ]; then
+  bad "no fixture was compared at all — an empty or unreadable fixture list is NOT agreement"
+else
+  note "fixtures compared: $COMPARED"
 fi
 
 echo

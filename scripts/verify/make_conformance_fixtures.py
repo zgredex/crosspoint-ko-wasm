@@ -103,6 +103,25 @@ MIXED = [
 ]
 
 
+# ko-glyphs.epub  the glyph-raster BRANCHES a Korean prose fixture never reaches: superscript/subscript
+# scaled glyphs (a different raster call from ordinary text), synthesized bold (the fork synthesises weight
+# because there is no bold KoPub), italic, and codepoints KoPub does not cover (the fallback path). These are
+# exactly the branches GfxRenderer::renderCharImpl / renderCharScaled own, and those two functions cannot be
+# held byte-identical in the pin because they carry the port's capture fast path. The exact text-pixel
+# comparison on this fixture is therefore the proof that the fast path is behaviour-preserving. Run in BOTH
+# 1-bit and 2-bit, because the two modes take different glyph paths.
+GLYPHS = [
+    ('글리프 분기', [
+        '위첨자<sup>2</sup> 와 아래첨자 H<sub>2</sub>O, 그리고 <b>굵은 글자</b> 합성.',
+        '기울임 <i>이탤릭</i>, 굵은 기울임 <b><i>동시</i></b>, 일반 텍스트.',
+        '미지원 코드포인트: ☃ ✈ ℝ ℤ Π ψ ⓒ ・ ï ★',
+        '한 줄에 위첨자<sup>각주</sup> 와 아래첨자<sub>지수</sub> 가 섞이면 기준선과 줄 높이가 흔들린다.',
+        '가나다라마바사아자차카타파하 1234567890 ABCabc .,!?()“”‘’',
+        '굵은 문장 안의 <b>굵은 한글</b> 과 굵은 라틴 <b>Bold Latin</b> 이 나란히.',
+    ]),
+]
+
+
 def chapter(title, paras, style_extra=''):
     body = '\n'.join(f'      {p}' if p.startswith('<') else f'      <p>{p}</p>' for p in paras)
     return f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -196,6 +215,7 @@ def main():
     made.append(write_epub(os.path.join(OUT, 'ko-ruby.epub'), 'XTCKO conformance — Korean ruby', RUBY))
     made.append(write_epub(os.path.join(OUT, 'ko-mixed.epub'), 'XTCKO conformance — mixed runs', MIXED))
     made.append(write_epub(os.path.join(OUT, 'ko-symbols.epub'), 'XTCKO conformance — uncovered codepoints', SYMBOLS))
+    made.append(write_epub(os.path.join(OUT, 'ko-glyphs.epub'), 'XTCKO conformance — glyph branches', GLYPHS))
     for p in made:
         print(f'{p}  {os.path.getsize(p)} bytes')
     return 0
