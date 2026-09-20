@@ -8,15 +8,16 @@
 <meta property="og:title" content="XTCKO — EPUB → XTC 변환기">
 <meta property="og:description" content="KO 포크 조판 규칙을 따르는 EPUB → XTC 변환기. 모든 변환이 브라우저에서 실행됩니다.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f172a'/%3E%3Cpath d='M9 9l14 14M23 9L9 23' stroke='%23e8eaf0' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=105">
+<link rel="stylesheet" href="style.css?v=106">
 </head>
 <body data-app-state="empty">
 
-<!-- compact app bar: brand + (loaded) title + (loaded) book change. The event status line lives
-     here in both states so it is never duplicated or hidden behind a panel. -->
 <header id="appbar">
-  <span class="brand">XTCKO</span>
-  <span class="brandSub">EPUB → XTC</span>
+  <div class="brandLockup" aria-label="XTCKO EPUB to XTC converter">
+    <span class="brandMark" aria-hidden="true">X</span>
+    <span class="brand">XTCKO</span>
+    <span class="brandSub">EPUB → XTC</span>
+  </div>
   <h1 id="bookTitle" class="bookTitle" hidden></h1>
   <span id="status" class="status" role="status" aria-live="polite">EPUB 파일을 선택하세요</span>
   <div class="appbarActions">
@@ -24,24 +25,33 @@
   </div>
 </header>
 
-<!-- ① import state: one centered card. No settings, no export, no engine internals. -->
 <main id="importScreen">
   <section id="importCard">
-    <h1>EPUB → XTC 변환기</h1>
-    <p class="sub">KO 포크 조판 규칙으로 기기용 XTC/XTCH 파일을 만듭니다.</p>
+    <div class="heroCopy">
+      <p class="eyebrow">CROSSPOINT-KO RENDERING</p>
+      <h1>책을, 기기에 맞는<br>형태로.</h1>
+      <p class="sub">한국어 조판 규칙을 그대로 적용해 EPUB을<br class="wideOnly"> Xteink용 XTC·XTCH로 변환합니다.</p>
+    </div>
+
+    <div class="deviceChips" aria-label="지원 기기">
+      <span><b>X4</b> 480×800</span>
+      <span><b>X3</b> 528×792</span>
+      <span>세로 · 가로</span>
+    </div>
 
     <div id="dropZone">
       <input type="file" id="epubFile" class="fileInput" accept=".epub,application/epub+zip"
              title="EPUB 파일 선택">
-      <p class="dropStep">① EPUB 선택</p>
-      <p class="dropTitle">EPUB 파일을 끌어다 놓거나 파일을 선택하세요</p>
+      <span class="dropIcon" aria-hidden="true">↑</span>
+      <p class="dropTitle">EPUB을 여기에 놓으세요</p>
+      <p class="dropSupport">또는 기기에서 파일을 선택하세요</p>
       <p class="dropActions">
-        <label for="epubFile" class="btn primary fileBtn" title="EPUB 파일 선택">EPUB 파일 선택</label>
+        <label for="epubFile" class="btn primary fileBtn" title="EPUB 파일 선택">파일 선택</label>
       </p>
       <p class="pickedFile" id="pickedFile" hidden></p>
-      <p class="privacy">파일은 서버에 업로드되지 않습니다. 모든 변환은 이 브라우저에서 처리됩니다.</p>
-      <p class="dropMeta">EPUB 2/3 · DRM 없는 파일 · X4 480×800 / X3 528×792 XTC·XTCH</p>
     </div>
+    <p class="privacy"><span aria-hidden="true">●</span> 파일은 업로드되지 않습니다. 모든 처리는 이 브라우저 안에서 완료됩니다.</p>
+    <p class="dropMeta">EPUB 2·3 · DRM 없는 파일</p>
   </section>
 </main>
 
@@ -83,295 +93,190 @@
   </section>
 
   <aside id="sidebar" aria-label="설정 및 내보내기">
-    <!-- §2: a real focusable way out of the dialog. Escape and the backdrop remain, but a phone or
-         screen-reader user needs a control they can reach and press. Hidden on desktop, where the
-         sidebar is a permanent column rather than a dialog. -->
-    <button id="drawerClose" class="drawerClose" aria-label="설정 닫기">닫기</button>
-    <!-- §2: only this list scrolls, so the export action below cannot scroll out of reach -->
+    <header class="sidebarHeader">
+      <div><p class="eyebrow">BOOK SETUP</p><h2>변환 설정</h2></div>
+      <button id="drawerClose" class="drawerClose iconButton" aria-label="설정 닫기">×</button>
+    </header>
+
     <div class="sidebarScroll">
-    <section class="card">
-      <h2><span class="step">②</span> 본문 설정</h2>
-
-      <label class="ctrl">
-        <span>줄 간격</span>
-        <select id="lineCompression">
-          <option value="1.00">좁게 (1.00)</option>
-          <option value="1.20" selected>보통 (1.20)</option>
-          <option value="1.40">넓게 (1.40)</option>
-        </select>
-      </label>
-
-      <label class="ctrl">
-        <span>본문 정렬</span>
-        <select id="paragraphAlignment">
-          <option value="0" selected>양끝 정렬</option>
-          <option value="1">왼쪽</option>
-          <option value="2">가운데</option>
-          <option value="3">오른쪽</option>
-          <option value="4">책 스타일</option>
-        </select>
-      </label>
-
-      <label class="ctrl check" id="textAaLab" title="글자 가장자리를 회색으로 부드럽게 그릴지 정합니다.">
-        <input type="checkbox" id="textAa" checked>
-        <span>글자 안티앨리어싱 <em class="aaHint"></em></span>
-      </label>
-      <details class="help">
-        <summary aria-label="글자 안티앨리어싱 도움말">?</summary>
-        <p class="hint">텍스트 안티앨리어싱. 2-bit XTCH: 그레이 평면이 2비트 글리프 커버리지를 담습니다(펌웨어와 동일, 끄면 텍스트가 1비트). 1-bit XTC: 이미지는 어느 쪽이든 이미지 디더링 모델로 처리되고, 이 스위치는 텍스트까지 하프톤 처리할지(켜짐: 부드러운 가장자리) 1비트로 선명하게 둘지(꺼짐)를 정합니다.</p>
-      </details>
-
-      <label class="ctrl check" title="공백뿐 아니라 글자 사이에서도 줄을 바꿉니다.">
-        <input type="checkbox" id="characterWrap" checked>
-        <span>한글 글자 단위 줄바꿈</span>
-      </label>
-      <details class="help">
-        <summary aria-label="한글 글자 단위 줄바꿈 도움말">?</summary>
-        <p class="hint">한글 글자 단위 줄바꿈: 공백뿐 아니라 글자 사이에서도 줄을 바꿉니다. KO 리더 기본값이며, 양끝 정렬 한국어에서 단어 사이가 크게 벌어지는 것을 막습니다. 하이픈보다 우선합니다 — 글자 단위로 어디서든 줄을 바꿀 수 있어 하이픈이 할 일이 없습니다(업스트림: "Hyphenation only applies in word-wrap mode").</p>
-      </details>
-    </section>
-
-    <section class="card" id="fontCard">
-      <h2>본문 글꼴</h2>
-
-      <div class="ctrl segRow">
-        <span>글꼴 선택</span>
-        <select id="fontPreset" class="visHidden">
-          <option value="kopub" selected>KoPub Batang 14 (기준 기본 글꼴)</option>
-          <option value="ridibatang">RIDIBatang 14 (XTCKO 추가)</option>
-          <option value="custom">사용자 글꼴 (.epdfont)</option>
-        </select>
-        <span class="seg" role="radiogroup" aria-label="본문 글꼴">
-          <label class="segOpt"><input type="radio" name="fontPresetRadio" value="kopub" checked
-                 title="KoPub Batang 14 — CrossPoint-KO 기본 본문 글꼴 (getReaderFontId 기본값)"><span>KoPub Batang 14</span></label>
-          <label class="segOpt"><input type="radio" name="fontPresetRadio" value="ridibatang"
-                 title="RIDIBatang 14 — XTCKO 추가 글꼴 (기준 엔진에는 없음)"><span>RIDIBatang 14</span></label>
-          <label class="segOpt"><input type="radio" name="fontPresetRadio" value="custom"
-                 title="사용자 글꼴 (OTF/TTF를 브라우저에서 변환)"><span>사용자 글꼴</span></label>
-        </span>
-      </div>
-
-      <div id="fontUpload" class="uploadBox hidden">
-        <p class="hint">TTF/OTF 글꼴을 선택하면 브라우저에서 즉시 변환하여 미리보기에 적용합니다.
-          현재 페이지를 먼저 처리하고, 나머지 페이지는 유휴 시간에 백그라운드에서 미리 변환합니다.
-          기기가 <code>/fonts/</code>에서 읽는 것과 같은 결과이며, 모든 처리는 브라우저 안에서
-          이루어지고 파일은 서버로 전송되지 않습니다.</p>
-
-        <div class="ctrl fileCtrl">
-          <span>글꼴 파일</span>
-          <input type="file" id="fontFile" class="fileInput" accept=".otf,.ttf,font/otf,font/ttf">
-          <label for="fontFile" class="btn secondary fileBtn small" title="OTF/TTF 글꼴 파일 선택">파일 선택…</label>
+      <section class="card" id="deviceCard">
+        <div class="sectionHead">
+          <span class="sectionIndex">01</span>
+          <div><h2>기기와 화면</h2><p>출력 크기와 읽는 방향</p></div>
         </div>
-
-        <!-- Everything below needs a font FILE: runFontConvert() returns early without
-             one, so these knobs are inert until something is loaded. Hidden until then —
-             a control that cannot do anything should not be on screen. -->
-        <div id="fontTuning" class="hidden">
-        <details class="adv" id="fontAdvanced">
-        <summary>고급 글꼴 설정</summary>
+        <label class="ctrl" title="CrossPoint-KO와 FreeInk가 런타임에 선택하는 실제 패널 프로파일입니다.">
+          <span>기기</span>
+          <select id="deviceProfile">
+            <option value="x4" selected>Xteink X4 · 480×800</option>
+            <option value="x3">Xteink X3 · 528×792</option>
+          </select>
+        </label>
+        <label class="ctrl" title="KO 포크의 읽기 방향과 같은 좌표 변환·안전 여백으로 본문을 다시 조판합니다.">
+          <span>읽기 방향</span>
+          <select id="orientation">
+            <option value="0" selected>세로</option>
+            <option value="1">가로 · 시계 방향</option>
+            <option value="3">가로 · 반시계 방향</option>
+          </select>
+        </label>
+        <details class="help proseHelp">
+          <summary>가로 모드 정보</summary>
+          <p class="hint">CrossPoint-KO의 두 가로 모드를 그대로 사용합니다. 본문은 X4 800×480 또는 X3 792×528 좌표에서 다시 조판되고, 비대칭 안전 여백도 방향에 맞춰 회전합니다.</p>
+        </details>
         <label class="ctrl">
-          <span>글꼴 이름</span>
-          <input type="text" id="fontName" value="custom" maxlength="24">
+          <span>화면 여백</span>
+          <input type="range" id="screenMargin" min="5" max="40" step="5" value="5" aria-label="화면 여백">
+          <output id="screenMarginOut">5 px</output>
         </label>
+      </section>
 
-        <label class="ctrl" title="KO 리더 150 dpi 기준 크기 — 14가 기본 글꼴(KoPub Batang 14)과 같습니다">
-          <span>글자 크기</span>
-          <input type="range" id="fontSize" min="8" max="48" step="1" value="14">
-          <output id="fontSizeOut">14 pt</output>
-        </label>
-
-        <label class="ctrl" title="가변 폰트는 이 값으로 인스턴스한 뒤 래스터화합니다. 400 = 원본 그대로.">
-          <span>굵기</span>
-          <input type="range" id="fontWeight" min="100" max="900" step="25" value="500">
-          <output id="fontWeightOut">500</output>
-        </label>
-        <details class="help">
-          <summary aria-label="굵기 도움말">?</summary>
-          <p class="hint">목표 획 굵기. 가변 폰트(wght 축)는 이 값으로 인스턴스한 뒤 래스터화합니다 — fvar 기본값이 Thin인 폰트(예: NotoSansKR-VariableFont 기본 100)를 바로잡습니다. 정적 폰트는 자체 OS/2 굵기 기준으로 합성 볼드를 적용합니다: +100 ≈ 14 pt에서 획 +0.5 px로, 측정상 KO 기본 RIDIBatang의 잉크량과 비슷합니다. 400 = 원본 그대로.</p>
-        </details>
-
-        <label class="ctrl check">
-          <input type="checkbox" id="fontHangul" checked>
-          <span>현대 한글 음절 U+AC00–D7A3</span>
-        </label>
-
-        <label class="ctrl stacked">
-          <span>추가 유니코드 범위</span>
-          <input type="text" id="fontIntervals" placeholder="e.g. 0x3130,0x318F 0x3000,0x303F"
-                 title="쉼표나 공백으로 구분한 MIN,MAX 16진수 범위">
-        </label>
-
-        <label class="ctrl" title="공백 폭(px) — KO 빌드는 공백을 9 px로 덮어씁니다">
-          <span>공백 너비 (px)</span>
-          <input type="range" id="fontSpacePx" min="0" max="30" step="1" value="9">
-          <output id="fontSpacePxOut">9 px</output>
-        </label>
-        </details>
-
+      <section class="card" id="fontCard">
+        <div class="sectionHead">
+          <span class="sectionIndex">02</span>
+          <div><h2>본문과 글꼴</h2><p>한국어 읽기에 맞춘 조판</p></div>
         </div>
 
-        <div id="fontConvStatus" class="fontStatus" role="status" aria-live="polite"></div>
+        <div class="ctrl segRow stackedControl">
+          <span>본문 글꼴</span>
+          <select id="fontPreset" class="visHidden">
+            <option value="kopub" selected>KoPub Batang 14 (기준 기본 글꼴)</option>
+            <option value="ridibatang">RIDIBatang 14 (XTCKO 추가)</option>
+            <option value="custom">사용자 글꼴 (.epdfont)</option>
+          </select>
+          <span class="seg" role="radiogroup" aria-label="본문 글꼴">
+            <label class="segOpt"><input type="radio" name="fontPresetRadio" value="kopub" checked title="KoPub Batang 14 — CrossPoint-KO 기본 본문 글꼴"><span>KoPub</span></label>
+            <label class="segOpt"><input type="radio" name="fontPresetRadio" value="ridibatang" title="RIDIBatang 14 — XTCKO 추가 글꼴"><span>RIDIBatang</span></label>
+            <label class="segOpt"><input type="radio" name="fontPresetRadio" value="custom" title="사용자 글꼴"><span>사용자</span></label>
+          </span>
+        </div>
 
-      </div>
-    </section>
+        <div id="fontUpload" class="uploadBox hidden">
+          <p class="hint">TTF/OTF를 브라우저에서 .epdfont로 변환해 즉시 적용합니다. 파일은 서버로 전송되지 않습니다.</p>
+          <div class="ctrl fileCtrl">
+            <span>글꼴 파일</span>
+            <input type="file" id="fontFile" class="fileInput" accept=".otf,.ttf,font/otf,font/ttf">
+            <label for="fontFile" class="btn secondary fileBtn small">파일 선택</label>
+          </div>
+          <div id="fontTuning" class="hidden">
+            <details class="adv" id="fontAdvanced">
+              <summary>고급 글꼴 설정</summary>
+              <label class="ctrl"><span>글꼴 이름</span><input type="text" id="fontName" value="custom" maxlength="24"></label>
+              <label class="ctrl"><span>글자 크기</span><input type="range" id="fontSize" min="8" max="48" step="1" value="14"><output id="fontSizeOut">14 pt</output></label>
+              <label class="ctrl"><span>굵기</span><input type="range" id="fontWeight" min="100" max="900" step="25" value="500"><output id="fontWeightOut">500</output></label>
+              <details class="help"><summary aria-label="굵기 도움말">?</summary><p class="hint">가변 폰트는 선택한 wght 값으로 인스턴스하고, 정적 폰트는 원래 굵기를 기준으로 합성 볼드를 적용합니다. 400은 원본 그대로입니다.</p></details>
+              <label class="ctrl check"><input type="checkbox" id="fontHangul" checked><span>현대 한글 음절 U+AC00–D7A3</span></label>
+              <label class="ctrl stacked"><span>추가 유니코드 범위</span><input type="text" id="fontIntervals" placeholder="e.g. 0x3130,0x318F" title="쉼표나 공백으로 구분한 MIN,MAX 16진수 범위"></label>
+              <label class="ctrl"><span>공백 너비</span><input type="range" id="fontSpacePx" min="0" max="30" step="1" value="9"><output id="fontSpacePxOut">9 px</output></label>
+            </details>
+          </div>
+          <div id="fontConvStatus" class="fontStatus" role="status" aria-live="polite"></div>
+        </div>
 
-    <section class="card">
-      <h2>페이지</h2>
-      <label class="ctrl" title="CrossPoint-KO와 FreeInk가 런타임에 선택하는 실제 패널 프로파일입니다.">
-        <span>기기</span>
-        <select id="deviceProfile">
-          <option value="x4" selected>Xteink X4 · 480×800</option>
-          <option value="x3">Xteink X3 · 528×792</option>
-        </select>
-      </label>
-      <label class="ctrl" title="KO 포크의 읽기 방향과 같은 좌표 변환·안전 여백으로 본문을 다시 조판합니다.">
-        <span>읽기 방향</span>
-        <select id="orientation">
-          <option value="0" selected>세로</option>
-          <option value="1">가로 · 시계 방향</option>
-          <option value="3">가로 · 반시계 방향</option>
-        </select>
-      </label>
-      <details class="help">
-        <summary aria-label="읽기 방향 도움말">?</summary>
-        <p class="hint">CrossPoint-KO의 두 가로 모드를 그대로 사용합니다. 본문은 X4의 800×480 또는 X3의 792×528 가로 좌표에서 다시 조판되고, 비대칭 안전 여백도 방향에 맞춰 회전합니다. XTC/XTCH 레코드는 선택한 기기의 세로 크기(X4 480×800, X3 528×792)로 저장됩니다.</p>
+        <label class="ctrl">
+          <span>줄 간격</span>
+          <select id="lineCompression">
+            <option value="1.00">좁게 (1.00)</option>
+            <option value="1.20" selected>보통 (1.20)</option>
+            <option value="1.40">넓게 (1.40)</option>
+          </select>
+        </label>
+        <label class="ctrl">
+          <span>본문 정렬</span>
+          <select id="paragraphAlignment">
+            <option value="0" selected>양끝 정렬</option>
+            <option value="1">왼쪽</option>
+            <option value="2">가운데</option>
+            <option value="3">오른쪽</option>
+            <option value="4">책 스타일</option>
+          </select>
+        </label>
+
+        <div class="toggleGroup">
+          <label class="ctrl check" id="textAaLab" title="글자 가장자리를 회색으로 부드럽게 그릴지 정합니다.">
+            <input type="checkbox" id="textAa" checked><span>글자 안티앨리어싱 <em class="aaHint"></em></span>
+          </label>
+          <details class="help inlineHelp"><summary aria-label="글자 안티앨리어싱 도움말">?</summary><p class="hint">XTCH에서는 2비트 글리프 커버리지로 가장자리를 부드럽게 표현합니다. XTC에서는 텍스트를 하프톤 처리할지 선명한 1비트로 둘지 정합니다.</p></details>
+          <label class="ctrl check" title="공백뿐 아니라 글자 사이에서도 줄을 바꿉니다.">
+            <input type="checkbox" id="characterWrap" checked><span>한글 글자 단위 줄바꿈</span>
+          </label>
+          <details class="help inlineHelp"><summary aria-label="한글 글자 단위 줄바꿈 도움말">?</summary><p class="hint">KO 리더 기본값입니다. 글자 사이에서도 줄을 바꿔 양끝 정렬에서 단어 사이가 크게 벌어지는 것을 막습니다.</p></details>
+        </div>
+      </section>
+
+      <section class="card" id="imageCard">
+        <div class="sectionHead">
+          <span class="sectionIndex">03</span>
+          <div><h2>이미지</h2><p>표지와 삽화의 표시 방식</p></div>
+        </div>
+        <label class="ctrl">
+          <span>이미지 처리</span>
+          <select id="imageRendering">
+            <option value="0" selected>표시</option>
+            <option value="1">자리만 표시</option>
+            <option value="2">숨김</option>
+          </select>
+        </label>
+        <label class="ctrl" title="사진·삽화에만 적용됩니다. 텍스트는 글자 안티앨리어싱이 담당합니다.">
+          <span>디더링</span>
+          <select id="imageDither">
+            <option value="2" selected>블루 노이즈 (기본)</option>
+            <option value="1">바이어 4×4 (규칙 패턴)</option>
+            <option value="3">Floyd–Steinberg (오차 확산)</option>
+            <option value="4">Atkinson (오차 확산)</option>
+            <option value="5">Jarvis–Judice–Ninke (오차 확산)</option>
+            <option value="6">Stucki (오차 확산)</option>
+            <option value="7">Burkes (오차 확산)</option>
+            <option value="9">Zhou–Fang 2003 (강도별 커널)</option>
+            <option value="8">ko 포크 해시 (펌웨어 자체)</option>
+            <option value="0">없음 (단순 임계값)</option>
+          </select>
+        </label>
+        <details class="help proseHelp"><summary>디더링 방식 자세히 보기</summary><p class="hint">사진·표지·삽화에만 적용됩니다. 2비트 XTCH는 4단계, 1비트 XTC는 2단계로 원본 이미지에서 한 번에 처리합니다. 기본값은 블루 노이즈이며 다른 모델은 같은 출력 톤 깊이에 맞춰 적용됩니다.</p></details>
+      </section>
+
+      <details class="card collapsible" id="advancedSettings">
+        <summary><span class="sectionIndex">04</span><span><b>고급 조판</b><small>EPUB 스타일과 문단 세부 설정</small></span></summary>
+        <label class="ctrl check" title="문단 첫 줄을 들여쓸지 정합니다."><input type="checkbox" id="paragraphIndent"><span>첫 줄 들여쓰기</span></label>
+        <details class="help"><summary aria-label="첫 줄 들여쓰기 도움말">?</summary><p class="hint">책 CSS에 text-indent가 있으면 그 값을 우선합니다. CSS 들여쓰기가 없는 문단에는 U+3000 접두사를 사용합니다.</p></details>
+        <label class="ctrl check"><input type="checkbox" id="extraParagraphSpacing" checked><span>문단 간격</span></label>
+        <p class="hint hidden" id="wrapNote">한글 글자 단위 줄바꿈이 켜져 있으면 하이픈은 적용되지 않습니다. 하이픈을 쓰려면 이 옵션을 끄세요.</p>
+        <label class="ctrl check" id="hyphenationLab" title="줄에 들어가지 않는 단어를 나눕니다."><input type="checkbox" id="hyphenation"><span>하이픈 처리</span></label>
+        <details class="help"><summary aria-label="하이픈 처리 도움말">?</summary><p class="hint">책 언어의 패턴이 있으면 언어별 패턴을 쓰고, 없으면 폴백 분절을 사용합니다. 한글 글자 단위 줄바꿈이 켜져 있으면 적용되지 않습니다.</p></details>
+        <label class="ctrl check"><input type="checkbox" id="embeddedStyle" checked><span>EPUB 원본 스타일 사용</span></label>
+        <details class="adv engineInfo" id="engineInfo">
+          <summary>변환 엔진 정보</summary>
+          <p class="hint">엔진: crosspoint-reader-ko @ release/korean 84a39194 (MIT) WASM 빌드. 기본 글꼴은 KoPub Batang 14입니다. 안전 여백과 상태 표시줄 예약 영역은 KO 리더 계산식으로 방향에 맞춰 적용하며, 기기 UI는 파일에 그리지 않습니다.</p>
+        </details>
       </details>
 
-      <label class="ctrl">
-        <span>화면 여백</span>
-        <input type="range" id="screenMargin" min="5" max="40" step="5" value="5" aria-label="화면 여백">
-        <output id="screenMarginOut">5 px</output>
-      </label>
+      <section class="card" id="exportPanel">
+        <div class="sectionHead">
+          <span class="sectionIndex">05</span>
+          <div><h2>출력 파일</h2><p>미리보기와 동일한 결과</p></div>
+        </div>
+        <p class="hint" id="exportSub">EPUB 한 권을 기기 파일 하나로 만듭니다.</p>
+        <div class="seg exportSeg" role="radiogroup" aria-label="출력 모드" title="출력 톤 깊이 — 미리보기가 정확히 이 모드로 다시 렌더링합니다">
+          <label class="segOpt"><input type="radio" name="exportModeRadio" value="0" title="XTC · 1비트"><span><b>XTC</b><small>1비트 · 작은 파일</small></span></label>
+          <label class="segOpt"><input type="radio" name="exportModeRadio" value="1" checked title="XTCH · 2비트 계조"><span><b>XTCH</b><small>2비트 · 이미지 품질</small></span></label>
+        </div>
+        <p class="hint" id="modeHint">사진·삽화가 많은 책은 XTCH, 텍스트 위주로 가볍게 읽으려면 XTC를 권합니다.</p>
+        <label class="ctrl check" title="기기 펌웨어 5.1.6 이상에서 읽을 수 있습니다."><input type="checkbox" id="lz4Wrap"><span>LZ4로 압축 (.xtcz)</span></label>
+        <details class="help"><summary aria-label="LZ4 압축 도움말">?</summary><p class="hint">LZ4 블록으로 감싸 .xtcz로 저장합니다. 펌웨어 5.1.6 이상에서 읽을 수 있으며 압축률은 책 내용에 따라 달라집니다.</p></details>
+        <label class="ctrl"><span>파일 이름</span><input type="text" id="exportName" value="[X4]" maxlength="40" aria-label="파일 이름 접두사" title="책 제목 앞에 붙는 접두사"></label>
+        <p class="hint" id="viewportOut" title="선택한 논리 화면에서 안전 여백·화면 여백·상태 표시줄 예약 영역을 뺀 본문 영역입니다."></p>
+      </section>
 
-      <label class="ctrl">
-        <span>이미지 처리</span>
-        <select id="imageRendering">
-          <option value="0" selected>표시</option>
-          <option value="1">자리만 표시</option>
-          <option value="2">숨김</option>
-        </select>
-      </label>
+      <button id="resetBtn" class="btn resetButton">모든 설정 초기화</button>
+    </div>
 
-      <label class="ctrl" title="사진·삽화에만 적용됩니다. 텍스트는 글자 안티앨리어싱이 담당합니다.">
-        <span>이미지 디더링</span>
-        <select id="imageDither">
-          <option value="2" selected>블루 노이즈 (기본)</option>
-          <option value="1">바이어 4×4 (규칙 패턴)</option>
-          <option value="3">Floyd–Steinberg (오차 확산)</option>
-          <option value="4">Atkinson (오차 확산)</option>
-          <option value="5">Jarvis–Judice–Ninke (오차 확산)</option>
-          <option value="6">Stucki (오차 확산)</option>
-          <option value="7">Burkes (오차 확산)</option>
-          <option value="9">Zhou–Fang 2003 (강도별 커널)</option>
-          <option value="8">ko 포크 해시 (펌웨어 자체)</option>
-          <option value="0">없음 (단순 임계값)</option>
-        </select>
-      </label>
-      <details class="help">
-        <summary aria-label="이미지 디더링 도움말">?</summary>
-        <p class="hint">이미지 픽셀 전용 디더링 모델(사진·표지·삽화) — 텍스트는 이 설정의 영향을 받지 않습니다(텍스트는 안티앨리어싱 스위치 담당). 모델은 내보내기 톤 깊이에 맞춰 적용됩니다: 2-bit XTCH는 4단계, 1-bit XTC는 2단계(이미 디더링된 페이지를 다시 디더링하지 않고 원본 이미지에서 한 번에). 톤 기준은 공식 변환기 epub2xtc.xteink.cn의 모델 그대로입니다 — 단계 0/85/170/255, 컷 42/127/212(경계값은 아래 구간에 포함), 1비트는 128. srokl/xtcjsapp과 x4converter.rho.sh도 같은 값을 씁니다. 그래서 평평한 회색 패치는 자기 값으로 되돌아옵니다(4단계 ±0.42, 2단계 ±1.12). 정렬형: 블루 노이즈(기본, 64×64), 바이어(4×4). 오차 확산: Floyd–Steinberg, Atkinson, Jarvis–Judice–Ninke, Stucki, Burkes, Zhou–Fang(강도별 커널 + 임계값 변조, 여기서는 결정적 — 원본은 Math.random() 사용). 톤 오차(평균 |패치 평균 − 원본 회색|, 0~255 기준) — 4단계: 블루 노이즈 0.21 · FS 0.48 · Burkes 0.80 · ko 포크 해시 1.75 · Atkinson 4.79 · 없음 22.8 / 2단계: 블루 노이즈 0.56 · FS 1.29 · ko 포크 해시 35.2 · 없음 69.6. ko 포크 해시 2비트는 펌웨어 양자화기 그대로라 컷이 단계값(85/170)에 있어 중간톤이 어긋납니다(올바른 컷은 중간점 42/127/212). 1비트는 펌웨어의 quantize1bit를 그대로 씁니다. 1비트 텍스트 하프톤의 잉크 밀도도 같은 모델에서 파생됩니다(단계 L → 잉크 255−L = 0/170/85/255, 즉 0/67%/33%/100%). 미리보기의 네 단계 색은 별개의 표시 문제로, 패널의 실제 반사율(정규화)로 그립니다. 공식 변환기와 아직 다른 점: 공식은 오차 확산에 강도(이미지 75%, 배경 50%)를 걸고 기본이 페이지 전체 디더링이며 미리보기에 단계값을 그대로 칠합니다. 여기서는 100% 확산·이미지만 디더링합니다.</p>
-      </details>
-
-      <button id="resetBtn" class="btn secondary">기본값으로 되돌리기</button>
-    </section>
-
-    <!-- §10: the controls a Korean reader rarely touches, out of the first-glance path -->
-    <details class="adv" id="advancedSettings">
-      <summary>고급 설정</summary>
-
-      <label class="ctrl check" title="문단 첫 줄을 들여쓸지 정합니다.">
-        <input type="checkbox" id="paragraphIndent">
-        <span>첫 줄 들여쓰기</span>
-      </label>
-      <details class="help">
-        <summary aria-label="첫 줄 들여쓰기 도움말">?</summary>
-        <p class="hint">첫 줄 들여쓰기. 책 CSS가 이미 들여쓰기한 문단에는 적용되지 않습니다: CSS text-indent가 있는 문단(한국 소설 대부분은 p{text-indent:1em})은 이 스위치와 무관하게 들여쓰기되므로 그런 책에서는 거의 바뀌지 않습니다(측정: 2034쪽 중 1쪽). CSS 들여쓰기가 없는 책에서는 대부분 바뀝니다(14쪽 중 12쪽). U+3000 접두사로 구현 — EM-SPACE와 달리 모든 한글 폰트에 있습니다.</p>
-      </details>
-
-      <label class="ctrl check">
-        <input type="checkbox" id="extraParagraphSpacing" checked>
-        <span>문단 간격</span>
-      </label>
-
-      <p class="hint hidden" id="wrapNote">한글 글자 단위 줄바꿈이 켜져 있으면 하이픈은 적용되지
-        않습니다. 하이픈을 쓰려면 이 옵션을 끄세요.</p>
-
-      <label class="ctrl check" id="hyphenationLab" title="줄에 들어가지 않는 단어를 나눕니다.">
-        <input type="checkbox" id="hyphenation">
-        <span>하이픈 처리</span>
-      </label>
-      <details class="help">
-        <summary aria-label="하이픈 처리 도움말">?</summary>
-        <p class="hint">줄에 들어가지 않는 단어를 나눕니다: 책 언어에 패턴이 있으면 언어 패턴(en/de/fr/es/it/pl/ru/sv/fi/uk), 없으면 폴백 분절(업스트림에 한국어 하이픈 패턴이 없어 한글 단어는 보이는 하이픈 없이 나뉩니다). '한글 글자 단위 줄바꿈'이 켜져 있으면 도달할 수 없고 아무것도 바꾸지 않으므로 숨깁니다.</p>
-      </details>
-
-      <label class="ctrl check">
-        <input type="checkbox" id="embeddedStyle" checked>
-        <span>EPUB 원본 스타일 사용</span>
-      </label>
-
-      <details class="adv" id="engineInfo">
-        <summary>변환 엔진 정보</summary>
-        <p class="hint">
-          엔진: crosspoint-reader-ko @ release/korean 84a39194 (MIT) WASM 빌드 — KO 타이포그래피<br>
-          본문 글꼴: KoPub Batang 14(기본, getReaderFontId 기본값, advanceY 32), RIDIBatang 14(XTCKO 추가, advanceY 38),
-          사용자 .epdfont(OTF/TTF 변환). 줄 높이는 펌웨어 값(반올림):
-          KoPub 14는 32/38/45 px, RIDIBatang 14는 38/46/53 px (좁게/보통/넓게)<br>
-          쪽 여백은 리더 계산식 그대로입니다: 가시 영역 9/3/3/3을 읽기 방향에 맞춰 회전한 뒤 screenMargin을 더하고,
-          논리 화면 아래는 max(screenMargin, 상태 표시줄 19 px)입니다. 기본 세로 14/8/22/8 →
-          X4 464×764, X3 512×756. 가로 시계 방향 8/14/22/8 및 반시계 방향 8/8/22/14 →
-          X4 778×450, X3 770×498.
-          상태 표시줄 영역은 <b>예약만</b> 하고 페이지에 그려 넣지 않습니다 — 기기가 읽을 때 자체 크롬을 합성합니다.
-        </p>
-      </details>
-    </details>
-
-    <section class="card" id="exportPanel">
-      <h2><span class="step">③</span> 내보내기</h2>
-      <p class="hint" id="exportSub">EPUB 1권 → 기기 파일 1개. 미리보기는 선택한 모드의 결과를
-        그대로 보여줍니다.</p>
-
-      <div class="seg exportSeg" role="radiogroup" aria-label="출력 모드"
-           title="출력 톤 깊이 — 미리보기가 정확히 이 모드로 다시 렌더링합니다">
-        <label class="segOpt"><input type="radio" name="exportModeRadio" value="0"
-               title="XTC · 1비트. 페이지당 48 KB, 기기에서 가장 빠르게 넘어갑니다. 회색은 블루 노이즈 하프톤으로 표현합니다."><span>XTC · 1비트 · 작은 파일</span></label>
-        <label class="segOpt"><input type="radio" name="exportModeRadio" value="1" checked
-               title="XTCH · 2비트 계조. 페이지당 96 KB, 회색 4단계를 그대로 담아 사진과 삽화 품질이 우선입니다."><span>XTCH · 2비트 계조 · 이미지 품질 우선</span></label>
-      </div>
-      <p class="hint" id="modeHint">사진·삽화가 많은 책은 XTCH, 텍스트 위주로 가볍게 읽으려면 XTC를 권합니다.</p>
-
-      <label class="ctrl check" title="파일을 LZ4로 압축해 .xtcz로 저장합니다. 기기 펌웨어 5.1.6 이상에서 읽을 수 있고, 책에 따라 파일 크기를 크게 줄일 수 있습니다.">
-        <input type="checkbox" id="lz4Wrap">
-        <span>LZ4로 압축 (.xtcz)</span>
-      </label>
-      <details class="help">
-        <summary aria-label="LZ4 압축 도움말">?</summary>
-        <p class="hint">파일을 LZ4 블록으로 감싸 <code>.xtcz</code>로 저장합니다. 기기 펌웨어 5.1.6 이상에서 읽을 수 있습니다. 압축률은 책 내용에 따라 크게 달라집니다 — 이미지가 많은 책에서 특히 잘 줄어듭니다(측정: 이미지 위주 14쪽 책 673,804 → 118,487 바이트, 17.6%). 텍스트만 있는 책은 줄어드는 폭이 작습니다.</p>
-      </details>
-
-      <label class="ctrl">
-        <span>파일 이름</span>
-        <input type="text" id="exportName" value="[X4]" maxlength="40"
-               aria-label="파일 이름 접두사" title="책 제목 앞에 붙는 접두사">
-      </label>
-
-      <p class="hint" id="viewportOut"
-         title="선택한 논리 화면에서 안전 여백·화면 여백·상태 표시줄 예약 영역을 뺀 본문 영역입니다. 파일에는 UI가 들어가지 않고, 기기가 읽을 때 자체 UI를 합성합니다."></p>
-    </section>
-    </div><!-- /.sidebarScroll -->
-
-    <!-- §2/§9: the final action sits OUTSIDE the scrolling list, so it is reachable from anywhere in
-         the settings. As `position: sticky` inside the export card it was not: sticky is bounded by
-         its containing block, so it only stuck once that card had itself scrolled into view. -->
     <div class="sidebarFooter">
       <p class="exportSummary" id="exportSummary"></p>
-      <button id="downloadBtn" class="btn primary" disabled
-              title="현재 설정과 모드로 책 전체를 다시 렌더링한 뒤 기기 파일로 저장합니다">변환 파일 다운로드</button>
+      <button id="downloadBtn" class="btn primary" disabled title="현재 설정과 모드로 책 전체를 다시 렌더링한 뒤 기기 파일로 저장합니다">변환 파일 다운로드</button>
       <div id="exportStatus" class="exportStatus" role="status" aria-live="polite"></div>
     </div>
   </aside>
 </main>
 
-<script src="app.js?v=105"></script>
+<script src="app.js?v=106"></script>
 </body>
 </html>
