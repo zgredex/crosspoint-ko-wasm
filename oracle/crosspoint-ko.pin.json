@@ -111,7 +111,6 @@
     "lib/Epub/Epub/ParsedText.cpp": "bb8035264a79e08f2901bf5e7b83e1b567cec200",
     "lib/Epub/Epub/ParsedText.h": "372bebee362e32e81c7aafe5eff9bd18d241762d",
     "lib/Epub/Epub/ReaderRenderSpec.h": "77ccb8aa14804461606a1f3f2adf1d251ab8c6fe",
-    "lib/Epub/Epub/Section.h": "092bf6f420aded29bff17bd53f9276304fcdc1dd",
     "lib/Epub/Epub/VisibleTextUtils.h": "72389f229aad6e0bcf6b6ecf778d3586717fb771",
     "lib/Epub/Epub/blocks/Block.h": "9601a35a6f109602c508c3e9826c7fea5bc2ab5e",
     "lib/Epub/Epub/blocks/BlockStyle.h": "e7f4dbf465b49fb80dd1a2f3e28cf967d388a59a",
@@ -148,7 +147,6 @@
     "lib/Epub/Epub/hyphenation/generated/hyph-ru.trie.h": "3da4120e4364bb9bfd396710ed5b9e65919e31fd",
     "lib/Epub/Epub/hyphenation/generated/hyph-sv.trie.h": "0883c5344be40164fbc5516fa38a1a3af9f092d2",
     "lib/Epub/Epub/hyphenation/generated/hyph-uk.trie.h": "0c8480df2c4b469b9b660b5b6b6637d7f64b8c69",
-    "lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h": "6c68fcf8ed58ff47fa7f8a851880e94138fe531a",
     "lib/Epub/Epub/parsers/ContainerParser.cpp": "0ce90a21bf233166a5bd7d42949719ccaea47c62",
     "lib/Epub/Epub/parsers/ContainerParser.h": "395177505a4495cff4d5faf3fee92a927dcc30bc",
     "lib/Epub/Epub/parsers/ContentOpfParser.cpp": "b8a524c68c740ddea82cd1b0ae43de2070c0ed63",
@@ -168,7 +166,7 @@
       "blob": "59f1d6e005d4033cbfa7350c7ec4ed9a18f3ad46",
       "port_path": "vendor-lib/EpdFont/SdFont.cpp",
       "divergence_kind": "amended",
-      "added_lines": 217,
+      "added_lines": 234,
       "removed_lines": 45,
       "changed_functions": [
         "SdFontData",
@@ -323,9 +321,10 @@
       "blob": "a06b9fc13a1f7b6bb7317ebb7e714ca9ecbb31f3",
       "port_path": "vendor-lib/Epub/Epub/Section.cpp",
       "divergence_kind": "amended",
-      "added_lines": 1,
+      "added_lines": 11,
       "removed_lines": 1,
       "changed_functions": [
+        "finalizeBuild",
         "startBuild"
       ],
       "only_in_reference": [],
@@ -335,6 +334,18 @@
       "removed_line_sample": [
         "streamed = epub->readItemContentsToStream(localPath, tmpHtml, 8192);"
       ]
+    },
+    "lib/Epub/Epub/Section.h": {
+      "blob": "092bf6f420aded29bff17bd53f9276304fcdc1dd",
+      "port_path": "vendor-lib/Epub/Epub/Section.h",
+      "divergence_kind": "additive",
+      "added_lines": 8,
+      "removed_lines": 0,
+      "changed_functions": [],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 0,
+      "port_function_count": 0
     },
     "lib/Epub/Epub/blocks/ImageBlock.cpp": {
       "blob": "659504a79d06ea31e756623136dfe90b67a06cd3",
@@ -558,9 +569,11 @@
       "blob": "664705f87f2c307fa6e83d8109cdafab74144045",
       "port_path": "vendor-lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp",
       "divergence_kind": "amended",
-      "added_lines": 4,
+      "added_lines": 47,
       "removed_lines": 2,
       "changed_functions": [
+        "characterData",
+        "endElement",
         "startElement"
       ],
       "only_in_reference": [],
@@ -571,6 +584,18 @@
         "self->epub->readItemContentsToStream(resolvedPath, headerProbe, 1024, /*allowEarlyStop=*/true);",
         "extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);"
       ]
+    },
+    "lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h": {
+      "blob": "6c68fcf8ed58ff47fa7f8a851880e94138fe531a",
+      "port_path": "vendor-lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h",
+      "divergence_kind": "additive",
+      "added_lines": 22,
+      "removed_lines": 0,
+      "changed_functions": [],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 0,
+      "port_function_count": 0
     },
     "lib/GfxRenderer/Bitmap.cpp": {
       "blob": "867fbf2bfd331f4f1fce9969a5e131a90e092faa",
@@ -699,8 +724,8 @@
     ]
   },
   "counts": {
-    "identical": 145,
-    "divergent": 19,
+    "identical": 143,
+    "divergent": 21,
     "missing_from_port": 1,
     "source_inputs": 3,
     "reference_engine_files": 168

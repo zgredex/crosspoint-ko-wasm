@@ -13,6 +13,13 @@ class GfxRenderer;
 class ChapterHtmlSlimParser;
 class CssParser;
 
+struct SectionChapterHeading {
+  std::string title;
+  std::string anchor;
+  uint16_t localPage = 0;
+  uint8_t level = 0;
+};
+
 class Section {
   std::shared_ptr<Epub> epub;
   const int spineIndex;
@@ -65,6 +72,7 @@ class Section {
   // Parse watermark from the partial's trailer, for estimating the total page count.
   uint32_t partialBytesConsumed_ = 0;
   uint32_t partialTotalBytes_ = 0;
+  std::vector<SectionChapterHeading> chapterHeadings_;
   bool finalizeBuild();
   // Write the LUTs/anchor map (and, for a partial, the watermark trailer), patch the
   // header, stamp the version byte, and swap the tmp .bin over filePath.
@@ -113,6 +121,7 @@ class Section {
   void suspendBuild();
   // True when a partial file was loaded: pageCount is a watermark, not the chapter total.
   bool isPartial() const { return partial_; }
+  const std::vector<SectionChapterHeading>& chapterHeadings() const { return chapterHeadings_; }
 
   // Unified page read: from the active build if it has reached the page, otherwise from
   // the on-disk file (finalized section, or a partial the rebuild hasn't caught up to).

@@ -261,6 +261,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
   }
   buildComplete_ = false;
   builtPageCount_ = 0;
+  chapterHeadings_.clear();
   // Pages from a loaded partial stay readable (from filePath) while this build writes
   // to the tmp .bin, so availability never drops below the partial's watermark.
   pageCount = partial_ ? partialPageCount_ : 0;
@@ -615,6 +616,7 @@ bool Section::commitBuildFile(const uint8_t version, const uint32_t bytesConsume
 bool Section::finalizeBuild() {
   // Flush the trailing page (emits the last page via the completePageFn into the LUT).
   build_->parser->finishParse();
+  const std::vector<ParsedChapterHeading> parsedHeadings = build_->parser->getChapterHeadings();
 
   if (!build_->reusedHtml) {
     // Parse succeeded: promote the freshly unzipped HTML to the persistent cache so future
@@ -634,7 +636,15 @@ bool Section::finalizeBuild() {
     partialPageCount_ = 0;
     pageCount = 0;
     builtPageCount_ = 0;
+    chapterHeadings_.clear();
     return false;
+  }
+  chapterHeadings_.clear();
+  chapterHeadings_.reserve(parsedHeadings.size());
+  for (const auto& heading : parsedHeadings) {
+    const auto page = getPageForVisibleTextOffset(heading.visibleTextOffset, true);
+    if (!page) continue;
+    chapterHeadings_.push_back({heading.title, heading.anchor, *page, heading.level});
   }
   buildComplete_ = true;
   partial_ = false;

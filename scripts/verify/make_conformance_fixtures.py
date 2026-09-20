@@ -20,6 +20,9 @@ What each fixture exercises, and why it is in the set:
   ko-mixed.epub  CJK run adjacent to Latin run adjacent to a punctuation-only run: this is
                  what `attachToPrevious` / `noSpaceBefore` in ParsedText.cpp actually act on,
                  and the reason Hangul can break mid-word without acquiring a fake space.
+  ko-chapters.epub deliberately false generic navigation labels versus visible Korean headings,
+                 including one heading omitted from navigation. It proves chapter names come from
+                 rendered XHTML structure rather than filenames or "Section N" placeholders.
 
 Output is deterministic: fixed timestamps, fixed UUIDs, no zlib timestamps. Two runs produce
 byte-identical files, which is what makes the fixture itself non-variable in the gate.
@@ -209,6 +212,66 @@ def write_epub(path, title, chapters, indent_paragraph=False):
     return path
 
 
+def write_chapter_fixture(path):
+    """Two-spine adversarial chapter fixture: nav labels are intentionally not the book's labels."""
+    title = 'XTCKO chapter parsing'
+    filler = ''.join(
+        '<p>Pagination filler sentence number %d. This paragraph exists so the next visible heading '
+        'must resolve to a later rendered page rather than collapsing onto the previous chapter.</p>' % i
+        for i in range(32))
+    spine0 = '''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Section 1</title></head><body>
+  <h1 style="display: none">Hidden placeholder</h1>
+  <h1>Section 1</h1>
+  <h2 id="real-one"><span>제1부</span> 실제 첫 장</h2>
+  <p>The visible Korean heading above is the only truthful label for this spine.</p>
+</body></html>'''
+    spine1 = f'''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Section 2</title></head><body>
+  <h1>{title}</h1>
+  <h2 id="real-two"><span>제2장</span> 깊은 제목</h2>
+  {filler}
+  <h2 id="real-three"><em>제3장</em> 목차에 없는 이름</h2>
+  {filler}
+  <h2 id="real-four">제4장 마지막 실제 이름</h2>
+  <p>End of fixture.</p>
+</body></html>'''
+    opf = f'''<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">urn:uuid:xtcko-chapter-fixture</dc:identifier>
+    <dc:title>{title}</dc:title><dc:language>ko</dc:language>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="s0" href="s0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="s1" href="s1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="s0"/><itemref idref="s1"/></spine>
+</package>'''
+    nav = '''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Contents</title></head><body><nav epub:type="toc"><ol>
+  <li><a href="s0.xhtml#real-one">Section 1</a></li>
+  <li><a href="s1.xhtml#real-two">Section 2</a></li>
+  <li><a href="s1.xhtml#real-four">Section 4</a></li>
+</ol></nav></body></html>'''
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with zipfile.ZipFile(path, 'w') as z:
+        def add(name, data, stored=False):
+            zi = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+            zi.compress_type = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
+            zi.external_attr = 0o644 << 16
+            z.writestr(zi, data)
+        add('mimetype', 'application/epub+zip', stored=True)
+        add('META-INF/container.xml', CONTAINER)
+        add('OEBPS/content.opf', opf)
+        add('OEBPS/nav.xhtml', nav)
+        add('OEBPS/s0.xhtml', spine0)
+        add('OEBPS/s1.xhtml', spine1)
+    return path
+
+
 def main():
     made = []
     made.append(write_epub(os.path.join(OUT, 'ko-text.epub'), 'XTCKO conformance — Korean text', PROSE))
@@ -216,6 +279,7 @@ def main():
     made.append(write_epub(os.path.join(OUT, 'ko-mixed.epub'), 'XTCKO conformance — mixed runs', MIXED))
     made.append(write_epub(os.path.join(OUT, 'ko-symbols.epub'), 'XTCKO conformance — uncovered codepoints', SYMBOLS))
     made.append(write_epub(os.path.join(OUT, 'ko-glyphs.epub'), 'XTCKO conformance — glyph branches', GLYPHS))
+    made.append(write_chapter_fixture(os.path.join(OUT, 'ko-chapters.epub')))
     for p in made:
         print(f'{p}  {os.path.getsize(p)} bytes')
     return 0

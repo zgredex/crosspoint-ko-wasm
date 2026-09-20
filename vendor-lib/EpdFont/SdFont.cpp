@@ -320,6 +320,23 @@ bool SdFontData::load() {
         fontFile.read(&glyph, sizeof(glyph)) != static_cast<int>(sizeof(glyph))) {
       return fail("truncated epdfont glyph table");
     }
+    // The renderer addresses bitmap bytes from width/height, not from
+    // dataLength.  A span can therefore be inside the file and still be too
+    // short for the geometry (the following glyph, or the end of the font,
+    // would be read as pixels).  Version 1 generators emit one canonical
+    // tightly-packed payload: four pixels per byte for 2-bit faces and eight
+    // for 1-bit faces.  Require that exact representation.  A zero-area glyph
+    // is valid only in the unambiguous 0x0/zero-byte form used for spacing.
+    if ((glyph.width == 0) != (glyph.height == 0)) {
+      return fail("epdfont glyph has one zero dimension");
+    }
+    const uint64_t pixels = static_cast<uint64_t>(glyph.width) * glyph.height;
+    const uint64_t expectedBytes = candidateHeader.is2Bit != 0
+                                       ? (pixels + 3u) / 4u
+                                       : (pixels + 7u) / 8u;
+    if (static_cast<uint64_t>(glyph.dataLength) != expectedBytes) {
+      return fail("epdfont glyph bitmap length contradicts geometry");
+    }
     if (glyph.dataLength > std::numeric_limits<uint16_t>::max() ||
         static_cast<uint64_t>(glyph.dataOffset) > bitmapBytes ||
         static_cast<uint64_t>(glyph.dataLength) > bitmapBytes - glyph.dataOffset) {

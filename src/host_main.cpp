@@ -536,6 +536,7 @@ int main(int argc, char** argv) {
     PoolSpine ps;                       // only filled when --pool
     ko::XtchWriter local(writer.mode(), deviceProfile);
     local.setTextAa(spec.textAntiAliasing != 0);
+    int renderedThisSpine = 0;
     for (int p = 0; p < n; p++) {
       if (maxPages >= 0 && p >= maxPages) break;
       ko::RenderedPage rp;
@@ -584,18 +585,32 @@ int main(int argc, char** argv) {
         ko::writeFile(std::string(base) + ".msb", std::string(rp.msb.begin(), rp.msb.end()));
       }
       totalPages++;
+      renderedThisSpine++;
       if (totalPages % 25 == 0) fprintf(stderr, "  ...%d\n", totalPages);
     }
-    if (n > 0) {
+    std::vector<PoolSpine::Anchor> resolvedChapterAnchors;
+    if (renderedThisSpine > 0) {
       // Candidates in SPINE order, then TOC order within the spine — the order the product's export
       // accumulates them in, and the order the pooled assembler must reproduce.
+      std::vector<int> namedLocalPages;
       for (int t = 0; t < driver.tocCount(); t++) {
         if (driver.tocSpine(t) != spine) continue;
         const std::string anchor = driver.tocAnchor(t);
         int local_ = anchor.empty() ? -1 : driver.anchorLocalPage(anchor);
-        if (local_ < 0 || local_ >= n) local_ = 0;
-        tocCandidates.push_back({driver.tocTitle(t),
-                                 static_cast<uint32_t>(chapterStart + local_)});
+        if (local_ < 0 || local_ >= renderedThisSpine) local_ = 0;
+        const std::string chapterTitle = driver.currentChapterTitle(anchor, local_, driver.tocTitle(t));
+        tocCandidates.push_back({chapterTitle, static_cast<uint32_t>(chapterStart + local_)});
+        resolvedChapterAnchors.push_back({chapterTitle, local_});
+        namedLocalPages.push_back(local_);
+      }
+      for (const auto& heading : driver.currentSectionChapterHeadings()) {
+        const int local_ = static_cast<int>(heading.localPage);
+        if (local_ < 0 || local_ >= renderedThisSpine ||
+            std::find(namedLocalPages.begin(), namedLocalPages.end(), local_) != namedLocalPages.end()) continue;
+        const std::string chapterTitle = ko::normalizeChapterTitle(heading.title);
+        tocCandidates.push_back({chapterTitle, static_cast<uint32_t>(chapterStart + local_)});
+        resolvedChapterAnchors.push_back({chapterTitle, local_});
+        namedLocalPages.push_back(local_);
       }
       std::string href = driver.spineHref(spine);
       const size_t slash = href.find_last_of('/');
@@ -603,11 +618,13 @@ int main(int argc, char** argv) {
       const size_t dot = href.find_last_of('.');
       if (dot != std::string::npos) href = href.substr(0, dot);
       ko::XtchChapter ch;
-      ch.name = href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href;
+      const std::string visibleTitle = driver.spineDisplayTitle(spine);
+      ch.name = !visibleTitle.empty() ? visibleTitle
+                                     : (href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href);
       ch.startPage = static_cast<uint16_t>(chapterStart);
-      ch.endPage = static_cast<uint16_t>(chapterStart + n - 1);
+      ch.endPage = static_cast<uint16_t>(chapterStart + renderedThisSpine - 1);
       spineFallback.push_back(ch);
-      chapterStart += n;
+      chapterStart += renderedThisSpine;
     }
     if (pooled) {
       const int made = static_cast<int>(local.pageCount());
@@ -621,21 +638,18 @@ int main(int argc, char** argv) {
         ps.len.push_back(static_cast<uint32_t>(rec.size()));
         ps.flat.insert(ps.flat.end(), rec.begin(), rec.end());
       }
-      // anchors, resolved while this spine's section is the built one
-      for (int t = 0; t < driver.tocCount(); t++) {
-        if (driver.tocSpine(t) != spine) continue;
-        const std::string anchor = driver.tocAnchor(t);
-        int local_ = anchor.empty() ? -1 : driver.anchorLocalPage(anchor);
-        if (local_ < 0 || local_ >= made) local_ = 0;
-        ps.toc.push_back({driver.tocTitle(t), local_});
-      }
+      // Already resolved against the full XHTML parse above; this includes
+      // visible headings omitted from EPUB navigation.
+      ps.toc = resolvedChapterAnchors;
       {   // fallback name, exactly as the serial path derives it
         std::string href = driver.spineHref(spine);
         const size_t slash = href.find_last_of('/');
         if (slash != std::string::npos) href = href.substr(slash + 1);
         const size_t dot = href.find_last_of('.');
         if (dot != std::string::npos) href = href.substr(0, dot);
-        ps.fallback = href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href;
+        const std::string visibleTitle = driver.spineDisplayTitle(spine);
+        ps.fallback = !visibleTitle.empty() ? visibleTitle
+                                           : (href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href);
       }
       pool.push_back(std::move(ps));
     }

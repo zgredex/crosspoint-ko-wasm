@@ -51,6 +51,30 @@ std::vector<uint8_t> validFont() {
   return out;
 }
 
+std::vector<uint8_t> geometryFont(bool twoBit, uint8_t width, uint8_t height, uint32_t dataLength) {
+  EpdFontHeader header{};
+  header.magic = EPDFONT_MAGIC;
+  header.version = EPDFONT_VERSION;
+  header.is2Bit = twoBit ? 1 : 0;
+  header.advanceY = 20;
+  header.ascender = 15;
+  header.descender = -5;
+  header.intervalCount = 1;
+  header.glyphCount = 1;
+  header.intervalsOffset = sizeof(EpdFontHeader);
+  header.glyphsOffset = header.intervalsOffset + sizeof(EpdFontInterval);
+  header.bitmapOffset = header.glyphsOffset + sizeof(EpdFontGlyph);
+
+  EpdFontInterval interval{0x41, 0x41, 0};
+  EpdFontGlyph glyph{width, height, 1, 0, 0, 1, dataLength, 0};
+  std::vector<uint8_t> out;
+  append(out, header);
+  append(out, interval);
+  append(out, glyph);
+  out.insert(out.end(), dataLength, 0xff);
+  return out;
+}
+
 bool loads(const std::vector<uint8_t>& bytes) {
   Storage.clearAll();
   Storage.mountBlob("/font.epdfont", bytes);
@@ -132,6 +156,26 @@ int main() {
     if (!reject(std::move(bad), "bitmap span overflow")) return 1;
   }
 
-  std::cout << "epdfont-integrity: canonical v1 loads; truncations, offsets, intervals and bitmap spans reject\n";
+  if (!loads(geometryFont(false, 8, 8, 8))) {
+    std::cerr << "canonical 8x8 1-bit glyph was rejected\n";
+    return 1;
+  }
+  if (!loads(geometryFont(true, 8, 8, 16))) {
+    std::cerr << "canonical 8x8 2-bit glyph was rejected\n";
+    return 1;
+  }
+  if (!reject(geometryFont(false, 8, 8, 7), "short 1-bit geometry")) return 1;
+  if (!reject(geometryFont(false, 8, 8, 9), "long 1-bit geometry")) return 1;
+  if (!reject(geometryFont(true, 8, 8, 15), "short 2-bit geometry")) return 1;
+  if (!reject(geometryFont(true, 8, 8, 17), "long 2-bit geometry")) return 1;
+  if (!reject(geometryFont(false, 0, 8, 0), "one zero glyph dimension")) return 1;
+  if (!reject(geometryFont(false, 8, 0, 0), "other zero glyph dimension")) return 1;
+  if (!loads(geometryFont(false, 0, 0, 0))) {
+    std::cerr << "canonical zero-area spacing glyph was rejected\n";
+    return 1;
+  }
+  if (!reject(geometryFont(false, 0, 0, 1), "zero-area glyph with bitmap")) return 1;
+
+  std::cout << "epdfont-integrity: canonical v1 geometry loads; malformed tables, spans and glyph geometry reject\n";
   return 0;
 }

@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include "device_profile.h"
+#include "utf8_utils.h"
 
 #include "../vendor-lib/Epub/Epub/converters/DitherUtils.h"  // the quantizer model
 #include "../vendor-lib/Epub/Epub/converters/BlueNoise64.h"  // 64x64 void-and-cluster
@@ -262,6 +263,7 @@ class XtchWriter {
     page.insert(page.end(), 8, 0);  // digest = 0
     page.insert(page.end(), plane.begin(), plane.end());
     pendingPages_.push_back(std::move(page));
+    pendingPageBytes_ += pendingPages_.back().capacity();
     return true;
   }
 
@@ -316,6 +318,7 @@ class XtchWriter {
     page.insert(page.end(), p1.begin(), p1.end());
     page.insert(page.end(), p2.begin(), p2.end());
     pendingPages_.push_back(std::move(page));
+    pendingPageBytes_ += pendingPages_.back().capacity();
     return true;
   }
 
@@ -349,10 +352,15 @@ class XtchWriter {
       return false;
     }
     pendingPages_.emplace_back(data, data + size);
+    pendingPageBytes_ += pendingPages_.back().capacity();
     return true;
   }
 
-  void clearPages() { std::vector<std::vector<uint8_t>>().swap(pendingPages_); }
+  void clearPages() {
+    std::vector<std::vector<uint8_t>>().swap(pendingPages_);
+    pendingPageBytes_ = 0;
+  }
+  uint64_t residentPageBytes() const { return pendingPageBytes_; }
 
   // The container header carries the book's metadata, so an assembler writer — constructed fresh, with
   // no book of its own — has to adopt it from the engine's writer or the file loses its title.
@@ -370,7 +378,7 @@ class XtchWriter {
   std::vector<uint8_t> buildPrefix(const std::vector<XtchChapter>& chapters,
                                    const std::vector<uint32_t>& pageSizes) const {
     const size_t pageCount = pageSizes.size();
-    if (pageCount > MAX_XTC_PAGES || chapters.size() > MAX_XTC_CHAPTERS) return {};
+    if (pageCount == 0 || pageCount > MAX_XTC_PAGES || chapters.size() > MAX_XTC_CHAPTERS) return {};
     const size_t chapterCount = chapters.size();
     const uint64_t metadataOffset = 56;
     const uint64_t chapterOffset = metadataOffset + 256;
@@ -386,11 +394,22 @@ class XtchWriter {
     std::vector<uint32_t> sizes;
     sizes.reserve(pendingPages_.size());
     for (const auto& p : pendingPages_) sizes.push_back(static_cast<uint32_t>(p.size()));
-    // buildPrefix reserves the exact final size (it lays out the fixed region itself), so there is no
-    // separate reserve here to double the peak.
     std::vector<uint8_t> out = buildPrefix(chapters, sizes);
     if (out.empty()) return {};
     const size_t pageCount = pendingPages_.size();
+
+    // Allocate the final buffer exactly once.  The old code claimed buildPrefix
+    // did this but it only allocated the fixed prefix, so repeated insert()
+    // growth could retain pending pages, an old output allocation and a new
+    // allocation simultaneously.  The API preflight accounts for the one
+    // unavoidable overlap: pending records + this final allocation.
+    uint64_t finalSize = out.size();
+    for (uint32_t size : sizes) {
+      if (size > UINT64_MAX - finalSize) return {};
+      finalSize += size;
+    }
+    if (finalSize > static_cast<uint64_t>(SIZE_MAX)) return {};
+    out.reserve(static_cast<size_t>(finalSize));
 
     // --- data ---
     // Memory-slim streaming: append each page then free its pending buffer, so peak usage stays ~= final
@@ -399,6 +418,7 @@ class XtchWriter {
     for (size_t i = 0; i < pageCount; i++) {
       auto& page = pendingPages_[i];
       out.insert(out.end(), page.begin(), page.end());
+      pendingPageBytes_ -= std::min<uint64_t>(pendingPageBytes_, page.capacity());
       std::vector<uint8_t>().swap(page);  // release this page's heap now
     }
     return out;
@@ -470,6 +490,7 @@ class XtchWriter {
   // allocation back to the allocator immediately.
   void reset() {
     std::vector<std::vector<uint8_t>>().swap(pendingPages_);
+    pendingPageBytes_ = 0;
   }
   size_t pageCount() const { return pendingPages_.size(); }
 
@@ -485,7 +506,8 @@ class XtchWriter {
     for (int i = 0; i < 8; i++) v[off + i] = (val >> (8 * i)) & 0xFF;
   }
   static void putStr(std::vector<uint8_t>& v, size_t off, const std::string& s, size_t maxLen) {
-    size_t n = s.size() < maxLen ? s.size() : maxLen - 1;
+    if (maxLen == 0) return;
+    const size_t n = utf8SafePrefixLength(s, maxLen - 1);
     memcpy(v.data() + off, s.data(), n);
   }
 
@@ -493,6 +515,7 @@ class XtchWriter {
   XtcMode mode_ = XtcMode::Gray2Bit;
   DeviceProfile deviceProfile_ = DeviceProfile::X4;
   std::vector<std::vector<uint8_t>> pendingPages_;
+  uint64_t pendingPageBytes_ = 0;
   bool textAa_ = true;
 };
 

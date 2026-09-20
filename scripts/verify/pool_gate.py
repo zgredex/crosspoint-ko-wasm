@@ -33,6 +33,7 @@ FIXTURES = [
     'oracle/fixtures/ko-ruby.epub',
     'oracle/fixtures/ko-mixed.epub',
     'oracle/fixtures/ko-symbols.epub',
+    'oracle/fixtures/ko-chapters.epub',
     'web/demo-png.epub',
     'web/demo-images.epub',
 ]

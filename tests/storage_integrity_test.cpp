@@ -1,7 +1,18 @@
 #include <HalStorage.h>
 
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <vector>
+
+namespace {
+int externalRead(void* ctx, size_t offset, uint8_t* dst, size_t len) {
+  auto* bytes = static_cast<std::vector<uint8_t>*>(ctx);
+  if (!bytes || !dst || offset > bytes->size() || len > bytes->size() - offset) return -1;
+  std::memcpy(dst, bytes->data() + offset, len);
+  return static_cast<int>(len);
+}
+}  // namespace
 
 int main() {
   HalStorage storage;
@@ -47,6 +58,22 @@ int main() {
     return 1;
   }
 
-  std::cout << "storage-integrity: paths are canonical, aliases do not collide, aggregate writes are bounded\n";
+  std::vector<uint8_t> external = {1, 2, 3, 4};
+  storage.mountExternalBlob("mutable.zip", external.size(), externalRead, &external);
+  HalFile mutableFile = storage.open("mutable.zip");
+  mutableFile.markZipDirectoryValidated();
+  if (mutableFile.isZipDirectoryValidated()) {
+    std::cerr << "mutable external backing cached a stale ZIP validation\n";
+    return 1;
+  }
+  storage.mountExternalBlob("immutable.zip", external.size(), externalRead, &external, true);
+  HalFile immutableFile = storage.open("immutable.zip");
+  immutableFile.markZipDirectoryValidated();
+  if (!immutableFile.isZipDirectoryValidated()) {
+    std::cerr << "immutable external backing could not cache ZIP validation\n";
+    return 1;
+  }
+
+  std::cout << "storage-integrity: paths, quotas and mutable/immutable ZIP validation pass\n";
   return 0;
 }

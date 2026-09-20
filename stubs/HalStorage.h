@@ -45,11 +45,10 @@ ExternalStats& externalStats();
 // Files generated while a book is open (inflated XHTML/images and parser
 // caches) share one allocated-capacity budget.  Charging vector capacity—not
 // just logical length—means geometric growth cannot jump over the ceiling.
-// 768 MiB leaves 1.25 GiB of the
-// module's 2 GiB memory32 ceiling for the mounted book, renderer and export
-// buffers while still allowing the documented 256 MiB spine and 128 MiB image
-// member ceilings to coexist.  Source blobs are not charged here: they are
-// separately bounded at the public EPUB/font boundaries.
+// 768 MiB is the absolute subsystem cap. wasm_api narrows it per load so the
+// mounted source + derived files + fixed headroom stay under the authoritative
+// 1.5 GiB working-set ceiling; export preflights then account for their own
+// simultaneously-live buffers against the same ceiling.
 struct StorageBudget {
   static constexpr size_t kDefaultLimit = 768u * 1024u * 1024u;
   size_t used = 0;
@@ -118,6 +117,10 @@ struct Blob {
 
   // EXTERNAL backing. data stays null and every read is served by readFn through the window below.
   bool external = false;
+  // Browser Blob/File objects are immutable snapshots. Other callback-backed
+  // sources (notably a host file descriptor) may change while mounted and may
+  // not reuse a prior whole-directory validation result.
+  bool externalImmutable = false;
   size_t externalSize = 0;
   int (*readFn)(void* ctx, size_t offset, uint8_t* dst, size_t len) = nullptr;
   void* readCtx = nullptr;
@@ -299,9 +302,11 @@ class HalFile : public Print {
   explicit operator bool() const { return isOpen(); }
 
   const std::string& path() const { return path_; }
-  bool isZipDirectoryValidated() const { return blob_ && blob_->zipDirectoryValidated; }
+  bool isZipDirectoryValidated() const {
+    return blob_ && blob_->zipDirectoryValidated && (!blob_->external || blob_->externalImmutable);
+  }
   void markZipDirectoryValidated() {
-    if (blob_) blob_->zipDirectoryValidated = true;
+    if (blob_ && (!blob_->external || blob_->externalImmutable)) blob_->zipDirectoryValidated = true;
   }
 
  private:
@@ -340,7 +345,7 @@ class HalStorage {
   // failure; it must not read past `size`.
   void mountExternalBlob(const std::string& path, size_t size,
                          int (*readFn)(void* ctx, size_t offset, uint8_t* dst, size_t len),
-                         void* ctx);
+                         void* ctx, bool immutableBacking = false);
 
   std::vector<String> listFiles(const char* path = "/", int maxFiles = 200) { (void)path;
     (void)maxFiles;

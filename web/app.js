@@ -2,6 +2,17 @@
 (() => {
   'use strict';
 
+  // The worker inherits the cache generation from the app script that is
+  // actually executing.  One query parameter in index.html now drives the
+  // whole hand-written asset chain; worker constructors cannot drift to an old
+  // hard-coded generation again.
+  const APP_ASSET_VERSION = (() => {
+    try {
+      const src = document.currentScript && document.currentScript.src;
+      return src ? new URL(src, location.href).searchParams.get('v') || '' : '';
+    } catch (_) { return ''; }
+  })();
+
   // Measurement hook for the open path: `?noEarlyRead=1` sends the open WITHOUT the read-ahead, which is
   // exactly what the worker did before it, so one build can produce both arms of the A/B (see the
   // earlyRead note in web/ko.worker.js). Read once — a URL that changes mid-session is not a scenario.
@@ -75,7 +86,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=105');
+    const w = new Worker(workerScriptUrl());
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -204,6 +215,8 @@
   // Where the workers live, resolved once. Each spawner used to derive this locally; adding a third
   // spawner (the pool) without the derivation was an instant runtime error.
   const WORKER_BASE = location.pathname.slice(0, location.pathname.lastIndexOf('/') + 1);
+  const workerScriptUrl = () => WORKER_BASE + 'ko.worker.js' +
+    (APP_ASSET_VERSION ? '?v=' + encodeURIComponent(APP_ASSET_VERSION) : '');
 
   window.__export = {
     call: (...a) => exportCall(...a),
@@ -255,7 +268,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=105');
+    const w = new Worker(workerScriptUrl());
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -959,11 +972,11 @@
     return r;
   }
   function spineLabel(title, href, i) {
-    // Match what the book shows in its own navigation document. Filenames are
-    // implementation details and only belong on screen when the EPUB supplied
-    // no navigation item for this spine at all.
-    const tocTitle = normalizeDisplayText(title).trim();
-    if (tocTitle) return tocTitle;
+    // The engine prefers a visible XHTML heading, with EPUB navigation as its
+    // fallback. Filenames are implementation details and appear only when the
+    // book supplied neither kind of human-readable label.
+    const bookTitle = normalizeDisplayText(title).trim();
+    if (bookTitle) return bookTitle;
     const fallback = normalizeDisplayText(String(href || '')
       .replace(/\.(xhtml|html|htm)$/i, '')
       .replace(/[_]+/g, ' ')).trim();
@@ -1898,7 +1911,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=105');
+    const w = new Worker(workerScriptUrl());
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };

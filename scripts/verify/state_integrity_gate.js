@@ -237,6 +237,14 @@ function check(ok, label, detail) {
   api._ko_export_abort();
   api._free(lensPtr);
 
+  check(api._ko_assemble_begin(1) === 0, 'assemble_begin for zero-page refusal');
+  check(api._ko_assemble_finish() < 0, 'assembler refuses a zero-page container');
+  check(api._ko_xtch_size() === 0, 'zero-page assembly publishes no bytes');
+  check(api._ko_plan_begin(1) === 0, 'plan_begin for zero-page refusal');
+  check(api._ko_plan_finish() < 0, 'planner refuses a zero-page container');
+  check(api._ko_plan_prefix_size() === 0, 'zero-page plan publishes no prefix');
+  api._ko_export_abort();
+
   // ---- 11. the 16-bit page limit is enforced, not wrapped ---------------------------------------
   const many = 65536;
   const bigPtr = api._malloc(many * 4);
@@ -250,7 +258,7 @@ function check(ok, label, detail) {
 
   // ---- 11b. the container BYTE budget, which is a separate ceiling from the page count -----------
   // 12,000 pages is legal by the format (under 65,535) but describes 12,000 x 96,022 = 1.15 GiB of 2-bit
-  // container, above the 1 GiB budget the module can actually hold. The page-count limit cannot catch this.
+  // container, above the 1 GiB file budget. The page-count limit cannot catch this.
   const budgetPages = 12000;
   const budgetPtr = api._malloc(budgetPages * 4);
   { const view = u32(budgetPtr, budgetPages); for (let i = 0; i < budgetPages; i++) view[i] = expectedGrayRecord; }
@@ -326,6 +334,9 @@ function check(ok, label, detail) {
   // ---- 13. valid E, and the state is still coherent ------------------------------------------------
   const nE = loadBytes(good);
   check(nE === nA, 'valid E still loads after everything', `spines=${nE}`);
+
+  check(api._ko_epub_alloc(1024 * 1024 * 1024 + 1) === 0,
+        'raw EPUB allocator refuses a request above the owned-input ceiling');
 
   // Raw ABI setters enforce the same positive enums as the worker boundary.
   check(api._ko_set_line_compression(NaN) < 0, 'NaN line compression is rejected at the C ABI');

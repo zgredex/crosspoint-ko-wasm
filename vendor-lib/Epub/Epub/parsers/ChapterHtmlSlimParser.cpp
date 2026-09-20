@@ -422,6 +422,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
   std::string classAttr;
   std::string styleAttr;
   std::string dirAttr;
+  std::string elementId;
   if (atts != nullptr) {
     for (int i = 0; atts[i]; i += 2) {
       if (strcmp(atts[i], "class") == 0) {
@@ -429,6 +430,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       } else if (strcmp(atts[i], "style") == 0) {
         styleAttr = atts[i + 1];
       } else if (strcmp(atts[i], "id") == 0) {
+        elementId = atts[i + 1];
         // Defer both anchor recording and TOC page breaks until startNewTextBlock,
         // after the previous block is flushed to pages via makePages().
         //
@@ -439,6 +441,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         const char* idValue = atts[i + 1];
         const bool isTocAnchor =
             std::find(self->tocAnchors.begin(), self->tocAnchors.end(), idValue) != self->tocAnchors.end();
+        if (isTocAnchor) {
+          self->latestTocAnchor = idValue;
+          self->latestTocAnchorVisibleOffset = self->visibleTextOffset;
+        }
         if (isTocAnchor || (!isNonNavigableInlineElement(name) && self->anchorData.size() < MAX_ANCHORS_PER_CHAPTER)) {
           // Flush a displaced anchor before overwriting. Consecutive non-block elements
           // (e.g. <aside id="fn1">text</aside><aside id="fn2">) with no intervening block
@@ -494,6 +500,23 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     self->skipUntilDepth = self->depth;
     self->depth += 1;
     return;
+  }
+
+  if (self->headingDepth < 0 && matches(name, HEADER_TAGS, std::size(HEADER_TAGS))) {
+    self->headingDepth = self->depth;
+    self->headingLevel = static_cast<uint8_t>(name[1] - '0');
+    self->headingVisibleOffset = self->visibleTextOffset;
+    self->headingText.clear();
+    self->headingAnchor = elementId;
+    if (self->headingAnchor.empty() && !self->pendingAnchorId.empty() &&
+        std::find(self->tocAnchors.begin(), self->tocAnchors.end(), self->pendingAnchorId) !=
+            self->tocAnchors.end()) {
+      self->headingAnchor = self->pendingAnchorId;
+    }
+    if (self->headingAnchor.empty() && !self->latestTocAnchor.empty() &&
+        self->latestTocAnchorVisibleOffset == self->visibleTextOffset) {
+      self->headingAnchor = self->latestTocAnchor;
+    }
   }
 
   // Special handling for tables/cells: flatten into per-cell paragraphs with a prefixed header.
@@ -1159,6 +1182,12 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
     return;
   }
 
+  if (self->headingDepth >= 0 && self->nonVisibleTextDepth == 0 && !self->collectingRubyText &&
+      self->headingText.size() < 4096) {
+    const size_t take = std::min<size_t>(static_cast<size_t>(len), 4096 - self->headingText.size());
+    self->headingText.append(s, take);
+  }
+
   // Collect ruby text instead of normal word processing
   if (self->collectingRubyText) {
     self->rubyTextBuffer.append(s, len);
@@ -1364,6 +1393,23 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
   auto* self = static_cast<ChapterHtmlSlimParser*>(userData);
   if (self->nonVisibleTextDepth > 0) {
     self->nonVisibleTextDepth--;
+  }
+
+  if (self->headingDepth >= 0 && self->depth - 1 == self->headingDepth &&
+      matches(name, HEADER_TAGS, std::size(HEADER_TAGS))) {
+    std::string title = trimAndNormalize(self->headingText);
+    if (!title.empty()) {
+      self->chapterHeadings.push_back(
+          {std::move(title), std::move(self->headingAnchor), self->headingVisibleOffset, self->headingLevel});
+    }
+    self->headingDepth = -1;
+    self->headingLevel = 0;
+    self->headingVisibleOffset = 0;
+    if (!self->headingAnchor.empty() && self->headingAnchor == self->latestTocAnchor) {
+      self->latestTocAnchor.clear();
+    }
+    self->headingAnchor.clear();
+    self->headingText.clear();
   }
 
   // Ruby text: </rt> distributes ruby to base words, </ruby> resets ruby state

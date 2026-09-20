@@ -36,10 +36,11 @@ void HalStorage::mountOwnedBlob(const std::string& path, uint8_t* data, size_t s
 
 void HalStorage::mountExternalBlob(const std::string& path, size_t size,
                                    int (*readFn)(void* ctx, size_t offset, uint8_t* dst, size_t len),
-                                   void* ctx) {
+                                   void* ctx, bool immutableBacking) {
   const std::string p = normalisePath(path);
   auto blob = std::make_shared<Blob>();
   blob->external = true;
+  blob->externalImmutable = immutableBacking;
   blob->externalSize = size;
   blob->readFn = readFn;
   blob->readCtx = ctx;

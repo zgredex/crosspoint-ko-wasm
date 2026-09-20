@@ -32,6 +32,7 @@
 #include <FontDecompressor.h>
 #include "layout_manifest.h"
 #include "device_profile.h"
+#include "chapter_title_probe.h"
 // §5 font-contribution measurement toggles. Default 1 so every other build (native host, any TU
 // that misses the definition) keeps the fonts embedded and behaves exactly as before.
 #ifndef KO_EMBED_KOPUB
@@ -49,6 +50,17 @@
 #include "fontIds.h"
 
 namespace ko {
+
+// Port-owned chapter metadata.  Keep this type outside the vendored Section
+// API so the oracle harness can compile the untouched Korean-fork headers and
+// compare rendering without teaching the reference tree about our metadata
+// extension.
+struct EngineChapterHeading {
+  std::string title;
+  std::string anchor;
+  uint16_t localPage = 0;
+  uint8_t level = 0;
+};
 
 // CrossPointSettings::ORIENTATION values. Keep the numeric values identical to
 // the Korean fork: they are part of the settings/API contract used by the web
@@ -256,6 +268,8 @@ class EngineDriver {
     epub_.reset();
     epubPath_.clear();
     pageCount_ = 0;
+    spineDisplayTitles_.clear();
+    spineDisplayTitlesResolved_.clear();
   }
 
   // A runtime device-profile change keeps the mounted EPUB but invalidates
@@ -270,9 +284,9 @@ class EngineDriver {
   // nothing is adopted, so there is no ownership question — the source outlives the mount by contract.
   bool loadEpubFromExternal(size_t size, const std::string& virtualPath,
                             int (*readFn)(void* ctx, size_t offset, uint8_t* dst, size_t len),
-                            void* ctx) {
+                            void* ctx, bool immutableBacking = false) {
     if (!readFn || size == 0) return false;
-    Storage.mountExternalBlob(virtualPath, size, readFn, ctx);
+    Storage.mountExternalBlob(virtualPath, size, readFn, ctx, immutableBacking);
     return openEpub(virtualPath);
   }
 
@@ -292,6 +306,8 @@ class EngineDriver {
       Storage.remove(virtualPath.c_str());
       return false;
     }
+    spineDisplayTitles_.assign(static_cast<size_t>(epub_->getSpineItemsCount()), std::string());
+    spineDisplayTitlesResolved_.assign(static_cast<size_t>(epub_->getSpineItemsCount()), false);
     // Lazy image extraction: section builds only header-probe images; the first
     // render of an image page pulls the file out of the EPUB through this hook
     // (mirrors EpubReaderActivity::onEnter).
@@ -445,17 +461,130 @@ class EngineDriver {
     if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return "";
     return epub_->getTocItem(i).title;
   }
-  // The first navigation title that belongs to this spine. SpineEntry::tocIndex
-  // is O(1), but for spines without their own TOC item the cache deliberately
-  // inherits the previous index for section parsing. Verify ownership before
-  // returning it so an unlisted preface/colophon never borrows a neighbour's
-  // visible chapter name.
-  std::string spineTocTitle(int spineIndex) const {
+  // First meaningful visible XHTML heading, obtained by a bounded streaming
+  // probe. A navigation title owned by this exact spine is the fallback; the
+  // href is deliberately not treated as book text.
+  std::string spineDisplayTitle(int spineIndex) const {
     if (!epub_ || spineIndex < 0 || spineIndex >= epub_->getSpineItemsCount()) return "";
+    const size_t index = static_cast<size_t>(spineIndex);
+    if (index < spineDisplayTitlesResolved_.size() && spineDisplayTitlesResolved_[index]) {
+      return spineDisplayTitles_[index];
+    }
+
+    std::string navTitle;
     const int tocIndex = epub_->getTocIndexForSpineIndex(spineIndex);
-    if (tocIndex < 0 || tocIndex >= epub_->getTocItemsCount()) return "";
-    const auto entry = epub_->getTocItem(tocIndex);
-    return entry.spineIndex == spineIndex ? entry.title : "";
+    if (tocIndex >= 0 && tocIndex < epub_->getTocItemsCount()) {
+      const auto entry = epub_->getTocItem(tocIndex);
+      if (entry.spineIndex == spineIndex) navTitle = normalizeChapterTitle(entry.title);
+    }
+
+    ChapterTitleProbe probe;
+    const auto item = epub_->getSpineItem(spineIndex);
+    // The ZIP member keeps its normal 256 MiB declared-size ceiling. The sink
+    // asks the inflater to stop after the first heading or 256 KiB, so labels
+    // do not materialize every spine merely to name the picker.
+#ifdef KO_ORACLE_BUILD
+    epub_->readItemContentsToStream(item.href, probe, 2048, true);
+#else
+    epub_->readItemContentsToStream(item.href, probe, 2048, true, MAX_EPUB_SPINE_BYTES);
+#endif
+    std::string visible = probe.headingTitle();
+    if (visible.empty() && epub_->getSpineItemsCount() == 1) visible = probe.documentTitle();
+
+    std::string result;
+    result = !visible.empty() ? std::move(visible) : std::move(navTitle);
+    if (index < spineDisplayTitles_.size()) {
+      spineDisplayTitles_[index] = result;
+      spineDisplayTitlesResolved_[index] = true;
+    }
+    return result;
+  }
+
+  // Resolve a navigation entry against headings captured by the full layout
+  // parse. Exact anchor wins, then the heading rendered on the anchor's page.
+  // A meaningful EPUB nav title remains the fallback; generic "Section 4"
+  // labels do not override text visibly printed in the book.
+  std::string currentChapterTitle(const std::string& anchor, int localPage,
+                                  const std::string& navTitle) const {
+    const std::string cleanNav = normalizeChapterTitle(navTitle);
+#ifndef KO_ORACLE_BUILD
+    if (section_) {
+      const auto& headings = section_->chapterHeadings();
+      std::string exactGeneric;
+      if (!anchor.empty()) {
+        for (const auto& h : headings) {
+          if (h.anchor != anchor) continue;
+          const std::string title = normalizeChapterTitle(h.title);
+          if (title.empty()) continue;
+          if (!isGenericChapterTitle(title)) return title;
+          if (exactGeneric.empty()) exactGeneric = title;
+        }
+      }
+      std::string pageGeneric;
+      if (localPage >= 0) {
+        for (const auto& h : headings) {
+          if (h.localPage != static_cast<uint16_t>(localPage)) continue;
+          const std::string title = normalizeChapterTitle(h.title);
+          if (title.empty()) continue;
+          if (!isGenericChapterTitle(title)) return title;
+          if (pageGeneric.empty()) pageGeneric = title;
+        }
+      }
+      if (!isGenericChapterTitle(cleanNav)) return cleanNav;
+      if (!exactGeneric.empty()) return exactGeneric;
+      if (!pageGeneric.empty()) return pageGeneric;
+      for (const auto& h : headings) {
+        const std::string title = normalizeChapterTitle(h.title);
+        if (!title.empty() && !isGenericChapterTitle(title)) return title;
+      }
+    }
+#else
+    (void)anchor;
+    (void)localPage;
+#endif
+    return cleanNav;
+  }
+
+  // Chapter-level headings not already represented by a TOC page. Prefer the
+  // shallowest repeated heading level. A single outer heading followed by
+  // repeated deeper headings is the normal omnibus/part structure: the outer
+  // heading remains represented by the TOC when it has an entry, while the
+  // repeated level supplies real chapter boundaries omitted by navigation.
+  std::vector<EngineChapterHeading> currentSectionChapterHeadings() const {
+#ifdef KO_ORACLE_BUILD
+    return {};
+#else
+    if (!section_) return {};
+    const auto& all = section_->chapterHeadings();
+    if (all.empty()) return {};
+    const bool hasMeaningful = std::any_of(all.begin(), all.end(), [](const SectionChapterHeading& h) {
+      return !normalizeChapterTitle(h.title).empty() && !isGenericChapterTitle(h.title);
+    });
+    size_t counts[7] = {};
+    for (const auto& h : all) {
+      if (h.level >= 1 && h.level <= 6 && !normalizeChapterTitle(h.title).empty() &&
+          (!hasMeaningful || !isGenericChapterTitle(h.title))) counts[h.level]++;
+    }
+    int level = 1;
+    while (level <= 6 && counts[level] == 0) level++;
+    if (level > 6) return {};
+    if (counts[level] == 1) {
+      for (int deeper = level + 1; deeper <= 6; ++deeper) {
+        if (counts[deeper] >= 2) {
+          level = deeper;
+          break;
+        }
+      }
+    }
+    std::vector<EngineChapterHeading> out;
+    for (const auto& h : all) {
+      if (h.level == level && !normalizeChapterTitle(h.title).empty() &&
+          (!hasMeaningful || !isGenericChapterTitle(h.title))) {
+        out.push_back({h.title, h.anchor, h.localPage, h.level});
+      }
+    }
+    return out;
+#endif
   }
   std::string tocAnchor(int i) const {
     if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return "";
@@ -493,6 +622,9 @@ class EngineDriver {
   }
 
  private:
+
+  mutable std::vector<std::string> spineDisplayTitles_;
+  mutable std::vector<bool> spineDisplayTitlesResolved_;
 
   // Private implementation. No defaults: every argument is supplied by the two entry points above, so a
   // defaulted `dropGrayPlanes` can never be reached by accident — which is the whole point of the split.

@@ -1097,6 +1097,11 @@ function reportSectionFailure(spine, error) {
 // sizes this ABI cannot carry, and the truncation would happen somewhere deep inside it. Reject at the
 // boundary, before arrayBuffer(), _ko_epub_alloc, checkedMalloc or the external mount see the Blob.
 const MAX_WASM_BOOK_BYTES = 0x7fffffff;
+const MAX_COPY_EPUB_BYTES = 512 * 1024 * 1024;
+const MAX_OWNED_EPUB_BYTES = 1024 * 1024 * 1024;
+const SAFE_WASM_WORKING_SET = 1536 * 1024 * 1024;
+const FIXED_WASM_HEADROOM = 256 * 1024 * 1024;
+const MAX_ASSEMBLY_WASM_CHUNK_BYTES = 16 * 1024 * 1024;
 const MAX_FONT_SOURCE_BYTES = 64 * 1024 * 1024;
 const MAX_EPDFONT_BYTES = 64 * 1024 * 1024;
 
@@ -1105,7 +1110,26 @@ function validateBookInput(data) {
   if (!Number.isSafeInteger(n) || n <= 0 || n > MAX_WASM_BOOK_BYTES) {
     throw new Error(`EPUB size ${n} exceeds the supported limit of ${MAX_WASM_BOOK_BYTES} bytes`);
   }
+  if (data && data.epub && n > MAX_COPY_EPUB_BYTES) {
+    throw new Error(`ArrayBuffer EPUB size ${n} exceeds the copying-path limit of ${MAX_COPY_EPUB_BYTES} bytes; `
+                    + 'pass a Blob so the range-backed loader can be used');
+  }
   return n;
+}
+
+function outputMode(value) {
+  if (value !== 0 && value !== 1) throw new Error('invalid output mode: ' + String(value));
+  return value;
+}
+
+function requireInputAllocationBudget(bytes, path) {
+  const resident = api && api._ko_storage_bytes ? Number(api._ko_storage_bytes()) : 0;
+  if (!Number.isSafeInteger(resident) || resident < 0 ||
+      resident > SAFE_WASM_WORKING_SET - FIXED_WASM_HEADROOM ||
+      bytes > SAFE_WASM_WORKING_SET - FIXED_WASM_HEADROOM - resident) {
+    throw new Error(`${path} cannot coexist with the currently resident book inside the safe wasm budget; `
+                    + 'pass a Blob so the range-backed loader can replace it without a bulk allocation');
+  }
 }
 
 async function loadEngineBook(data, timing, early) {
@@ -1116,6 +1140,7 @@ async function loadEngineBook(data, timing, early) {
   self.__koBookBlob = null;
   if (data.epub) {
     const bytes = new Uint8Array(data.epub);
+    requireInputAllocationBudget(bytes.length, 'ArrayBuffer EPUB');
     const tCopy = performance.now();
     const ptr = checkedMalloc(bytes.length, 'loadEngineBook:ptr');
     api.HEAPU8.set(bytes, ptr);
@@ -1130,7 +1155,8 @@ async function loadEngineBook(data, timing, early) {
   }
   const blob = data.blob;
 
-  if (data.streamEpub && blob && blob.stream && api._ko_epub_alloc && api._ko_load_epub_owned) {
+  if (data.streamEpub && blob && blob.size <= MAX_OWNED_EPUB_BYTES && blob.stream &&
+      api._ko_epub_alloc && api._ko_load_epub_owned) {
     const size = blob.size;
     const ptr = api._ko_epub_alloc(size);
     if (ptr) {
@@ -1196,6 +1222,11 @@ async function loadEngineBook(data, timing, early) {
     timing.externalFallback = false;
     timing.engineSpanMs = performance.now() - t0;
     return n;
+  }
+
+  if (blob.size > MAX_OWNED_EPUB_BYTES) {
+    throw new Error(`Blob EPUB size ${blob.size} exceeds the owned-input limit of ${MAX_OWNED_EPUB_BYTES} bytes; `
+                    + 'this browser cannot use the required range-backed loader');
   }
 
   // The read and the heap allocation are independent, so start the read first and allocate while it is
@@ -1457,6 +1488,7 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
   let transactionStarted = false;
   let committed = false;
   try {
+  const previewMode = outputMode(ev.data.mode);
   if (foregroundExportRunning) { post(id, false, { error: 'book locked during export' }); return; }
   if (!api) await init();
   await stopWarmBeforeMutation();
@@ -1492,7 +1524,7 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
   builtKey = layoutKey(currentSpec || {});
   builtFontStamp = fontStamp;
   const buildMs = performance.now() - tBuild0;
-  const wantMono = ev.data.mode === 0;
+  const wantMono = previewMode === 0;
   const tRender0 = performance.now();
   const rc = renderPageEngine(0);
   if (rc !== 0) {
@@ -1689,6 +1721,9 @@ case 'openPreview': {
 }
       case 'render': {
         if (!requireWorkerBook(id, 'render')) break;
+        // Validate before applying a spec or rebuilding: an untrusted bad mode
+        // must not mutate the current reader state and then fail later.
+        const renderMode = outputMode(ev.data.mode);
         // §2/§8: the spec travels with the render, so an ordinary page turn is one request and a
         // settings change is one request too. When it has not changed, this does nothing at all.
         let vpInfo = null;
@@ -1707,7 +1742,7 @@ case 'openPreview': {
         }
         const tRender0 = performance.now();
         const key = layoutKey(currentSpec || {});
-        const wantMono = ev.data.mode === 0;   // 1-bit XTC preview (BW plane only)
+        const wantMono = renderMode === 0;   // 1-bit XTC preview (BW plane only)
         // rebuild if spine, LAYOUT, OR loaded font changed since the last build
         // (a custom-font swap changes glyphs/metrics but not the worker spec;
         //  pixel-only options like AA/dither/tone depth must not repaginate — §3)
@@ -1959,7 +1994,7 @@ case 'openPreview': {
           // §1 of the 1.4 audit: this local used to be named warmMode, shadowing the module-level
           // metadata variable — the assignment further down then threw "Assignment to constant
           // variable" AFTER the whole book was rendered, so the warm never reported ready.
-          const selectedWarmMode = ev.data.mode === 0 ? 0 : 1;
+          const selectedWarmMode = outputMode(ev.data.mode);
           if (api._ko_export_set_mode(selectedWarmMode) !== 0) {
             throw new Error(api.UTF8ToString(api._ko_error()) || 'warm export mode rejected');
           }
@@ -2032,9 +2067,9 @@ case 'openPreview': {
 // that would produce a container with missing chapter names and no error.
       case 'spineLabels': {
         if (!requireWorkerBook(id, 'spineLabels')) break;
-        // On demand again: the actual display name comes from the EPUB's parsed navigation table, the
-        // same source used by the Korean reader and by XTC chapter export. The href is retained only as
-        // a fallback for spine entries the book did not put in its TOC.
+        // On demand: the engine probes visible XHTML headings and uses an
+        // exact-spine navigation label only as fallback. The href is retained
+        // solely for a book with neither source.
         const start = Math.max(0, ev.data.start | 0);
         const count = Math.max(1, ev.data.count | 0);
         const end = Math.min(spineCount, start + count);
@@ -2065,7 +2100,7 @@ case 'openPreview': {
         try {
           await stopWarmBeforeMutation();
           if (ev.data.spec) await applySpecIfChanged(ev.data.spec);
-          const m = ev.data.mode === 0 ? 0 : 1;
+          const m = outputMode(ev.data.mode);
           if (api._ko_export_set_mode(m) !== 0 ||
               api._ko_set_image_tone_depth(m === 0 ? 2 : 4) !== 0) {
             throw new Error(api.UTF8ToString(api._ko_error()) || 'spine export mode rejected');
@@ -2105,7 +2140,7 @@ case 'openPreview': {
         // function of the page SIZES and the chapters, so this returns ~10 KB of header/metadata/
         // chapter-table/index and the caller composes [prefix][records…] in the browser. Uncompressed
         // XTC/XTCH only — XTCZ needs the byte stream, so it uses assembleSpines.
-        const mode = ev.data.mode === 0 ? 0 : 1;
+        const mode = outputMode(ev.data.mode);
         let started = false, committed = false;
         try {
           if (api._ko_plan_begin(mode) < 0) throw new Error('plan begin failed');
@@ -2164,7 +2199,7 @@ case 'openPreview': {
         // them in the order the caller sent (spine order) and builds the chapter table with the same
         // shared builder the serial path uses. Completion order must never reach this code, so the
         // caller is responsible for sending spines in index order.
-        const mode = ev.data.mode === 0 ? 0 : 1;
+        const mode = outputMode(ev.data.mode);
         let started = false, committed = false;
         try {
         if (api._ko_assemble_begin(mode) < 0) throw new Error('assemble begin failed');
@@ -2180,28 +2215,55 @@ case 'openPreview': {
           }
           if (!(sp.bytes instanceof ArrayBuffer)) throw new Error('spine ' + sp.spine + ': invalid byte payload');
           const bytes = new Uint8Array(sp.bytes);
-          const offs = new Uint32Array(pages);
           let acc = 0;
-          for (let i = 0; i < pages; i++) { offs[i] = acc; acc += lengths[i]; }
+          for (let i = 0; i < pages; i++) acc += lengths[i];
           if (acc !== bytes.length) {
             throw new Error('spine ' + sp.spine + ': lengths sum ' + acc + ' != ' + bytes.length + ' bytes');
           }
-          // Allocated before the try: if a later allocation throws, the earlier ones must still be freed.
-          let bptr = 0, optr = 0, lptr = 0;
-          try {
-            bptr = checkedMalloc(bytes.length, 'case-assembleSpines:bptr');
-            optr = checkedMalloc(pages * 4, 'case-assembleSpines:optr');
-            lptr = checkedMalloc(pages * 4, 'case-assembleSpines:lptr');
-            api.HEAPU8.set(bytes, bptr);
-            new Uint32Array(api.HEAPU8.buffer, optr, pages).set(offs);
-            new Uint32Array(api.HEAPU8.buffer, lptr, pages).set(lengths);
-            if (api._ko_assemble_add_spine(bptr, bytes.length, pages, optr, lptr) < 0) {
-              throw new Error('assemble add spine failed for spine ' + sp.spine);
+          // Never copy a complete giant spine back into wasm beside the
+          // assembler's accumulated pages. Feed bounded groups; the C boundary
+          // independently accounts each live chunk with pending storage.
+          let pageStart = 0;
+          let byteStart = 0;
+          while (pageStart < pages) {
+            let pageEnd = pageStart;
+            let chunkSize = 0;
+            while (pageEnd < pages &&
+                   chunkSize + lengths[pageEnd] <= MAX_ASSEMBLY_WASM_CHUNK_BYTES) {
+              chunkSize += lengths[pageEnd++];
             }
-          } finally {
-            if (bptr) api._free(bptr);
-            if (optr) api._free(optr);
-            if (lptr) api._free(lptr);
+            if (pageEnd === pageStart) {
+              throw new Error('spine ' + sp.spine + ': one page exceeds the assembly chunk limit');
+            }
+            const chunk = bytes.subarray(byteStart, byteStart + chunkSize);
+            const chunkPages = pageEnd - pageStart;
+            const chunkOffsets = new Uint32Array(chunkPages);
+            let offset = 0;
+            for (let i = 0; i < chunkPages; i++) {
+              chunkOffsets[i] = offset;
+              offset += lengths[pageStart + i];
+            }
+            // Allocated before the try: if a later allocation throws, every
+            // earlier claim is still released before propagating the failure.
+            let bptr = 0, optr = 0, lptr = 0;
+            try {
+              bptr = checkedMalloc(chunk.length, 'case-assembleSpines:bptr');
+              optr = checkedMalloc(chunkPages * 4, 'case-assembleSpines:optr');
+              lptr = checkedMalloc(chunkPages * 4, 'case-assembleSpines:lptr');
+              api.HEAPU8.set(chunk, bptr);
+              new Uint32Array(api.HEAPU8.buffer, optr, chunkPages).set(chunkOffsets);
+              new Uint32Array(api.HEAPU8.buffer, lptr, chunkPages)
+                .set(lengths.subarray(pageStart, pageEnd));
+              if (api._ko_assemble_add_spine(bptr, chunk.length, chunkPages, optr, lptr) < 0) {
+                throw new Error('assemble add spine failed for spine ' + sp.spine);
+              }
+            } finally {
+              if (bptr) api._free(bptr);
+              if (optr) api._free(optr);
+              if (lptr) api._free(lptr);
+            }
+            pageStart = pageEnd;
+            byteStart += chunkSize;
           }
           for (const t of (sp.toc || [])) {
             if (withCString(t.title, (tp) => api._ko_assemble_add_toc(base, tp, t.localPage | 0)) < 0) {
@@ -2269,7 +2331,7 @@ case 'openPreview': {
         // §3 of the 1.3 audit: the snapshot is applied AFTER the lock is held, so the settings the
         // file is built from are exactly the settings the caller sent with this one message.
         if (ev.data.spec) await applySpecIfChanged(ev.data.spec);
-        const exportMode = ev.data.mode === 0 ? 0 : 1;
+        const exportMode = outputMode(ev.data.mode);
         if (api._ko_export_set_mode(exportMode) !== 0) {
           throw new Error(api.UTF8ToString(api._ko_error()) || 'export mode rejected');
         }
@@ -2294,7 +2356,7 @@ case 'openPreview': {
         invalidateEngine();
         // hand the finished bytes to the app as a transferable for download
         const tx = takeTransferBuffer(res.file)     // §2: no full-file copy;
-        post(id, true, { file: tx, mode: ev.data.mode === 0 ? 0 : 1,
+        post(id, true, { file: tx, mode: outputMode(ev.data.mode),
                          pages: res.pages, spines: res.spines,
                          xtcz: res.xtcz, rawBytes: res.rawBytes,
                          // diagnostic: per-spine ms and the preflight cost, if any. Storing these

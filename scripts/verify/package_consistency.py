@@ -27,6 +27,7 @@ usage: package_consistency.py <dist-dir> <embedded-face...> -- <external-face...
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -70,6 +71,38 @@ def check(dist, embedded, external):
         if face in embedded and blob in assets:
             problems.append(f'face {face} is embedded, yet {blob} was packaged anyway '
                             f'(dead weight on every visit)')
+    problems.extend(check_cache_chain(dist))
+    return problems
+
+
+def check_cache_chain(dist):
+    """The app/style generation and every worker must be one atomic cache chain."""
+    try:
+        index = open(os.path.join(dist, 'index.html'), encoding='utf-8').read()
+        app = open(os.path.join(dist, 'app.js'), encoding='utf-8').read()
+        worker = open(os.path.join(dist, 'ko.worker.js'), encoding='utf-8').read()
+    except OSError as exc:
+        return [f'cannot inspect hand-written cache chain: {exc}']
+
+    app_match = re.search(r'app\.js\?v=([A-Za-z0-9._-]+)', index)
+    style_match = re.search(r'style\.css\?v=([A-Za-z0-9._-]+)', index)
+    if not app_match or not style_match:
+        return ['index.html must version both app.js and style.css']
+    if app_match.group(1) != style_match.group(1):
+        return [f'cache-bust mismatch: app={app_match.group(1)} style={style_match.group(1)}']
+    if re.search(r'ko\.worker\.js\?v=[A-Za-z0-9._-]+', app):
+        return ['app.js contains a hard-coded worker cache version; workers must inherit APP_ASSET_VERSION']
+    required = ('document.currentScript', 'APP_ASSET_VERSION', 'workerScriptUrl()')
+    missing = [token for token in required if token not in app]
+    problems = ([f'app.js worker cache chain is not derived from its own script URL (missing {", ".join(missing)})']
+                if missing else [])
+    if 'function outputMode(value)' not in worker:
+        problems.append('ko.worker.js has no strict output-mode validator')
+    silent_modes = re.findall(r'ev\.data\.mode\s*===\s*0\s*\?\s*0\s*:\s*1', worker)
+    if silent_modes:
+        problems.append(f'ko.worker.js still silently coerces {len(silent_modes)} invalid output mode value(s)')
+    if re.search(r'ev\.data\.mode\s*===', worker):
+        problems.append('ko.worker.js reads an unvalidated message mode directly')
     return problems
 
 

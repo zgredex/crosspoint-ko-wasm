@@ -161,6 +161,35 @@ static std::vector<uint8_t> g_coverData;   // cover BMP bytes (ko_generate_cover
 static std::string g_coverPath;
 static size_t g_coverSize = 0;
 
+// memory32 has a hard 2 GiB ceiling and this module is built without C++
+// exceptions, so allocation failure aborts the worker.  These limits describe
+// simultaneously-live memory, not independent subsystem allowances.
+static constexpr uint64_t SAFE_WASM_WORKING_SET = 1536ull * 1024ull * 1024ull;
+static constexpr uint64_t FIXED_WASM_HEADROOM = 256ull * 1024ull * 1024ull;
+static constexpr uint64_t MAX_COPY_EPUB_BYTES = 512ull * 1024ull * 1024ull;
+static constexpr uint64_t MAX_OWNED_EPUB_BYTES = 1024ull * 1024ull * 1024ull;
+static constexpr uint64_t MAX_CONTAINER_FILE_BYTES = 1ull << 30;
+// Serial/full assembly finalization retains the pending records while claiming
+// the final contiguous vector, so its peak is two container-sized allocations.
+static constexpr uint64_t MAX_SERIAL_CONTAINER_BYTES =
+    (SAFE_WASM_WORKING_SET - FIXED_WASM_HEADROOM) / 2u;
+static constexpr uint64_t MAX_SAFE_SPINE_TRANSFER = 384ull * 1024ull * 1024ull;
+
+static bool safeWasmWorkingSetAllows(uint64_t additionalLiveBytes) {
+  const uint64_t storage = Storage.totalBytes();
+  return storage <= SAFE_WASM_WORKING_SET && additionalLiveBytes <= SAFE_WASM_WORKING_SET - storage &&
+         FIXED_WASM_HEADROOM <= SAFE_WASM_WORKING_SET - storage - additionalLiveBytes;
+}
+
+static void setDerivedBudgetForLoad(uint64_t simultaneouslyResidentInput) {
+  uint64_t available = 0;
+  if (simultaneouslyResidentInput < SAFE_WASM_WORKING_SET - FIXED_WASM_HEADROOM) {
+    available = SAFE_WASM_WORKING_SET - FIXED_WASM_HEADROOM - simultaneouslyResidentInput;
+  }
+  const uint64_t capped = std::min<uint64_t>(available, StorageBudget::kDefaultLimit);
+  Storage.setDerivedByteLimit(static_cast<size_t>(capped));
+}
+
 static void setError(const std::string& msg) {
   g_error.assign(msg.begin(), msg.end());
   g_error.push_back('\0');
@@ -669,6 +698,9 @@ static void beginBookReplacement() {
   dropRuntimeCustomFont();
   if (g_driver) g_driver->resetBook();
   Storage.clearAll();
+  // clearAll() releases every charged derived blob, so the per-load policy can
+  // safely start from the default before the new source representation narrows it.
+  Storage.setDerivedByteLimit(StorageBudget::kDefaultLimit);
   if (g_xtch) {
     g_xtch->reset();
     // reset() clears PAGES, not the metadata strings. Without this, a plan/assemble started after a failed
@@ -709,15 +741,26 @@ static int finishBookLoad() {
 
 KO_EXPORT int ko_load_epub(const uint8_t* data, size_t size, const char* virtualPath) {
   if (!g_driver || !g_xtch || !data || size == 0) return -1;
+  if (size > MAX_COPY_EPUB_BYTES) {
+    setError("copy EPUB load exceeds the 512 MiB safe limit");
+    return -1;
+  }
   // Fresh in-memory FS per book: section caches from a previous load otherwise accumulate in the wasm
   // heap and eventually fail section builds. Done as part of "begin", so the engine is already describing
   // no book if the parse below fails.
   beginBookReplacement();
+  // The caller's source and mountBlob's copy coexist until this call returns.
+  setDerivedBudgetForLoad(static_cast<uint64_t>(size) * 2u);
   const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
   if (!g_driver->loadEpubFromBlob(data, size, vp)) {
     setError("Epub::load failed");
     return -1;
   }
+  // The caller releases its temporary immediately after this call. Future
+  // derived files therefore need to reserve only the mounted copy, not the
+  // transient source as well; no allocation occurs between relaxing this limit
+  // and returning to that caller.
+  setDerivedBudgetForLoad(size);
   return finishBookLoad();
 }
 
@@ -725,7 +768,14 @@ KO_EXPORT int ko_load_epub(const uint8_t* data, size_t size, const char* virtual
 // it with ko_load_epub_owned, which adopts the pointer, and only free it yourself if you never call
 // that (or if the call never happened).
 KO_EXPORT uint8_t* ko_epub_alloc(size_t size) {
-  if (size == 0) return nullptr;
+  if (size == 0 || size > MAX_OWNED_EPUB_BYTES) {
+    setError("EPUB allocation exceeds the 1 GiB owned-input limit");
+    return nullptr;
+  }
+  if (!safeWasmWorkingSetAllows(size)) {
+    setError("EPUB allocation cannot coexist with the current wasm working set");
+    return nullptr;
+  }
   return static_cast<uint8_t*>(std::malloc(size));
 }
 
@@ -738,12 +788,18 @@ KO_EXPORT int ko_load_epub_owned(uint8_t* data, size_t size, const char* virtual
   // must never read or free it afterwards. The only case where nothing is adopted is a null/empty
   // buffer, and then there is nothing to leak either.
   if (!data || size == 0) return -1;
+  if (size > MAX_OWNED_EPUB_BYTES) {
+    std::free(data);  // a usable pointer is consumed by this API on every outcome
+    setError("owned EPUB exceeds the 1 GiB safe limit");
+    return -1;
+  }
   if (!g_driver) {
     std::free(data);          // consumed, just not by the storage
     setError("no engine");
     return -1;
   }
   beginBookReplacement();     // NOT Storage.clearAll(): see the begin/finish split above
+  setDerivedBudgetForLoad(size);
   const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
   if (!g_driver->loadEpubFromOwnedBlob(data, size, vp)) {
     setError("Epub::load failed");
@@ -773,6 +829,7 @@ static int ko_blob_read_trampoline(void* ctx, size_t offset, uint8_t* dst, size_
 KO_EXPORT int ko_load_epub_external(int size, const char* virtualPath) {
   if (!g_driver || size <= 0) return -1;
   beginBookReplacement();                   // fresh FS + no live book, same as every other load path
+  setDerivedBudgetForLoad(0);                // only the 256 KiB range window is resident
   externalStats().reset();
   const std::string vp = virtualPath && virtualPath[0] ? virtualPath : "/book.epub";
   // The reader is passed in, not looked up: the browser's is the EM_JS bridge and the host's is a pread,
@@ -786,7 +843,10 @@ KO_EXPORT int ko_load_epub_external(int size, const char* virtualPath) {
     setError("no external reader installed");
     return -1;
   }
-  if (!g_driver->loadEpubFromExternal(static_cast<size_t>(size), vp, reader, nullptr)) {
+  // A browser Blob is immutable by platform contract, so its validated central
+  // directory can be cached. Callback-backed host files use the default false
+  // and are revalidated on every ZIP open if their bytes might change.
+  if (!g_driver->loadEpubFromExternal(static_cast<size_t>(size), vp, reader, nullptr, true)) {
     setError("Epub::load failed");
     return -1;
   }
@@ -849,13 +909,12 @@ KO_EXPORT const char* ko_get_spine_href(int spineIndex) {
   return last.c_str();
 }
 
-// First EPUB navigation title assigned to a spine; pointer valid until the
-// next call. An empty result means the book has no TOC item for that spine and
-// lets the UI fall back to the basename rather than inventing metadata.
+// First meaningful visible XHTML heading for a spine, with its own navigation
+// title as fallback; pointer valid until the next call.
 KO_EXPORT const char* ko_get_spine_title(int spineIndex) {
   if (!g_driver || spineIndex < 0 || spineIndex >= g_driver->spineCount()) return "";
   static std::string last;
-  last = g_driver->spineTocTitle(spineIndex);
+  last = g_driver->spineDisplayTitle(spineIndex);
   return last.c_str();
 }
 
@@ -1092,7 +1151,6 @@ KO_EXPORT void ko_unload_book() {
 // Per-page record sizes are MEASURED, not estimated: demo-images produces 1,249,766 bytes for 13 pages and
 // 625,766 for 13 in 1-bit. The per-page record itself is a 22-byte header plus one or two profile planes;
 // the remaining container prefix is budgeted separately below.
-static constexpr uint64_t MAX_WASM_CONTAINER_BYTES = 1ull << 30;      // 1 GiB, half the wasm maximum
 static uint64_t recordBytesForMode(ko::XtcMode mode, ko::DeviceProfile profile) {
   const uint64_t planes = ko::deviceGeometry(profile).planeBytes;
   return 22ull + planes * (mode == ko::XtcMode::Mono1Bit ? 1ull : 2ull);
@@ -1101,7 +1159,7 @@ static uint64_t recordBytesForMode(ko::XtcMode mode, ko::DeviceProfile profile) 
 // How many pages of this mode fit under the budget. Never rely on OOM as the limit.
 static uint32_t maxPagesForMode(ko::XtcMode mode, ko::DeviceProfile profile) {
   // Worst case: every page also has a 16-byte index entry and a 96-byte chapter.
-  const uint64_t pages = (MAX_WASM_CONTAINER_BYTES - 56u - 256u) /
+  const uint64_t pages = (MAX_SERIAL_CONTAINER_BYTES - 56u - 256u) /
                          (recordBytesForMode(mode, profile) + 16u + 96u);
   return pages > ko::MAX_XTC_PAGES ? static_cast<uint32_t>(ko::MAX_XTC_PAGES)
                                   : static_cast<uint32_t>(pages);
@@ -1189,6 +1247,15 @@ KO_EXPORT int ko_export_spine(int spine) {
       return failExport("container byte budget reached at spine " + std::to_string(spine) + ", page " +
                         std::to_string(p));
     }
+    const uint64_t projectedPages = static_cast<uint64_t>(g_totalPages) + 1u;
+    const uint64_t projectedContainer = 56u + 256u +
+        projectedPages * (recordBytesForMode(g_exportMode, g_exportSpec.deviceProfile) + 16u + 96u);
+    if (projectedContainer > MAX_SERIAL_CONTAINER_BYTES ||
+        projectedContainer > UINT64_MAX / 2u ||
+        !safeWasmWorkingSetAllows(projectedContainer * 2u)) {
+      return failExport("safe wasm peak-memory budget reached at spine " + std::to_string(spine) +
+                        ", page " + std::to_string(p));
+    }
     if (!g_xtch->addPageFromPlanes(rp.bw, rp.lsb, rp.msb)) {
       return failExport("page encoder refused a page (container page limit or bad planes)");
     }
@@ -1205,7 +1272,9 @@ KO_EXPORT int ko_export_spine(int spine) {
       size_t dot = href.find_last_of('.');
       if (dot != std::string::npos) href = href.substr(0, dot);
       ko::XtchChapter ch;
-      ch.name = href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href;
+      std::string visibleTitle = g_driver->spineDisplayTitle(spine);
+      ch.name = !visibleTitle.empty() ? visibleTitle
+                                     : (href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href);
       ch.startPage = static_cast<uint16_t>(spineStart);
       ch.endPage = static_cast<uint16_t>(spineStart + added - 1);
       g_spineFallback.push_back(ch);
@@ -1214,13 +1283,28 @@ KO_EXPORT int ko_export_spine(int spine) {
     // becomes a chapter whose start page = spine start + anchor local page
     // (anchors are recorded during the layout we just ran).
     const int tocN = g_driver->tocCount();
+    std::vector<int> namedLocalPages;
     for (int t = 0; t < tocN; t++) {
       if (g_driver->tocSpine(t) != spine) continue;
-      const std::string title = g_driver->tocTitle(t);
       const std::string anchor = g_driver->tocAnchor(t);
       int local = anchor.empty() ? -1 : g_driver->anchorLocalPage(anchor);
-      int page = (local >= 0 && local < added) ? spineStart + local : spineStart;
+      if (local < 0 || local >= added) local = 0;
+      const std::string title = g_driver->currentChapterTitle(anchor, local, g_driver->tocTitle(t));
+      int page = spineStart + local;
       g_chapterCandidates.push_back({title, static_cast<uint32_t>(page)});
+      namedLocalPages.push_back(local);
+    }
+    // A valid EPUB may omit navigation entries entirely, or omit chapters
+    // inside a single large XHTML spine. Visible heading parsing supplies those
+    // real names and pages. Existing TOC pages stay first, preserving book order
+    // and avoiding duplicate entries at the same rendered page.
+    for (const auto& heading : g_driver->currentSectionChapterHeadings()) {
+      const int local = static_cast<int>(heading.localPage);
+      if (local < 0 || local >= added ||
+          std::find(namedLocalPages.begin(), namedLocalPages.end(), local) != namedLocalPages.end()) continue;
+      g_chapterCandidates.push_back({ko::normalizeChapterTitle(heading.title),
+                                     static_cast<uint32_t>(spineStart + local)});
+      namedLocalPages.push_back(local);
     }
     g_spinePageStart += added;
   }
@@ -1242,8 +1326,15 @@ KO_EXPORT int ko_export_finish() {
   }
   if (!g_xtch) return -1;
   if (!requireBook("export_finish")) return failExport("book disappeared during export");
+  if (g_totalPages <= 0) return failExport("cannot export an empty book");
   g_chapters = buildChapters(g_chapterCandidates, g_spineFallback,
                              static_cast<uint32_t>(g_totalPages));
+  const uint64_t finalBytes = 56u + 256u + static_cast<uint64_t>(g_chapters.size()) * 96u +
+                              static_cast<uint64_t>(g_totalPages) * 16u + g_xtch->residentPageBytes();
+  if (finalBytes > MAX_SERIAL_CONTAINER_BYTES || finalBytes > UINT64_MAX / 2u ||
+      !safeWasmWorkingSetAllows(finalBytes * 2u)) {
+    return failExport("export finalization exceeds the safe wasm peak-memory budget");
+  }
   g_xtchOut = g_xtch->finish(g_chapters);
   g_xtchFullReady = 1;
   g_exportActive = false;                 // the transaction is over; a new export needs a new begin()
@@ -1274,7 +1365,13 @@ struct EncodedSpine {
   std::vector<SpineTocEntry> toc;            // anchors resolved while the section was still built
   std::string fallbackName;
   int count() const { return static_cast<int>(lengths.size()); }
-  void reset() { flat.clear(); offsets.clear(); lengths.clear(); toc.clear(); fallbackName.clear(); }
+  void reset() {
+    std::vector<uint8_t>().swap(flat);
+    std::vector<uint32_t>().swap(offsets);
+    std::vector<uint32_t>().swap(lengths);
+    std::vector<SpineTocEntry>().swap(toc);
+    std::string().swap(fallbackName);
+  }
 };
 }  // namespace
 
@@ -1290,7 +1387,7 @@ static std::string boundedChapterName(const char* value) {
   // unbounded scan/allocation.
   size_t n = 0;
   while (n < 79 && value[n] != '\0') ++n;
-  return std::string(value, n);
+  return std::string(value, ko::utf8SafePrefixLength(value, n, 79));
 }
 
 static int failAssembly(const std::string& why) {
@@ -1316,6 +1413,21 @@ KO_EXPORT int ko_encode_spine(int spine) {
   w.setTextAa(textAaEnabled());
   const int n = g_driver->buildSection(spine, g_spec);
   if (n < 0) return -1;
+  const uint64_t recordBytes = recordBytesForMode(g_xtch->mode(), g_spec.deviceProfile);
+  if (static_cast<uint64_t>(n) > ko::MAX_XTC_PAGES ||
+      static_cast<uint64_t>(n) > MAX_SAFE_SPINE_TRANSFER / recordBytes) {
+    setError("encoded spine exceeds the 384 MiB safe transfer limit");
+    return -1;
+  }
+  const uint64_t encodedBytes = static_cast<uint64_t>(n) * recordBytes;
+  if (encodedBytes > std::numeric_limits<uint32_t>::max() ||
+      !safeWasmWorkingSetAllows(encodedBytes + recordBytes)) {
+    setError("encoded spine exceeds the safe wasm working-set budget");
+    return -1;
+  }
+  g_enc.flat.reserve(static_cast<size_t>(encodedBytes));
+  g_enc.offsets.reserve(static_cast<size_t>(n));
+  g_enc.lengths.reserve(static_cast<size_t>(n));
   int rendered = 0;
   for (int p = 0; p < n; p++) {
     ko::RenderedPage rp;
@@ -1332,27 +1444,31 @@ KO_EXPORT int ko_encode_spine(int spine) {
       setError("page encode failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
       return -1;
     }
+    // The final flat transfer buffer was reserved before rendering.  Append
+    // this one record and release it immediately, so a giant spine never has
+    // both a complete page-vector set and a complete flat copy resident.
+    const std::vector<uint8_t>& rec = w.page(0);
+    if (rec.size() != recordBytes || g_enc.flat.size() > std::numeric_limits<uint32_t>::max() - rec.size()) {
+      g_enc.reset();
+      setError("encoded spine record size is inconsistent");
+      return -1;
+    }
+    g_enc.offsets.push_back(static_cast<uint32_t>(g_enc.flat.size()));
+    g_enc.lengths.push_back(static_cast<uint32_t>(rec.size()));
+    g_enc.flat.insert(g_enc.flat.end(), rec.begin(), rec.end());
+    w.clearPages();
     rendered++;
   }
-  const int pages = static_cast<int>(w.pageCount());
+  const int pages = g_enc.count();
   if (pages != rendered) {
     // The serial path counts a page for every successful render and trusts the writer to have made
     // the same number of records. If those disagree the container would already be malformed, so
     // fail loudly here rather than assemble a file whose index disagrees with its records.
     return -1;
   }
-  // Move the records into g_enc and build the transferable layout.
-  size_t total = 0;
-  for (size_t i = 0; i < static_cast<size_t>(pages); i++) total += w.page(i).size();
-  g_enc.flat.reserve(total);
-  for (size_t i = 0; i < static_cast<size_t>(pages); i++) {
-    const std::vector<uint8_t>& rec = w.page(i);
-    g_enc.offsets.push_back(static_cast<uint32_t>(g_enc.flat.size()));
-    g_enc.lengths.push_back(static_cast<uint32_t>(rec.size()));
-    g_enc.flat.insert(g_enc.flat.end(), rec.begin(), rec.end());
-  }
   // TOC anchors, resolved while this spine's section is still the built one.
   const int tocN = g_driver->tocCount();
+  std::vector<int> namedLocalPages;
   for (int t = 0; t < tocN; t++) {
     if (g_driver->tocSpine(t) != spine) continue;
     const std::string anchor = g_driver->tocAnchor(t);
@@ -1361,8 +1477,20 @@ KO_EXPORT int ko_encode_spine(int spine) {
     SpineTocEntry e;
     e.tocIndex = t;
     e.localPage = local;
-    e.title = g_driver->tocTitle(t);
+    e.title = g_driver->currentChapterTitle(anchor, local, g_driver->tocTitle(t));
     g_enc.toc.push_back(e);
+    namedLocalPages.push_back(local);
+  }
+  for (const auto& heading : g_driver->currentSectionChapterHeadings()) {
+    const int local = static_cast<int>(heading.localPage);
+    if (local < 0 || local >= pages ||
+        std::find(namedLocalPages.begin(), namedLocalPages.end(), local) != namedLocalPages.end()) continue;
+    SpineTocEntry e;
+    e.tocIndex = -1;
+    e.localPage = local;
+    e.title = ko::normalizeChapterTitle(heading.title);
+    g_enc.toc.push_back(std::move(e));
+    namedLocalPages.push_back(local);
   }
   // Fallback chapter name, only used when the book has no usable TOC.
   {
@@ -1371,7 +1499,10 @@ KO_EXPORT int ko_encode_spine(int spine) {
     if (slash != std::string::npos) href = href.substr(slash + 1);
     const size_t dot = href.find_last_of('.');
     if (dot != std::string::npos) href = href.substr(0, dot);
-    g_enc.fallbackName = href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href;
+    const std::string visibleTitle = g_driver->spineDisplayTitle(spine);
+    g_enc.fallbackName = !visibleTitle.empty()
+                             ? visibleTitle
+                             : (href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href);
   }
   return pages;
 }
@@ -1449,6 +1580,17 @@ KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCo
     if (off + len > size) {                       // a truncated record must never be assembled
       return failAssembly("assemble_add_spine: truncated page record");
     }
+    const uint64_t projectedPages = static_cast<uint64_t>(g_asm->pageCount()) + 1u;
+    const uint64_t projectedContainer = 56u + 256u +
+        projectedPages * (recordBytesForMode(g_asmMode, g_asm->deviceProfile()) + 16u + 96u);
+    // During add, the complete transferred spine buffer is still live beside
+    // the assembler's pending records. The final output does not exist yet;
+    // its unavoidable second copy is checked separately at finish.
+    if (projectedContainer > MAX_SERIAL_CONTAINER_BYTES ||
+        static_cast<uint64_t>(size) > UINT64_MAX - projectedContainer ||
+        !safeWasmWorkingSetAllows(projectedContainer + static_cast<uint64_t>(size))) {
+      return failAssembly("assemble_add_spine: safe wasm peak-memory budget exceeded");
+    }
     if (!g_asm->addRawPage(data + off, static_cast<size_t>(len))) {
       return failAssembly("assemble_add_spine: page rejected");
     }
@@ -1501,7 +1643,14 @@ KO_EXPORT int ko_assemble_finish() {
   }
   if (!g_asm || !requireBook("assemble_finish")) return failAssembly("assemble_finish: book or writer unavailable");
   const uint32_t total = static_cast<uint32_t>(g_asm->pageCount());
+  if (total == 0) return failAssembly("assemble_finish: cannot build an empty container");
   g_chapters = buildChapters(g_asmCandidates, g_asmFallback, total);
+  const uint64_t finalBytes = 56u + 256u + static_cast<uint64_t>(g_chapters.size()) * 96u +
+                              static_cast<uint64_t>(total) * 16u + g_asm->residentPageBytes();
+  if (finalBytes > MAX_SERIAL_CONTAINER_BYTES || finalBytes > UINT64_MAX / 2u ||
+      !safeWasmWorkingSetAllows(finalBytes * 2u)) {
+    return failAssembly("assemble_finish: safe wasm peak-memory budget exceeded");
+  }
   g_xtchOut = g_asm->finish(g_chapters);
   if (g_xtchOut.empty()) return failAssembly("assemble_finish: container build refused");
   g_xtchFullReady = 1;
@@ -1578,7 +1727,7 @@ KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
   // The planner knows the exact record size.  Bound the array walk using the
   // fixed header+index cost here; actual chapter bytes are added at finish.
   const size_t bytePageLimit = static_cast<size_t>(
-      (MAX_WASM_CONTAINER_BYTES - 56u - 256u) / (expected + 16u));
+      (MAX_CONTAINER_FILE_BYTES - 56u - 256u) / (expected + 16u));
   if (g_planSizes.size() > ko::MAX_XTC_PAGES ||
       addCount > ko::MAX_XTC_PAGES - g_planSizes.size() ||
       addCount > bytePageLimit - std::min(bytePageLimit, g_planSizes.size())) {
@@ -1599,7 +1748,7 @@ KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
     }
     const uint64_t projectedPages = g_planSizes.size() + static_cast<uint64_t>(count);
     const uint64_t projected = 56u + 256u + projectedPages * 16u + recordBytes;
-    if (projected > MAX_WASM_CONTAINER_BYTES) {
+    if (projected > MAX_CONTAINER_FILE_BYTES) {
       return failPlan("plan_add_spine: container byte budget exceeded (" +
                       std::to_string(projected) + " bytes)");
     }
@@ -1650,12 +1799,13 @@ KO_EXPORT int ko_plan_finish() {
                    g_planDeviceProfile);
   w.adoptMetadataFrom(*g_xtch);          // the header carries the book's title/author
   const uint32_t total = static_cast<uint32_t>(g_planSizes.size());
+  if (total == 0) return failPlan("plan_finish: cannot build an empty container");
   g_chapters = ko::buildChapters(g_planCandidates, g_planFallback, total);
   uint64_t recordBytes = 0;
   for (uint32_t size : g_planSizes) recordBytes += size;
   const uint64_t projected = 56u + 256u + static_cast<uint64_t>(g_chapters.size()) * 96u +
                              static_cast<uint64_t>(g_planSizes.size()) * 16u + recordBytes;
-  if (g_chapters.size() > ko::MAX_XTC_CHAPTERS || projected > MAX_WASM_CONTAINER_BYTES) {
+  if (g_chapters.size() > ko::MAX_XTC_CHAPTERS || projected > MAX_CONTAINER_FILE_BYTES) {
     return failPlan("plan_finish: container byte budget exceeded");
   }
   g_planPrefix = w.buildPrefix(g_chapters, g_planSizes);
@@ -1715,12 +1865,9 @@ KO_EXPORT int ko_xtcz_wrap() {
   }
   const size_t rawLen = g_xtchOut.size();
   // Wrapping necessarily retains the raw container while building the XTZ4
-  // destination.  The raw export ceiling is 1 GiB, but two such vectors cannot
-  // coexist in a 2 GiB memory32 module.  Half that ceiling is the largest
-  // wrappable source, and the aggregate check below leaves another 512 MiB for
-  // allocator slack, renderer state and transient worker calls.
-  static constexpr uint64_t MAX_XTCZ_RAW_BYTES = MAX_WASM_CONTAINER_BYTES / 2u;
-  static constexpr uint64_t MAX_XTCZ_ACCOUNTED_PEAK = 1536ull * 1024ull * 1024ull;
+  // destination. The aggregate check accounts for storage, raw bytes, the
+  // worst-case destination and fixed renderer/allocator headroom together.
+  static constexpr uint64_t MAX_XTCZ_RAW_BYTES = MAX_SERIAL_CONTAINER_BYTES;
   if (rawLen > MAX_XTCZ_RAW_BYTES || rawLen > std::numeric_limits<uint32_t>::max()) {
     setError("xtcz_wrap: raw container exceeds the safe wrapping limit");
     return -1;
@@ -1737,8 +1884,8 @@ KO_EXPORT int ko_xtcz_wrap() {
   const size_t cap = 16u + numBlocks * perBlock;
   const uint64_t storageBytes = Storage.totalBytes();
   const uint64_t rawAndWorst = static_cast<uint64_t>(rawLen) + cap;
-  if (rawAndWorst > MAX_XTCZ_ACCOUNTED_PEAK ||
-      storageBytes > MAX_XTCZ_ACCOUNTED_PEAK - rawAndWorst) {
+  if (rawAndWorst > SAFE_WASM_WORKING_SET || storageBytes > SAFE_WASM_WORKING_SET - rawAndWorst ||
+      FIXED_WASM_HEADROOM > SAFE_WASM_WORKING_SET - rawAndWorst - storageBytes) {
     setError("xtcz_wrap: insufficient safe wasm memory headroom");
     return -1;
   }
