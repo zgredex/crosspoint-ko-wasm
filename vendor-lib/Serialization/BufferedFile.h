@@ -139,8 +139,14 @@ void writePod(BufferedFileWriter& out, const T& value) {
 }
 
 template <typename T>
-void readPod(BufferedFileReader& in, T& value) {
-  in.read(&value, sizeof(T));
+bool readPod(BufferedFileReader& in, T& value) {
+  T decoded{};
+  if (in.read(&decoded, sizeof(T)) != sizeof(T)) {
+    value = T{};
+    return false;
+  }
+  value = decoded;
+  return true;
 }
 
 inline void writeString(BufferedFileWriter& out, const std::string& s) {
@@ -149,13 +155,20 @@ inline void writeString(BufferedFileWriter& out, const std::string& s) {
   out.write(s.data(), len);
 }
 
-inline void readString(BufferedFileReader& in, std::string& s) {
-  uint32_t len;
-  readPod(in, len);
+inline bool readString(BufferedFileReader& in, std::string& s, uint32_t maxLen = 4096) {
+  uint32_t len = 0;
+  if (!readPod(in, len) || len > maxLen) {
+    s.clear();
+    return false;
+  }
   s.resize(len);
   if (len > 0) {
-    in.read(&s[0], len);
+    if (in.read(&s[0], len) != len) {
+      s.clear();
+      return false;
+    }
   }
+  return true;
 }
 
 }  // namespace serialization

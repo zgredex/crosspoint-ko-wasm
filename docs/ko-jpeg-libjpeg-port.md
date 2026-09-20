@@ -31,7 +31,8 @@ Also measured: libjpeg-turbo decodes 1200x1500 in **1.49 ms**, progressive full-
    SIMD is off deliberately: SIMD IDCT is not guaranteed bit-identical to C ISLOW, and the host
    build is the byte-exact verification harness. Our decoder pins `dct_method = JDCT_ISLOW`.
 3. **Converter rewrite** (`vendor-lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp`):
-   - `readWholeFile()` → `jpeg_mem_src()`. No streaming, no size cap.
+   - `readWholeFile()` → `jpeg_mem_src()`, with the 128 MiB compressed-file ceiling enforced before
+     the vector allocation (and the same ceiling applied to the ZIP member before extraction).
    - `JpegErrorHandler` with `setjmp`/`longjmp`: libjpeg's default `error_exit` is `exit()`,
      which in wasm would kill the whole conversion. Corrupt file = fail that image only.
    - `chooseScaleDenom(targetScale)` keeps the **same thresholds** as the old chooser

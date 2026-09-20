@@ -22,11 +22,6 @@ namespace {
 constexpr size_t MAX_CONTAINER_XML = 1u * 1024 * 1024;      // META-INF/container.xml
 constexpr size_t MAX_OPF_XML = 16u * 1024 * 1024;           // the OPF package document
 constexpr size_t MAX_TOC_XML = 16u * 1024 * 1024;           // the navigation document (NAV or NCX)
-// NOTE: there is deliberately no ceiling on the guide-cover wrapper XHTML. It cannot take one without
-// rewriting the reference's own read in Epub::load (the item is allocated inside readItemContentsToBytes),
-// and the oracle pin allows only ADDITIVE divergence in pinned engine files — it flagged the attempt as
-// "amended". A pre-allocation ceiling here needs the reference to change first. Recorded as a known gap
-// rather than silently restructured to look covered.
 }  // namespace
 
 bool Epub::findContentOpfFile(std::string* contentOpfFile) const {
@@ -52,7 +47,7 @@ if (containerSize > MAX_CONTAINER_XML) {
   }
 
   // Stream read (reusing your existing stream logic)
-  if (!readItemContentsToStream(containerPath, containerParser, 512)) {
+  if (!readItemContentsToStream(containerPath, containerParser, 512, false, MAX_CONTAINER_XML)) {
     LOG_ERR("EBP", "Could not read META-INF/container.xml");
     return false;
   }
@@ -97,7 +92,7 @@ if (contentOpfSize > MAX_OPF_XML) {
     return false;
   }
 
-  if (!readItemContentsToStream(contentOpfFilePath, opfParser, 1024)) {
+  if (!readItemContentsToStream(contentOpfFilePath, opfParser, 1024, false, MAX_OPF_XML)) {
     LOG_ERR("EBP", "Could not read content.opf");
     return false;
   }
@@ -114,7 +109,8 @@ if (contentOpfSize > MAX_OPF_XML) {
   if (bookMetadata.coverItemHref.empty() && !opfParser.guideCoverPageHref.empty()) {
     LOG_DBG("EBP", "No cover from metadata, trying guide cover page: %s", opfParser.guideCoverPageHref.c_str());
     size_t coverPageSize;
-    uint8_t* coverPageData = readItemContentsToBytes(opfParser.guideCoverPageHref, &coverPageSize, true);
+    uint8_t* coverPageData = readItemContentsToBytes(opfParser.guideCoverPageHref, &coverPageSize, true,
+                                                     MAX_EPUB_GUIDE_XHTML_BYTES);
     if (coverPageData) {
       const std::string coverPageHtml(reinterpret_cast<char*>(coverPageData), coverPageSize);
       free(coverPageData);
@@ -202,7 +198,7 @@ if (ncxSize > MAX_TOC_XML) {
 
   // Stream the decompressed NCX straight into the parser instead of round-tripping
   // through a temp file on the SD card (decompress -> write -> reopen -> reread -> delete).
-  if (!readItemContentsToStream(tocNcxItem, ncxParser, 1024)) {
+  if (!readItemContentsToStream(tocNcxItem, ncxParser, 1024, false, MAX_TOC_XML)) {
     LOG_ERR("EBP", "Could not read toc ncx file");
     return false;
   }
@@ -244,7 +240,7 @@ if (navSize > MAX_TOC_XML) {
 
   // Stream the decompressed nav document straight into the parser instead of round-tripping
   // through a temp file on the SD card (decompress -> write -> reopen -> reread -> delete).
-  if (!readItemContentsToStream(tocNavItem, navParser, 1024)) {
+  if (!readItemContentsToStream(tocNavItem, navParser, 1024, false, MAX_TOC_XML)) {
     LOG_ERR("EBP", "Could not read toc nav file");
     return false;
   }
@@ -296,44 +292,9 @@ void Epub::parseCssFiles() const {
     return;
   }
 
-  // Some converters emit one byte-identical stylesheet per chapter (100+ .css
-  // entries), and each parse costs a zip locate plus an SD extract round-trip.
-  // Map every CSS path to its central-directory (CRC32, compressed size) in a
-  // single scan and parse only the first of each identical pair. Rules merge
-  // into one global set, so dropping exact duplicates cannot lose styles. A
-  // path that never matches a directory entry keeps key 0 and always parses.
-  std::vector<uint64_t> dedupKeys(cssFiles.size(), 0);
-  if (cssFiles.size() > 1) {
-    std::unordered_map<std::string, size_t> pathToIndex;
-    pathToIndex.reserve(cssFiles.size());
-    for (size_t i = 0; i < cssFiles.size(); i++) {
-      pathToIndex.emplace(FsHelpers::normalisePath(cssFiles[i]), i);
-    }
-    ZipFile(filepath).enumerateFileEntries([&](std::string_view entryPath, uint32_t crc32, uint32_t compressedSize) {
-      if (!FsHelpers::hasCssExtension(entryPath)) {
-        return;
-      }
-      const auto it = pathToIndex.find(std::string{entryPath});
-      if (it != pathToIndex.end()) {
-        dedupKeys[it->second] = (static_cast<uint64_t>(crc32) << 32) | compressedSize;
-      }
-    });
-  }
-  std::vector<uint64_t> seenKeys;
-  seenKeys.reserve(cssFiles.size());
-  size_t skippedDuplicates = 0;
-
   // No cache yet - parse CSS files
   for (size_t cssIndex = 0; cssIndex < cssFiles.size(); cssIndex++) {
     const auto& cssPath = cssFiles[cssIndex];
-    const uint64_t dedupKey = dedupKeys[cssIndex];
-    if (dedupKey != 0) {
-      if (std::find(seenKeys.begin(), seenKeys.end(), dedupKey) != seenKeys.end()) {
-        skippedDuplicates++;
-        continue;
-      }
-      seenKeys.push_back(dedupKey);
-    }
     LOG_DBG("EBP", "Parsing CSS file: %s", cssPath.c_str());
 
     // Check heap before parsing - CSS parsing allocates heavily
@@ -361,7 +322,7 @@ void Epub::parseCssFiles() const {
       LOG_ERR("EBP", "Could not create temp CSS file");
       continue;
     }
-    if (!readItemContentsToStream(cssPath, tempCssFile, 1024)) {
+    if (!readItemContentsToStream(cssPath, tempCssFile, 1024, false, MAX_CSS_FILE_SIZE)) {
       LOG_ERR("EBP", "Could not read CSS file: %s", cssPath.c_str());
       // Explicitly close() file before calling Storage.remove()
       tempCssFile.close();
@@ -388,8 +349,7 @@ void Epub::parseCssFiles() const {
     LOG_ERR("EBP", "Failed to save CSS rules to cache");
   }
 
-  LOG_DBG("EBP", "Loaded %zu CSS style rules from %zu files (%zu identical duplicates skipped)", cssParser->ruleCount(),
-          cssFiles.size(), skippedDuplicates);
+  LOG_DBG("EBP", "Loaded %zu CSS style rules from %zu files", cssParser->ruleCount(), cssFiles.size());
   cssParser->clear();
 }
 
@@ -648,7 +608,7 @@ bool Epub::generateCoverBmp(bool cropped) const {
     if (!Storage.openFileForWrite("EBP", coverJpgTempPath, coverJpg)) {
       return false;
     }
-    if (!readItemContentsToStream(coverImageHref, coverJpg, 1024)) {
+    if (!readItemContentsToStream(coverImageHref, coverJpg, 1024, false, MAX_EPUB_IMAGE_BYTES)) {
       LOG_ERR("EBP", "Failed to extract cover image from epub");
       coverJpg.close();
       Storage.remove(coverJpgTempPath.c_str());
@@ -686,7 +646,11 @@ bool Epub::generateCoverBmp(bool cropped) const {
     if (!Storage.openFileForWrite("EBP", coverPngTempPath, coverPng)) {
       return false;
     }
-    readItemContentsToStream(coverImageHref, coverPng, 1024);
+    if (!readItemContentsToStream(coverImageHref, coverPng, 1024, false, MAX_EPUB_IMAGE_BYTES)) {
+      coverPng.close();
+      Storage.remove(coverPngTempPath.c_str());
+      return false;
+    }
     // Explicitly close() file before reopening for reading
     coverPng.close();
 
@@ -741,7 +705,7 @@ bool Epub::generateThumbBmp(int height) const {
     if (!Storage.openFileForWrite("EBP", coverJpgTempPath, coverJpg)) {
       return false;
     }
-    if (!readItemContentsToStream(coverImageHref, coverJpg, 1024)) {
+    if (!readItemContentsToStream(coverImageHref, coverJpg, 1024, false, MAX_EPUB_IMAGE_BYTES)) {
       LOG_ERR("EBP", "Failed to extract cover image for thumbnail");
       coverJpg.close();
       Storage.remove(coverJpgTempPath.c_str());
@@ -782,7 +746,11 @@ bool Epub::generateThumbBmp(int height) const {
     if (!Storage.openFileForWrite("EBP", coverPngTempPath, coverPng)) {
       return false;
     }
-    readItemContentsToStream(coverImageHref, coverPng, 1024);
+    if (!readItemContentsToStream(coverImageHref, coverPng, 1024, false, MAX_EPUB_IMAGE_BYTES)) {
+      coverPng.close();
+      Storage.remove(coverPngTempPath.c_str());
+      return false;
+    }
     // Explicitly close() file before reopening for reading
     coverPng.close();
 
@@ -819,7 +787,8 @@ bool Epub::generateThumbBmp(int height) const {
   return false;
 }
 
-uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size, const bool trailingNullByte) const {
+uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size, const bool trailingNullByte,
+                                      const size_t maxOutputBytes) const {
   if (itemHref.empty()) {
     LOG_DBG("EBP", "Failed to read item, empty href");
     return nullptr;
@@ -827,7 +796,7 @@ uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size
 
   const std::string path = FsHelpers::normalisePath(itemHref);
 
-  const auto content = ZipFile(filepath).readFileToMemory(path.c_str(), size, trailingNullByte);
+  const auto content = ZipFile(filepath).readFileToMemory(path.c_str(), size, trailingNullByte, maxOutputBytes);
   if (!content) {
     LOG_DBG("EBP", "Failed to read item %s", path.c_str());
     return nullptr;
@@ -837,22 +806,23 @@ uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size
 }
 
 bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, const size_t chunkSize,
-                                    const bool allowEarlyStop) const {
+                                    const bool allowEarlyStop, const size_t maxOutputBytes) const {
   if (itemHref.empty()) {
     LOG_DBG("EBP", "Failed to read item, empty href");
     return false;
   }
 
   const std::string path = FsHelpers::normalisePath(itemHref);
-  return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize, allowEarlyStop);
+  return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize, allowEarlyStop, maxOutputBytes);
 }
 
-bool Epub::extractItemToFile(const std::string& itemHref, const std::string& destPath) const {
+bool Epub::extractItemToFile(const std::string& itemHref, const std::string& destPath,
+                             const size_t maxOutputBytes) const {
   HalFile out;
   if (!Storage.openFileForWrite("EBP", destPath, out)) {
     return false;
   }
-  const bool ok = readItemContentsToStream(itemHref, out, 4096);
+  const bool ok = readItemContentsToStream(itemHref, out, 4096, false, maxOutputBytes);
   out.flush();
   out.close();
   if (!ok) {

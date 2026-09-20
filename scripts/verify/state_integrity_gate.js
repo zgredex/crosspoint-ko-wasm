@@ -125,6 +125,27 @@ function check(ok, label, detail) {
   check(api._ko_rgba_ptr() === 0, 'failed render ALSO invalidated the composed frame');
   check(api._ko_compose_rgba(1) < 0, 'compose after the failed render is refused');
 
+  // ---- 6b. layout mutation invalidates both pagination and rendered output ----------------------
+  loadBytes(good);
+  check(api._ko_build_spine(0) >= 0, 'build portrait spine for layout invalidation');
+  check(api._ko_render_page(0) === 0 && api._ko_compose_rgba(0) === 0,
+        'commit a portrait page before changing layout');
+  check(api._ko_set_orientation(1) === 0, 'orientation changes to landscape CW');
+  check(api._ko_plane_size(0) === 0 && api._ko_rgba_ptr() === 0,
+        'orientation change clears planes and composed frame');
+  check(api._ko_render_page(0) < 0,
+        'orientation change invalidates the previously built section/current spine');
+  check(api._ko_logical_width() === 800 && api._ko_logical_height() === 480,
+        'landscape renderer geometry is active');
+  check(api._ko_build_spine(0) >= 0 && api._ko_render_page(0) === 0,
+        'landscape section must be rebuilt before rendering');
+  const oldVw = api._ko_viewport_width(), oldVh = api._ko_viewport_height();
+  check(api._ko_set_margins(5000, 5000, 5000, 5000) < 0,
+        'oversized margins are refused');
+  check(api._ko_viewport_width() === oldVw && api._ko_viewport_height() === oldVh,
+        'refused margins leave the viewport unchanged');
+  check(api._ko_set_orientation(0) === 0, 'orientation restored to portrait');
+
   // ---- 7. invalid spine indices are refused everywhere (they used to clamp to spine 0) ------------
   loadBytes(good);
   const count = api._ko_load_epub ? loadBytes(good) : 0;
@@ -149,7 +170,9 @@ function check(ok, label, detail) {
   // ---- 9. the assembler is a transaction --------------------------------------------------------
   // This module exposes HEAPU8 only, so 32-bit fields are written through a view over the heap buffer.
   const u32 = (ptr, n = 1) => new Uint32Array(api.HEAPU8.buffer, ptr, n);
-  const rec = new Uint8Array(64);
+  const rec = new Uint8Array(22 + 96000);
+  rec.set([0x58, 0x54, 0x48, 0x00, 0xe0, 0x01, 0x20, 0x03, 0x00, 0x00,
+           0x00, 0x77, 0x01, 0x00], 0);  // XTH, 480x800, 96,000-byte two-plane payload
   const recPtr = api._malloc(rec.length); api.HEAPU8.set(rec, recPtr);
   const offPtr = api._malloc(4); u32(offPtr)[0] = 0;
   const lenPtr = api._malloc(4); u32(lenPtr)[0] = rec.length;
@@ -197,6 +220,29 @@ function check(ok, label, detail) {
   check(api._ko_plan_finish() < 0, 'the over-budget plan cannot finish');
   check(api._ko_plan_prefix_size() === 0, 'no prefix published for an over-budget plan');
 
+  // A record sum below 1 GiB is still invalid when the fixed prefix/index pushes the container over.
+  const prefixEdge = new Uint32Array([(1 << 30) - 100]);
+  const prefixEdgePtr = api._malloc(4); u32(prefixEdgePtr)[0] = prefixEdge[0];
+  api._ko_export_abort();
+  check(api._ko_plan_begin(1) === 0, 'plan_begin for prefix-budget edge');
+  check(api._ko_plan_add_spine(prefixEdgePtr, 1) < 0,
+        'planner includes fixed prefix/index bytes in its 1 GiB budget');
+  check(api._ko_plan_finish() < 0, 'prefix-over-budget plan cannot finish');
+  api._ko_export_abort();
+
+  // The add fits without chapters; finish must include the actual chapter table and reject before allocation.
+  const chapterEdgePtr = api._malloc(4);
+  u32(chapterEdgePtr)[0] = (1 << 30) - (56 + 256 + 16) - 50;
+  check(api._ko_plan_begin(1) === 0, 'plan_begin for chapter-budget edge');
+  check(api._ko_plan_add_spine(chapterEdgePtr, 1) === 1,
+        'record plus fixed/index bytes fit just below the budget');
+  api._ko_plan_add_fallback(0, 'chapter', 1);
+  check(api._ko_plan_finish() < 0,
+        'plan_finish includes actual chapter-table bytes in the budget');
+  check(api._ko_plan_prefix_size() === 0, 'chapter-over-budget plan allocates no prefix');
+  api._ko_export_abort();
+  api._free(prefixEdgePtr); api._free(chapterEdgePtr);
+
   const recPtr2 = api._malloc(64);
   const offPtr2 = api._malloc(budgetPages * 4);
   const lenPtr2 = api._malloc(budgetPages * 4);
@@ -218,6 +264,16 @@ function check(ok, label, detail) {
   // ---- 13. valid E, and the state is still coherent ------------------------------------------------
   const nE = loadBytes(good);
   check(nE === nA, 'valid E still loads after everything', `spines=${nE}`);
+
+  // ---- 14. repeated init is a complete lifecycle reset ------------------------------------------
+  check(api._ko_set_device_profile(3) === 0, 'switch to X3 before repeated init');
+  check(api._ko_set_orientation(1) === 0, 'switch to landscape before repeated init');
+  check(api._ko_init(464, 764) === 0, 'repeated ko_init succeeds');
+  check(api._ko_device_profile() === 4 && api._ko_orientation() === 0,
+        'repeated init restores the default X4 portrait spec');
+  check(api._ko_logical_width() === 480 && api._ko_logical_height() === 800,
+        'repeated init restores X4 renderer geometry');
+  sweepNoBook('after repeated init');
 
   console.log();
   if (failures) {

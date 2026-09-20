@@ -782,9 +782,50 @@ function applyFont(name) {
 // §2/§3: one place that turns a spec object into engine state. The per-field setters are cheap
 // (field writes in the engine) and run unconditionally so the spec is always authoritative; only the
 // expensive parts are gated — the font (custom = malloc + copy + reparse) and the margins.
+function validateSpec(spec) {
+  if (![1.0, 1.2, 1.4].includes(spec.lineCompression)) {
+    throw new Error('invalid line compression ' + spec.lineCompression);
+  }
+  if (!Number.isInteger(spec.paragraphAlignment) || spec.paragraphAlignment < 0 ||
+      spec.paragraphAlignment > 4) {
+    throw new Error('invalid paragraph alignment ' + spec.paragraphAlignment);
+  }
+  for (const key of ['paragraphIndent', 'extraParagraphSpacing', 'characterWrap', 'hyphenation',
+                     'embeddedStyle', 'textAa']) {
+    if (spec[key] !== 0 && spec[key] !== 1) throw new Error('invalid ' + key + ' ' + spec[key]);
+  }
+  if (!Number.isInteger(spec.imageRendering) || spec.imageRendering < 0 || spec.imageRendering > 2) {
+    throw new Error('invalid image rendering ' + spec.imageRendering);
+  }
+  if (!Number.isInteger(spec.imageDither) || spec.imageDither < 0 || spec.imageDither > 9) {
+    throw new Error('invalid image dither ' + spec.imageDither);
+  }
+  if (spec.imageToneDepth !== 2 && spec.imageToneDepth !== 4) {
+    throw new Error('invalid image tone depth ' + spec.imageToneDepth);
+  }
+  if (!['kopub', 'ridibatang', 'custom'].includes(spec.font)) {
+    throw new Error('invalid font ' + spec.font);
+  }
+  if (!Number.isInteger(spec.orientation) || spec.orientation < 0 || spec.orientation > 3) {
+    throw new Error('invalid reader orientation ' + spec.orientation);
+  }
+  if (spec.deviceProfile !== 'x4' && spec.deviceProfile !== 'x3') {
+    throw new Error('invalid device profile ' + spec.deviceProfile);
+  }
+  if (!Number.isInteger(spec.screenMargin) || spec.screenMargin < 5 ||
+      spec.screenMargin > 40 || spec.screenMargin % 5 !== 0) {
+    throw new Error('invalid reader screen margin ' + spec.screenMargin);
+  }
+}
+
 async function applySpec(raw) {
   const before = currentSpec;
-  currentSpec = Object.assign(defaultSpec(), raw || {});
+  if (raw != null && (typeof raw !== 'object' || Array.isArray(raw))) {
+    throw new Error('reader spec must be an object');
+  }
+  const candidate = Object.assign(defaultSpec(), raw || {});
+  validateSpec(candidate);  // authoritative worker boundary: no engine mutation has happened yet
+  currentSpec = candidate;
   const lkBefore = before ? layoutKey(before) : null;
   const rkBefore = before ? renderKey(before) : null;
   const lk = layoutKey(currentSpec);
@@ -797,21 +838,6 @@ async function applySpec(raw) {
   // fail-closed test: the first call threw correctly, and the very next exportBook still produced a
   // KoPub file — because the failed spec had already been written down.
   try {
-  // Validate every fallible scalar before touching engine state. This matters
-  // for profile/orientation in particular: changing renderer geometry and then
-  // failing a lazy font load must not leave the engine landscape while
-  // currentSpec rolls back to portrait.
-  if (!Number.isInteger(currentSpec.orientation) || currentSpec.orientation < 0 || currentSpec.orientation > 3) {
-    throw new Error('invalid reader orientation ' + currentSpec.orientation);
-  }
-  if (currentSpec.deviceProfile !== 'x4' && currentSpec.deviceProfile !== 'x3') {
-    throw new Error('invalid device profile ' + currentSpec.deviceProfile);
-  }
-  if (!Number.isInteger(currentSpec.screenMargin) || currentSpec.screenMargin < 5 ||
-      currentSpec.screenMargin > 40 || currentSpec.screenMargin % 5 !== 0) {
-    throw new Error('invalid reader screen margin ' + currentSpec.screenMargin);
-  }
-
   // Fetch the face before touching the engine with it: a lazily-loaded face (anything but the
   // default) may still be in flight, and `applyFont` would otherwise silently fail against a font id
   // that is not registered yet — rendering with the previous face and reporting success.
@@ -887,7 +913,12 @@ function viewportInfo(spec) {
 
 // The render path carries the spec, so an unchanged spec costs nothing at all (§2).
 async function applySpecIfChanged(raw) {
-  if (currentSpec && renderKey(currentSpec) === renderKey(Object.assign(defaultSpec(), raw || {}))) {
+  if (raw != null && (typeof raw !== 'object' || Array.isArray(raw))) {
+    throw new Error('reader spec must be an object');
+  }
+  const candidate = Object.assign(defaultSpec(), raw || {});
+  validateSpec(candidate);
+  if (currentSpec && renderKey(currentSpec) === renderKey(candidate)) {
     COUNTERS.renderApplies += 1;
     return false;
   }

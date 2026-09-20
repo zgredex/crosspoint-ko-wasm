@@ -105,14 +105,12 @@
     "lib/EpdFont/scripts/requirements.txt": "ef4f32716cb53527fe82297f68c253fee4afc21d",
     "lib/EpdFont/scripts/ttf_to_epdfont.py": "608c88eb56c8914fb7d344b4af48d05c97c1930d",
     "lib/EpdFont/scripts/verify_compression.py": "c2320c78be29fdb3bb57b3e281210f222f49ed21",
-    "lib/Epub/Epub.h": "40ab6f257d75bb63310a33be09e9db646851f05c",
     "lib/Epub/Epub/FootnoteEntry.h": "6034a6a5c3937d01dc016db504cf1a13e3f1a683",
     "lib/Epub/Epub/Page.cpp": "89dc65eb45e9f69ab387e5aeae16df4b2fd5018d",
     "lib/Epub/Epub/Page.h": "7e9a7c9123e2c5bf4d278e50c0a4c099a8bdcb81",
     "lib/Epub/Epub/ParsedText.cpp": "bb8035264a79e08f2901bf5e7b83e1b567cec200",
     "lib/Epub/Epub/ParsedText.h": "372bebee362e32e81c7aafe5eff9bd18d241762d",
     "lib/Epub/Epub/ReaderRenderSpec.h": "77ccb8aa14804461606a1f3f2adf1d251ab8c6fe",
-    "lib/Epub/Epub/Section.cpp": "a06b9fc13a1f7b6bb7317ebb7e714ca9ecbb31f3",
     "lib/Epub/Epub/Section.h": "092bf6f420aded29bff17bd53f9276304fcdc1dd",
     "lib/Epub/Epub/VisibleTextUtils.h": "72389f229aad6e0bcf6b6ecf778d3586717fb771",
     "lib/Epub/Epub/blocks/Block.h": "9601a35a6f109602c508c3e9826c7fea5bc2ab5e",
@@ -150,7 +148,6 @@
     "lib/Epub/Epub/hyphenation/generated/hyph-ru.trie.h": "3da4120e4364bb9bfd396710ed5b9e65919e31fd",
     "lib/Epub/Epub/hyphenation/generated/hyph-sv.trie.h": "0883c5344be40164fbc5516fa38a1a3af9f092d2",
     "lib/Epub/Epub/hyphenation/generated/hyph-uk.trie.h": "0c8480df2c4b469b9b660b5b6b6637d7f64b8c69",
-    "lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp": "664705f87f2c307fa6e83d8109cdafab74144045",
     "lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h": "6c68fcf8ed58ff47fa7f8a851880e94138fe531a",
     "lib/Epub/Epub/parsers/ContainerParser.cpp": "0ce90a21bf233166a5bd7d42949719ccaea47c62",
     "lib/Epub/Epub/parsers/ContainerParser.h": "395177505a4495cff4d5faf3fee92a927dcc30bc",
@@ -216,54 +213,127 @@
     "lib/Epub/Epub.cpp": {
       "blob": "f1b8537485013f3efae5d174db31aefe536c9ac5",
       "port_path": "vendor-lib/Epub/Epub.cpp",
-      "divergence_kind": "additive",
-      "added_lines": 38,
-      "removed_lines": 0,
+      "divergence_kind": "amended",
+      "added_lines": 55,
+      "removed_lines": 46,
       "changed_functions": [
+        "extractItemToFile",
         "findContentOpfFile",
+        "generateCoverBmp",
+        "generateThumbBmp",
         "parseContentOpf",
+        "parseCssFiles",
         "parseTocNavFile",
-        "parseTocNcxFile"
+        "parseTocNcxFile",
+        "readItemContentsToBytes",
+        "readItemContentsToStream"
       ],
       "only_in_reference": [],
       "only_in_port": [],
       "reference_function_count": 33,
-      "port_function_count": 33
+      "port_function_count": 33,
+      "removed_line_sample": [
+        "if (!readItemContentsToStream(containerPath, containerParser, 512)) {",
+        "if (!readItemContentsToStream(contentOpfFilePath, opfParser, 1024)) {",
+        "uint8_t* coverPageData = readItemContentsToBytes(opfParser.guideCoverPageHref, &coverPageSize, true);",
+        "if (!readItemContentsToStream(tocNcxItem, ncxParser, 1024)) {",
+        "if (!readItemContentsToStream(tocNavItem, navParser, 1024)) {",
+        "// Some converters emit one byte-identical stylesheet per chapter (100+ .css",
+        "// entries), and each parse costs a zip locate plus an SD extract round-trip.",
+        "// Map every CSS path to its central-directory (CRC32, compressed size) in a"
+      ]
+    },
+    "lib/Epub/Epub.h": {
+      "blob": "40ab6f257d75bb63310a33be09e9db646851f05c",
+      "port_path": "vendor-lib/Epub/Epub.h",
+      "divergence_kind": "amended",
+      "added_lines": 10,
+      "removed_lines": 4,
+      "changed_functions": [],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 0,
+      "port_function_count": 0,
+      "removed_line_sample": [
+        "#include <unordered_map>",
+        "bool trailingNullByte = false) const;",
+        "bool allowEarlyStop = false) const;",
+        "bool extractItemToFile(const std::string& itemHref, const std::string& destPath) const;"
+      ]
     },
     "lib/Epub/Epub/BookMetadataCache.cpp": {
       "blob": "beb14a1aec076dd734471ac6accff3f2c075e7f5",
       "port_path": "vendor-lib/Epub/Epub/BookMetadataCache.cpp",
       "divergence_kind": "amended",
-      "added_lines": 35,
-      "removed_lines": 5,
+      "added_lines": 247,
+      "removed_lines": 61,
       "changed_functions": [
         "beginTocPass",
+        "beginWrite",
         "buildBookBin",
-        "createTocEntry"
+        "createSpineEntry",
+        "createTocEntry",
+        "endContentOpfPass",
+        "endTocPass",
+        "endWrite",
+        "getSpineEntry",
+        "getTocEntry",
+        "load",
+        "readSpineEntryFrom",
+        "readTocEntryFrom"
       ],
-      "only_in_reference": [],
+      "only_in_reference": [
+        "readSpineEntry",
+        "readTocEntry"
+      ],
       "only_in_port": [],
       "reference_function_count": 21,
-      "port_function_count": 21,
+      "port_function_count": 19,
       "removed_line_sample": [
-        "t.len = static_cast<uint16_t>(path.size());",
-        "t.index = static_cast<uint16_t>(i);",
-        "return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);",
-        "int matched = zip.fillUncompressedSizes(targets, spineSizes);",
-        "cumSize += itemSize;"
+        "BookMetadataCache::SpineEntry readSpineEntryFrom(F& file) {",
+        "BookMetadataCache::SpineEntry entry;",
+        "serialization::readString(file, entry.href);",
+        "serialization::readPod(file, entry.cumulativeSize);",
+        "BookMetadataCache::TocEntry readTocEntryFrom(F& file) {",
+        "BookMetadataCache::TocEntry entry;",
+        "serialization::readString(file, entry.title);",
+        "serialization::readString(file, entry.href);"
       ]
     },
     "lib/Epub/Epub/BookMetadataCache.h": {
       "blob": "3a479f8e0fcf1fb53ca9b64fd939ad3762f53679",
       "port_path": "vendor-lib/Epub/Epub/BookMetadataCache.h",
-      "divergence_kind": "additive",
-      "added_lines": 4,
-      "removed_lines": 0,
+      "divergence_kind": "amended",
+      "added_lines": 9,
+      "removed_lines": 4,
       "changed_functions": [],
       "only_in_reference": [],
       "only_in_port": [],
       "reference_function_count": 0,
-      "port_function_count": 0
+      "port_function_count": 0,
+      "removed_line_sample": [
+        "uint16_t hrefLen;   // length for collision reduction",
+        "SpineEntry readSpineEntry(HalFile& file) const;",
+        "TocEntry readTocEntry(HalFile& file) const;",
+        ": cachePath(std::move(cachePath)), lutOffset(0), spineCount(0), tocCount(0), loaded(false), buildMode(false) {}"
+      ]
+    },
+    "lib/Epub/Epub/Section.cpp": {
+      "blob": "a06b9fc13a1f7b6bb7317ebb7e714ca9ecbb31f3",
+      "port_path": "vendor-lib/Epub/Epub/Section.cpp",
+      "divergence_kind": "amended",
+      "added_lines": 1,
+      "removed_lines": 1,
+      "changed_functions": [
+        "startBuild"
+      ],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 28,
+      "port_function_count": 28,
+      "removed_line_sample": [
+        "streamed = epub->readItemContentsToStream(localPath, tmpHtml, 8192);"
+      ]
     },
     "lib/Epub/Epub/blocks/ImageBlock.cpp": {
       "blob": "659504a79d06ea31e756623136dfe90b67a06cd3",
@@ -392,7 +462,7 @@
       "blob": "b6b3bd9734a5bb39206381c49c60320821bf3c76",
       "port_path": "vendor-lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp",
       "divergence_kind": "amended",
-      "added_lines": 169,
+      "added_lines": 168,
       "removed_lines": 184,
       "changed_functions": [
         "decodeToFramebuffer",
@@ -483,6 +553,24 @@
         "lowHeapWarningLogged = true;"
       ]
     },
+    "lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp": {
+      "blob": "664705f87f2c307fa6e83d8109cdafab74144045",
+      "port_path": "vendor-lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp",
+      "divergence_kind": "amended",
+      "added_lines": 4,
+      "removed_lines": 2,
+      "changed_functions": [
+        "startElement"
+      ],
+      "only_in_reference": [],
+      "only_in_port": [],
+      "reference_function_count": 31,
+      "port_function_count": 31,
+      "removed_line_sample": [
+        "self->epub->readItemContentsToStream(resolvedPath, headerProbe, 1024, /*allowEarlyStop=*/true);",
+        "extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);"
+      ]
+    },
     "lib/GfxRenderer/Bitmap.cpp": {
       "blob": "867fbf2bfd331f4f1fce9969a5e131a90e092faa",
       "port_path": "vendor-lib/GfxRenderer/Bitmap.cpp",
@@ -505,7 +593,7 @@
       "blob": "27136c2e0bc25f9159db5054a8419ed513afe734",
       "port_path": "vendor-lib/GfxRenderer/GfxRenderer.cpp",
       "divergence_kind": "amended",
-      "added_lines": 186,
+      "added_lines": 205,
       "removed_lines": 2,
       "changed_functions": [
         "begin",
@@ -563,7 +651,7 @@
       "blob": "1858115fc0a748ded33ad40a5374747e0a19c594",
       "port_path": "vendor-lib/GfxRenderer/GfxRenderer.h",
       "divergence_kind": "additive",
-      "added_lines": 55,
+      "added_lines": 61,
       "removed_lines": 0,
       "changed_functions": [],
       "only_in_reference": [],
@@ -610,8 +698,8 @@
     ]
   },
   "counts": {
-    "identical": 148,
-    "divergent": 16,
+    "identical": 145,
+    "divergent": 19,
     "missing_from_port": 1,
     "source_inputs": 3,
     "reference_engine_files": 168

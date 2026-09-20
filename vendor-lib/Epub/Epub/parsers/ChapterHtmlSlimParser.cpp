@@ -617,7 +617,8 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
               // image-heavy chapter from stalling for seconds per image.
               ImageDimensions dims = {0, 0};
               ImageDimsProbe headerProbe;
-              self->epub->readItemContentsToStream(resolvedPath, headerProbe, 1024, /*allowEarlyStop=*/true);
+              self->epub->readItemContentsToStream(resolvedPath, headerProbe, 1024, /*allowEarlyStop=*/true,
+                                                   MAX_EPUB_IMAGE_BYTES);
               bool gotDimensions = headerProbe.getDimensions(dims);
 
               if (!gotDimensions) {
@@ -631,7 +632,8 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 HalFile cachedImageFile;
                 bool extractSuccess = false;
                 if (Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
-                  extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096);
+                  extractSuccess = self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, 4096, false,
+                                                                        MAX_EPUB_IMAGE_BYTES);
                   cachedImageFile.flush();
                   cachedImageFile.close();
                 }

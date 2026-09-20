@@ -175,10 +175,52 @@ static bool requireBook(const char* operation) {
   return true;
 }
 
+static void invalidateRenderedPage() {
+  g_page = ko::RenderedPage{};
+  g_rgbaReady = false;
+}
+
+static void invalidateLayoutState() {
+  if (g_driver) g_driver->invalidateSection();
+  g_currentSpine = -1;
+  invalidateRenderedPage();
+}
+
+static bool applyMarginsChecked(int top, int right, int bottom, int left) {
+  if (!g_renderer) {
+    setError("renderer not initialised");
+    return false;
+  }
+  const int screenWidth = g_renderer->getScreenWidth();
+  const int screenHeight = g_renderer->getScreenHeight();
+  if (top < 0 || right < 0 || bottom < 0 || left < 0 ||
+      static_cast<int64_t>(left) + right >= screenWidth ||
+      static_cast<int64_t>(top) + bottom >= screenHeight) {
+    setError("invalid reader margins");
+    return false;
+  }
+  const int viewportWidth = screenWidth - left - right;
+  const int viewportHeight = screenHeight - top - bottom;
+  const bool changed = g_spec.marginTop != top || g_spec.marginRight != right ||
+                       g_spec.marginBottom != bottom || g_spec.marginLeft != left ||
+                       g_spec.viewportWidth != viewportWidth || g_spec.viewportHeight != viewportHeight;
+  g_spec.marginTop = top;
+  g_spec.marginRight = right;
+  g_spec.marginBottom = bottom;
+  g_spec.marginLeft = left;
+  g_spec.viewportWidth = static_cast<uint16_t>(viewportWidth);
+  g_spec.viewportHeight = static_cast<uint16_t>(viewportHeight);
+  if (changed) invalidateLayoutState();
+  return true;
+}
+
+static void clearBookOutputs();
+static void beginBookReplacement();
+
 extern "C" {
 
 // forward decl (ko_init calls it before its definition)
-KO_EXPORT void ko_set_margins(int top, int right, int bottom, int left);
+KO_EXPORT int ko_set_margins(int top, int right, int bottom, int left);
 
 // ---- lifecycle -------------------------------------------------------------
 
@@ -214,16 +256,22 @@ KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
     g_xtch = new ko::XtchWriter();
   } else {
     g_renderer->begin();
-    if (g_driver) g_driver->invalidateSection();
   }
+  beginBookReplacement();
   g_spec = ko::Spec();
+  g_error.clear();
+  g_xtch->reset();
+  g_xtch->setMode(ko::XtcMode::Gray2Bit);
+  g_xtch->setDeviceProfile(ko::DeviceProfile::X4);
+  g_xtch->setTextAa(true);
+  g_xtch->setMetadata("", "", "", "");
   ko::applyReaderOrientation(*g_renderer, g_spec.orientation);
   // The width/height arguments are ADVISORY and were, until now, silently discarded: the geometry
   // is derived from the spec's margins (viewport = screen − margins), so ko_init(464, 778) still
   // produced a 464x764 layout. Five verification scripts were initialised with the old 778 and
   // printed nothing about it, which made their own headers wrong about the geometry they measured.
   // Saying it out loud costs one line and removes that whole class of quiet disagreement.
-  ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  if (ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft) != 0) return -1;
   if (viewportWidth != g_spec.viewportWidth || viewportHeight != g_spec.viewportHeight) {
     std::fprintf(stderr,
                  "[ko] ko_init(%d,%d) ignored: geometry follows the margins, giving %ux%u "
@@ -261,22 +309,46 @@ KO_EXPORT const char* ko_error() {
 
 // ---- Korean typography knobs ------------------------------------------------
 
-KO_EXPORT void ko_set_line_compression(float v) { g_spec.lineCompression = v; }
-KO_EXPORT void ko_set_extra_paragraph_spacing(int v) { g_spec.extraParagraphSpacing = v; }
-KO_EXPORT void ko_set_paragraph_indent(int v) { g_spec.paragraphIndent = v; }
-KO_EXPORT void ko_set_character_wrap(int v) { g_spec.characterWrap = v; }
+KO_EXPORT void ko_set_line_compression(float v) {
+  if (g_spec.lineCompression != v) { g_spec.lineCompression = v; invalidateLayoutState(); }
+}
+KO_EXPORT void ko_set_extra_paragraph_spacing(int v) {
+  if (g_spec.extraParagraphSpacing != v) { g_spec.extraParagraphSpacing = v; invalidateLayoutState(); }
+}
+KO_EXPORT void ko_set_paragraph_indent(int v) {
+  if (g_spec.paragraphIndent != v) { g_spec.paragraphIndent = v; invalidateLayoutState(); }
+}
+KO_EXPORT void ko_set_character_wrap(int v) {
+  if (g_spec.characterWrap != v) { g_spec.characterWrap = v; invalidateLayoutState(); }
+}
 // alignment: 0 JUSTIFIED 1 LEFT 2 CENTER 3 RIGHT 4 BOOK_STYLE
-KO_EXPORT void ko_set_paragraph_alignment(int v) { g_spec.paragraphAlignment = v; }
-KO_EXPORT void ko_set_hyphenation(int v) { g_spec.hyphenationEnabled = v; }
-KO_EXPORT void ko_set_embedded_style(int v) { g_spec.embeddedStyle = v; }
-KO_EXPORT void ko_set_image_rendering(int v) { g_spec.imageRendering = v; }
+KO_EXPORT void ko_set_paragraph_alignment(int v) {
+  if (g_spec.paragraphAlignment != v) { g_spec.paragraphAlignment = v; invalidateLayoutState(); }
+}
+KO_EXPORT void ko_set_hyphenation(int v) {
+  if (g_spec.hyphenationEnabled != v) { g_spec.hyphenationEnabled = v; invalidateLayoutState(); }
+}
+KO_EXPORT void ko_set_embedded_style(int v) {
+  if (g_spec.embeddedStyle != v) { g_spec.embeddedStyle = v; invalidateLayoutState(); }
+}
+KO_EXPORT void ko_set_image_rendering(int v) {
+  if (g_spec.imageRendering != v) { g_spec.imageRendering = v; invalidateLayoutState(); }
+}
 // Text anti-aliasing (device Text AA toggle). Off = text renders 1-bit in the
 // BW pass only; images still get their grayscale passes.
-KO_EXPORT void ko_set_text_aa(int v) { g_spec.textAntiAliasing = v ? 1 : 0; }
+KO_EXPORT void ko_set_text_aa(int v) {
+  const int value = v ? 1 : 0;
+  if (g_spec.textAntiAliasing != value) { g_spec.textAntiAliasing = value; invalidateRenderedPage(); }
+}
 // Image dither model (ko::DitherMode code) and the tone depth the export needs
 // (4 for a 2-bit page, 2 for a 1-bit page). Re-render after changing either.
-KO_EXPORT void ko_set_image_dither(int v) { g_spec.imageDither = v; }
-KO_EXPORT void ko_set_image_tone_depth(int v) { g_spec.imageToneDepth = (v == 2) ? 2 : 4; }
+KO_EXPORT void ko_set_image_dither(int v) {
+  if (g_spec.imageDither != v) { g_spec.imageDither = v; invalidateRenderedPage(); }
+}
+KO_EXPORT void ko_set_image_tone_depth(int v) {
+  const int value = (v == 2) ? 2 : 4;
+  if (g_spec.imageToneDepth != value) { g_spec.imageToneDepth = value; invalidateRenderedPage(); }
+}
 KO_EXPORT void ko_set_focus_reading(int v) { (void)v; g_spec.focusReadingEnabled = 0; }  // EN-only; hardcoded off in KO
 
 // CrossPointSettings::ORIENTATION: 0 portrait, 1 landscape CW, 2 portrait
@@ -287,9 +359,19 @@ KO_EXPORT int ko_set_orientation(int v) {
     setError("invalid reader orientation");
     return -1;
   }
+  const ko::Spec before = g_spec;
   g_spec.applyOrientation(v);  // also rotates the reference viewable margins
   ko::applyReaderOrientation(*g_renderer, g_spec.orientation);
-  ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  if (!applyMarginsChecked(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft)) {
+    g_spec = before;
+    ko::applyReaderOrientation(*g_renderer, g_spec.orientation);
+    return -1;
+  }
+  if (before.orientation != g_spec.orientation || before.marginTop != g_spec.marginTop ||
+      before.marginRight != g_spec.marginRight || before.marginBottom != g_spec.marginBottom ||
+      before.marginLeft != g_spec.marginLeft) {
+    invalidateLayoutState();
+  }
   return 0;
 }
 
@@ -300,8 +382,17 @@ KO_EXPORT int ko_set_screen_margin(int v) {
     setError("invalid reader screen margin");
     return -1;
   }
+  const ko::Spec before = g_spec;
   g_spec.applyScreenMargin(v);
-  ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  if (!applyMarginsChecked(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft)) {
+    g_spec = before;
+    return -1;
+  }
+  if (before.screenMargin != g_spec.screenMargin || before.marginTop != g_spec.marginTop ||
+      before.marginRight != g_spec.marginRight || before.marginBottom != g_spec.marginBottom ||
+      before.marginLeft != g_spec.marginLeft) {
+    invalidateLayoutState();
+  }
   return 0;
 }
 
@@ -318,22 +409,26 @@ KO_EXPORT int ko_set_device_profile(int v) {
     setError("cannot change device profile during export");
     return -1;
   }
+  const ko::Spec before = g_spec;
   const auto profile = static_cast<ko::DeviceProfile>(v);
   if (g_spec.deviceProfile != profile) {
     g_spec.deviceProfile = profile;
     g_display->setDeviceProfile(profile);
     g_renderer->begin();
-    g_driver->invalidateSection();
-    g_page = ko::RenderedPage{};
-    g_rgbaReady = false;
-  }
-  if (g_xtch) {
-    g_xtch->reset();
-    g_xtch->setDeviceProfile(profile);
+    if (g_xtch) {
+      g_xtch->reset();
+      g_xtch->setDeviceProfile(profile);
+    }
   }
   g_spec.applyOrientation(g_spec.orientation);
   ko::applyReaderOrientation(*g_renderer, g_spec.orientation);
-  ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  if (!applyMarginsChecked(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft)) return -1;
+  if (before.deviceProfile != g_spec.deviceProfile || before.orientation != g_spec.orientation ||
+      before.marginTop != g_spec.marginTop || before.marginRight != g_spec.marginRight ||
+      before.marginBottom != g_spec.marginBottom || before.marginLeft != g_spec.marginLeft ||
+      before.viewportWidth != g_spec.viewportWidth || before.viewportHeight != g_spec.viewportHeight) {
+    invalidateLayoutState();
+  }
   return 0;
 }
 
@@ -390,6 +485,7 @@ KO_EXPORT int ko_load_external_builtin_font(int fontId, uintptr_t ptr, size_t le
   slot->family = std::move(family);
   slot->font = std::move(font);
   slot->bundle = std::move(parsed);
+  if (g_spec.fontId == fontId) invalidateLayoutState();
 
   // A build that still embeds this face now has both; the external one is registered, so drop the
   // embedded wrapper rather than keeping two copies of the font alive. This is what makes the switch
@@ -422,7 +518,10 @@ KO_EXPORT int ko_set_font(int fontId) {
         setError("font not loaded");
         return -1;
       }
-      g_spec.fontId = fontId;
+      if (g_spec.fontId != fontId) {
+        g_spec.fontId = fontId;
+        invalidateLayoutState();
+      }
       return 0;
     default:
       setError("unknown font id");
@@ -471,6 +570,7 @@ KO_EXPORT int ko_load_epdfont(const uint8_t* data, size_t size, const char* name
   g_renderer->insertSdFont(CUSTOM_FONT_ID, candidate.release());  // takes ownership
   g_customFontPath = candidatePath;
   g_spec.fontId = CUSTOM_FONT_ID;
+  invalidateLayoutState();
   return 0;
 }
 
@@ -487,6 +587,7 @@ KO_EXPORT int ko_clear_custom_font() {
   if (g_spec.fontId == CUSTOM_FONT_ID) {
     // Back to the reference default face, not to a port-specific one.
     g_spec.fontId = KOPUB_14_FONT_ID;
+    invalidateLayoutState();
   }
   return 0;
 }
@@ -499,17 +600,8 @@ KO_EXPORT int ko_font_advance_y() {
   return g_renderer->getLineHeight(g_spec.fontId);
 }
 
-KO_EXPORT void ko_set_margins(int top, int right, int bottom, int left) {
-  g_spec.marginTop = top;
-  g_spec.marginRight = right;
-  g_spec.marginBottom = bottom;
-  g_spec.marginLeft = left;
-  if (g_renderer) {
-    g_spec.viewportWidth = static_cast<uint16_t>(
-        g_renderer->getScreenWidth() - g_spec.marginLeft - g_spec.marginRight);
-    g_spec.viewportHeight = static_cast<uint16_t>(
-        g_renderer->getScreenHeight() - g_spec.marginTop - g_spec.marginBottom);
-  }
+KO_EXPORT int ko_set_margins(int top, int right, int bottom, int left) {
+  return applyMarginsChecked(top, right, bottom, left) ? 0 : -1;
 }
 
 KO_EXPORT int ko_viewport_width() { return g_spec.viewportWidth; }
@@ -531,8 +623,6 @@ KO_EXPORT int ko_logical_height() {
 // coherent state: no book.
 // Defined once the remaining output state is declared (it lives further down this file); forward declared
 // so the replacement path can invalidate it without moving declarations around.
-static void clearBookOutputs();
-
 static void beginBookReplacement() {
   if (g_driver) g_driver->resetBook();
   Storage.clearAll();
@@ -939,20 +1029,21 @@ KO_EXPORT void ko_unload_book() {
 // -fno-exceptions, so a failed vector allocation ABORTS the worker rather than throwing past it.
 //
 // Per-page record sizes are MEASURED, not estimated: demo-images produces 1,249,766 bytes for 13 pages and
-// 625,766 for 13 in 1-bit, i.e. 96,096 and 48,096 bytes per record (plane bytes plus a 96-byte record
-// header).
+// 625,766 for 13 in 1-bit. The per-page record itself is a 22-byte header plus one or two profile planes;
+// the remaining container prefix is budgeted separately below.
 static constexpr uint64_t MAX_WASM_CONTAINER_BYTES = 1ull << 30;      // 1 GiB, half the wasm maximum
 static uint64_t recordBytesForMode(ko::XtcMode mode, ko::DeviceProfile profile) {
   const uint64_t planes = ko::deviceGeometry(profile).planeBytes;
-  // 22-byte record header plus a conservative 74-byte allowance for the
-  // container's index/chapter/metadata share, preserving the previous budget.
-  return 96ull + planes * (mode == ko::XtcMode::Mono1Bit ? 1ull : 2ull);
+  return 22ull + planes * (mode == ko::XtcMode::Mono1Bit ? 1ull : 2ull);
 }
 
 // How many pages of this mode fit under the budget. Never rely on OOM as the limit.
 static uint32_t maxPagesForMode(ko::XtcMode mode, ko::DeviceProfile profile) {
-const uint64_t pages = MAX_WASM_CONTAINER_BYTES / recordBytesForMode(mode, profile);
-return pages > ko::MAX_XTC_PAGES ? static_cast<uint32_t>(ko::MAX_XTC_PAGES) : static_cast<uint32_t>(pages);
+  // Worst case: every page also has a 16-byte index entry and a 96-byte chapter.
+  const uint64_t pages = (MAX_WASM_CONTAINER_BYTES - 56u - 256u) /
+                         (recordBytesForMode(mode, profile) + 16u + 96u);
+  return pages > ko::MAX_XTC_PAGES ? static_cast<uint32_t>(ko::MAX_XTC_PAGES)
+                                  : static_cast<uint32_t>(pages);
 }
 
 // The ONE way an export becomes failed. It also drops the accumulated container, so a failed export cannot
@@ -1259,7 +1350,7 @@ KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCo
     setError("assemble_add_spine: null record");
     return -1;
   }
-// The format's page count is 16 bits on disk; refuse rather than wrap the header to zero.
+  // The format's page count is 16 bits on disk; refuse rather than wrap the header to zero.
   // A legal page count can still describe several GiB of container, so the byte budget is a SEPARATE ceiling.
   if (g_asm->pageCount() + static_cast<size_t>(pageCount) > ko::MAX_XTC_PAGES ||
       g_asm->pageCount() + static_cast<size_t>(pageCount) >
@@ -1373,12 +1464,14 @@ KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
   // The planner is where a caller can describe a container that would never fit: it receives record LENGTHS,
   // so the declared total is known before a single byte is written.
   {
-    uint64_t total = 0;
-    for (uint32_t v : g_planSizes) total += v;
-    for (int i = 0; i < count; i++) total += lengths[i];
-    if (total > MAX_WASM_CONTAINER_BYTES) {
+    uint64_t recordBytes = 0;
+    for (uint32_t v : g_planSizes) recordBytes += v;
+    for (int i = 0; i < count; i++) recordBytes += lengths[i];
+    const uint64_t projectedPages = g_planSizes.size() + static_cast<uint64_t>(count);
+    const uint64_t projected = 56u + 256u + projectedPages * 16u + recordBytes;
+    if (projected > MAX_WASM_CONTAINER_BYTES) {
       g_planFailed = true;
-      setError("plan_add_spine: container byte budget exceeded (" + std::to_string(total) + " bytes)");
+      setError("plan_add_spine: container byte budget exceeded (" + std::to_string(projected) + " bytes)");
       return -1;
     }
   }
@@ -1419,6 +1512,15 @@ KO_EXPORT int ko_plan_finish() {
   w.adoptMetadataFrom(*g_xtch);          // the header carries the book's title/author
   const uint32_t total = static_cast<uint32_t>(g_planSizes.size());
   g_chapters = ko::buildChapters(g_planCandidates, g_planFallback, total);
+  uint64_t recordBytes = 0;
+  for (uint32_t size : g_planSizes) recordBytes += size;
+  const uint64_t projected = 56u + 256u + static_cast<uint64_t>(g_chapters.size()) * 96u +
+                             static_cast<uint64_t>(g_planSizes.size()) * 16u + recordBytes;
+  if (g_chapters.size() > ko::MAX_XTC_CHAPTERS || projected > MAX_WASM_CONTAINER_BYTES) {
+    g_planFailed = true;
+    setError("plan_finish: container byte budget exceeded");
+    return -1;
+  }
   g_planPrefix = w.buildPrefix(g_chapters, g_planSizes);
   if (g_planPrefix.empty()) {                 // buildPrefix refuses an over-limit page count
     g_planFailed = true;
@@ -1536,7 +1638,19 @@ KO_EXPORT void ko_xtch_release() {
 KO_EXPORT void ko_export_abort() {
   g_exportActive = false;
   g_exportFailed = false;
+  g_asmActive = false;
+  g_asmFailed = false;
+  g_planActive = false;
+  g_planFailed = false;
   if (g_xtch) g_xtch->reset();
+  g_enc.reset();
+  g_asm.reset();
+  g_asmCandidates.clear();
+  g_asmFallback.clear();
+  g_planSizes.clear();
+  g_planCandidates.clear();
+  g_planFallback.clear();
+  g_planPrefix.clear();
   g_chapters.clear();
   g_spineFallback.clear();
   g_chapterCandidates.clear();

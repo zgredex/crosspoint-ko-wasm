@@ -30,6 +30,8 @@ The contract, the evidence and what is *not* covered: **`docs/ko-oracle-conforma
 # 1. source contract — is the vendored engine still the pinned one?
 #    needs gh auth for the fresh tree; a cached tree can be passed with --tree-json
 KO_ORACLE_SRC=<pinned checkout> python3 scripts/verify/oracle_pin.py --check
+# The conformance wrapper accepts the same cached tree when GitHub auth is unavailable:
+KO_ORACLE_TREE_JSON=/tmp/pinned_tree.json scripts/verify/oracle_conformance.sh --quick
 
 # 2. behaviour contract — does the port LAY OUT the same as the reference?
 bash scripts/verify/oracle_conformance.sh            # all fixtures

@@ -87,8 +87,7 @@ void jpegErrorExit(j_common_ptr cinfo) {
   longjmp(self->escape, 1);
 }
 
-// Read the whole file into memory: no streaming, no size cap (a 1200x1500 greyscale
-// frame is 1.8 MB against a 2 GB heap).
+// Read the whole file only after enforcing the compressed-file cap.
 bool readWholeFile(const std::string& path, std::vector<uint8_t>& out) {
   HalFile f;
   if (!Storage.openFileForRead("JPG", path, f)) {
@@ -96,8 +95,8 @@ bool readWholeFile(const std::string& path, std::vector<uint8_t>& out) {
     return false;
   }
   const int64_t size = f.size();
-  if (size <= 0) {
-    LOG_ERR("JPG", "Empty file: %s", path.c_str());
+  if (size <= 0 || static_cast<uint64_t>(size) > MAX_IMAGE_FILE_BYTES) {
+    LOG_ERR("JPG", "Empty or oversized file: %s", path.c_str());
     f.close();
     return false;
   }

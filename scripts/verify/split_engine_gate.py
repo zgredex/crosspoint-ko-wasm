@@ -114,6 +114,26 @@ def main():
             'the spec commit is transactional')
 
     print()
+    print('-- untrusted specs must be rejected before they can mutate engine state --')
+    for needle, why in [
+            ("[1.0, 1.2, 1.4]", 'line compression is an exact Korean-reader enum'),
+            ("spec.paragraphAlignment > 4", 'paragraph alignment is range checked'),
+            ("['paragraphIndent', 'extraParagraphSpacing', 'characterWrap', 'hyphenation'",
+             'binary layout fields are checked'),
+            ("spec.imageDither > 9", 'image dither is range checked'),
+            ("spec.imageToneDepth !== 2", 'image tone depth is enumerated'),
+            ("spec.orientation > 3", 'orientation is range checked'),
+            ("spec.deviceProfile !== 'x4'", 'device profile is enumerated'),
+            ("spec.screenMargin % 5 !== 0", 'screen margin matches firmware steps')]:
+        in_function(worker, 'validateSpec', needle, why)
+    ordered(worker, 'applySpec',
+            ['const candidate = Object.assign', 'validateSpec(candidate)', 'currentSpec = candidate'],
+            'applySpec validates before committing or calling the engine')
+    ordered(worker, 'applySpecIfChanged',
+            ['const candidate = Object.assign', 'validateSpec(candidate)', 'if (currentSpec'],
+            'the unchanged-spec shortcut cannot bypass validation')
+
+    print()
     print('-- destroying an engine destroys what the page believed about it (bug 3) --')
     in_function(app, 'killExportEngine', 'warmSpecKey = null;', "the page's warm belief is reset on a kill")
     in_function(app, 'killExportEngine', 'exportLoaded = null;', 'the engine handle is cleared')

@@ -15,9 +15,9 @@ What each check proves, and why it is not decorative:
            a byte-identical container.
   stage 7b generic read helpers — readFile / readFileToBuffer / readFileToStream must work on an external
            mount, whose Blob has data == nullptr by design. Before the fix these dereferenced that null.
-  stage 10 gray-plane control — the rejected state must still be *reachable* (so the control can show it
-           is wrong) and must be *unreachable* from product code (no boolean in the product API, macro
-           host-only). Both halves are asserted; either alone is a story.
+  stage 10 gray-plane control — the rejected state stays reachable in the host renderer, but the production
+           writer must reject the incomplete three-plane input. Product code has no boolean that can request
+           it, and the negative renderer remains host-only.
 
 Run: /usr/bin/python3 scripts/verify/defensive_gate.py
 """
@@ -114,16 +114,15 @@ def stage7_generic_reads():
 
 
 def stage10_gray_plane_control():
-    print("stage 10 — the rejected state must stay demonstrable and stay out of the product")
-    pair = []
-    for mode, flags in (("1bit", ["--1bit"]),):
-        a, b = OUT / f"{mode}-product.xtch", OUT / f"{mode}-control.xtch"
-        run([str(a)] + flags)
-        run([str(b)] + flags + ["--drop-gray-planes"])
-        pair.append((mode, masked_sha(a), masked_sha(b), a.read_bytes() != b.read_bytes()))
-    for mode, prod, ctrl, differ in pair:
-        check(differ, f"{mode}: the control still changes the container (so the gate can see the hazard)",
-              f"{prod} == {ctrl} — the control no longer discriminates")
+    print("stage 10 — incomplete mono plane sets must be rejected and stay out of the product")
+    a, b = OUT / "1bit-product.xtch", OUT / "1bit-rejected.xtch"
+    product = run([str(a), "--1bit"])
+    rejected = run([str(b), "--1bit", "--drop-gray-planes"])
+    log = (rejected.stderr or b"").decode("utf-8", "replace")
+    check(product.returncode == 0 and a.exists(), "1bit: complete three-plane input produces a container")
+    check(rejected.returncode != 0 and "page encoder refused" in log,
+          "1bit: missing gray planes are rejected by the writer",
+          f"exit={rejected.returncode} stderr={log[-200:]}")
 
     # Product API: no boolean that can drop the gray planes, and the macro is host-only.
     driver = (ROOT / "src/ko_engine_driver.h").read_text()
@@ -204,7 +203,7 @@ def main():
         return 1
     print("PASS — a relative epub path loads identically to an absolute one, owned load fails closed without "
           "a double free, short external reads are looped, the generic read helpers survive an external Blob, "
-          "and the rejected gray-plane state is test-only")
+          "and incomplete mono planes are rejected while the negative renderer remains test-only")
     return 0
 
 

@@ -364,8 +364,8 @@ else()
   add_executable(ko_xtch_host src/host_main.cpp)
   target_link_libraries(ko_xtch_host PRIVATE koengine)
   # The gray-plane negative control (Driver::renderPageDroppingGrayForTest) is compiled ONLY here. It
-  # exists so mono_planes_gate.py can demonstrate that dropping the gray passes changes a 1-bit container;
-  # the shipped module must not be able to select that state, so the macro is deliberately not global.
+  # exists so mono_planes_gate.py can prove the writer rejects incomplete 1-bit input; the shipped module
+  # must not be able to select that state, so the macro is deliberately not global.
   target_compile_definitions(ko_xtch_host PRIVATE KO_TEST_NEGATIVE_CONTROLS)
 
   # Verification tools as real targets. They used to be built by hand from a clang++ line in a
@@ -377,4 +377,10 @@ else()
     add_executable(${tool} tools/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE koengine)
   endforeach()
+  if(NOT KO_ENGINE_ROOT)
+    enable_testing()
+    add_executable(cache_integrity_test tests/cache_integrity_test.cpp)
+    target_link_libraries(cache_integrity_test PRIVATE koengine)
+    add_test(NAME cache_integrity COMMAND cache_integrity_test)
+  endif()
 endif()

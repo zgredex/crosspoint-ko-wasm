@@ -5,8 +5,8 @@ The proposal was: a 1-bit consumer reads only the BW plane, so a 1-bit preview o
 two gray render passes and save a full extra image decode per page. The codebase says otherwise, in two
 places:
 
-  * `src/xtch_writer.h::addMonoPage()` reads `lsb`/`msb` — `thinSolid = textAa_ && haveGray` — and uses
-    them to turn grey pixels into ink dots and to thin anti-aliased ink.
+  * `src/xtch_writer.h::addMonoPage()` requires and reads `lsb`/`msb`, using them to turn grey pixels
+    into ink dots and to thin anti-aliased ink.
   * `src/wasm_api.cpp::ko_compose_rgba()` reads them too: "A 1-bit page is never a pure function of the
     BW plane: grey pixels become ink dots."
 
@@ -16,8 +16,7 @@ So the optimization is not available, and the entry point that implemented it (`
 What this gate asserts:
   1. The product has no path that drops the gray planes for 1-bit output — statically, in every file that
      could pass the flag.
-  2. Dropping them CHANGES a 1-bit container (the control the host keeps for exactly this), so the claim
-     "it would not change output" is false on the record, with a number.
+  2. The writer rejects a 1-bit page whose gray planes were dropped.
   3. The same flag does NOT change a 2-bit container — it is specifically a 1-bit hazard.
 
 Run: /usr/bin/python3 scripts/verify/mono_planes_gate.py
@@ -83,27 +82,23 @@ def differing_bytes(a, b):
 
 
 def behavioural_checks():
-    print("behaviour — dropping the gray planes must change a 1-bit container")
+    print("behaviour — the writer must reject missing gray planes for 1-bit output")
     OUT.mkdir(parents=True, exist_ok=True)
     for book in FIXTURES:
         if not (ROOT / book).exists():
             continue
         name = Path(book).stem
         correct = OUT / f"{name}-1bit-correct.xtch"
-        dropped = OUT / f"{name}-1bit-dropped.xtch"
         r1 = subprocess.run([str(HOST), str(ROOT / book), str(correct), "--1bit"],
                             capture_output=True, timeout=900)
-        r2 = subprocess.run([str(HOST), str(ROOT / book), str(dropped), "--1bit", "--drop-gray-planes"],
+        r2 = subprocess.run([str(HOST), str(ROOT / book), str(OUT / f"{name}-rejected.xtch"),
+                             "--1bit", "--drop-gray-planes"],
                             capture_output=True, timeout=900)
-        if r1.returncode or r2.returncode:
-            check(False, f"{name}: both 1-bit arms run", f"exit {r1.returncode}/{r2.returncode}")
-            continue
-        n = differing_bytes(correct, dropped)
-        check(n is not None and n > 0, f"{name}: 1-bit WITH gray planes != 1-bit WITHOUT",
-              "they came out identical, so this gate can no longer see the hazard")
-        if n:
-            print(f"        {name:<14} 1-bit, gray planes dropped -> {n} differing bytes "
-                  f"(the optimization was not free)")
+        check(r1.returncode == 0, f"{name}: complete three-plane 1-bit page succeeds",
+              f"exit {r1.returncode}")
+        log = (r2.stdout + r2.stderr).decode(errors="replace")
+        check(r2.returncode != 0 and "page encoder refused" in log,
+              f"{name}: missing gray planes are rejected", f"exit {r2.returncode}; log={log[-200:]}")
 
     # The flag must be inert for 2-bit output: it is a 1-bit-only hazard, and if 2-bit changed too the
     # flag would be doing something other than what it claims.
@@ -128,8 +123,8 @@ def main():
     if failures:
         print(f"FAIL — {len(failures)} check(s) failed: " + "; ".join(failures))
         return 1
-    print("PASS — no product path skips the gray planes, and the control shows dropping them changes a "
-          "1-bit container while leaving 2-bit output alone")
+    print("PASS — no product path skips gray planes, the mono writer rejects missing planes, and the "
+          "2-bit path is unaffected by the mono-only negative control")
     return 0
 
 

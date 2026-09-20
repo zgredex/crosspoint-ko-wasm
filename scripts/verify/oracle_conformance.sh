@@ -61,6 +61,7 @@ cd "$REPO_ROOT"
 PORT_BIN=build/ko_xtch_host
 ORACLE_BIN=build-oracle/ko_xtch_host
 ORACLE_CMAKE_ROOT="${KO_ORACLE_CMAKE_ROOT:-/tmp/up-src/crosspoint-reader-ko-crosspoint-reader-ko-84a3919/lib}"
+ORACLE_TREE_JSON="${KO_ORACLE_TREE_JSON:-}"
 WORK="${KO_CONFORMANCE_WORK:-/tmp/ko-conformance}"
 QUICK=0
 SENSITIVITY=0
@@ -92,7 +93,11 @@ COMPARED=0
 
 # --- 1. the pin must hold before anything is compared -------------------------
 echo "== oracle pin =="
-if KO_ORACLE_SRC="$ORACLE_CMAKE_ROOT/.." python3 scripts/verify/oracle_pin.py --check | sed 's/^/  /'; then
+PIN_ARGS=(--check)
+if [ -n "$ORACLE_TREE_JSON" ]; then
+  PIN_ARGS+=(--tree-json "$ORACLE_TREE_JSON")
+fi
+if KO_ORACLE_SRC="$ORACLE_CMAKE_ROOT/.." python3 scripts/verify/oracle_pin.py "${PIN_ARGS[@]}" | sed 's/^/  /'; then
   ok "vendored engine matches the pin"
 else
   bad "oracle pin check failed — refusing to certify against a drifted engine"
@@ -163,14 +168,15 @@ if [ -z "$FIXTURES" ]; then
   # continuation — it is a second command, and the first line silently wins, which is how a "full"
   # gate run compared three fixtures and reported PASS for six.
   FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-text.epub:--device=x3 oracle/fixtures/ko-text.epub:--landscape-cw"
-  FIXTURES="$FIXTURES oracle/fixtures/ko-text.epub:--landscape-ccw oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub"
+  FIXTURES="$FIXTURES oracle/fixtures/ko-text.epub:--landscape-ccw oracle/fixtures/ko-text.epub:--device=x3,--landscape-cw"
+  FIXTURES="$FIXTURES oracle/fixtures/ko-text.epub:--device=x3,--landscape-ccw oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub"
   #   ko-glyphs TWICE: sup/sub scaled glyphs, synthesized bold and the fallback face take a DIFFERENT raster
   #   path from ordinary prose, and 1-bit and 2-bit take different paths again — yet those are exactly the
   #   functions the pin cannot hold byte-identical (they carry the port's capture fast path). `path:flags` is
   #   the loop's syntax for "same fixture, different mode".
   FIXTURES="$FIXTURES oracle/fixtures/ko-glyphs.epub oracle/fixtures/ko-glyphs.epub:--1bit"
   FIXTURES="$FIXTURES oracle/fixtures/ko-symbols.epub web/demo-images.epub web/demo-png.epub web/demo.epub"
-  [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-text.epub:--device=x3 oracle/fixtures/ko-text.epub:--landscape-cw oracle/fixtures/ko-text.epub:--landscape-ccw oracle/fixtures/ko-glyphs.epub oracle/fixtures/ko-glyphs.epub:--1bit"
+  [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-text.epub:--device=x3 oracle/fixtures/ko-text.epub:--landscape-cw oracle/fixtures/ko-text.epub:--landscape-ccw oracle/fixtures/ko-text.epub:--device=x3,--landscape-cw oracle/fixtures/ko-text.epub:--device=x3,--landscape-ccw oracle/fixtures/ko-glyphs.epub oracle/fixtures/ko-glyphs.epub:--1bit"
 fi
 
 # --- 3. sensitivity control ---------------------------------------------------
@@ -235,6 +241,8 @@ for fx in $FIXTURES; do
   case "$fx" in
     *:*) extra="${fx#*:}"; fx="${fx%%:*}" ;;
   esac
+  extra_tag="$(printf '%s' "$extra" | tr -d '-' | tr ',=' '__')"
+  extra="${extra//,/ }"
   # A fixture that is absent BY DESIGN (a commercial book this repo does not redistribute) is not a
   # gate failure; a fixture that should be in the checkout and is not, is. Without this distinction a
   # fresh clone reported "missing fixture web/demo.epub" as a failure — technically true, and wrong
@@ -248,7 +256,7 @@ for fx in $FIXTURES; do
     bad "missing fixture $fx"
     continue
   fi
-  name="$(basename "$fx" .epub)$(printf '%s' "$extra" | tr -d '-')"
+  name="$(basename "$fx" .epub)$extra_tag"
   echo "== $fx =="
   # --dump-planes rides along with the render that is already happening, so the per-page text-raster
   # comparison below costs a directory walk rather than a second render.

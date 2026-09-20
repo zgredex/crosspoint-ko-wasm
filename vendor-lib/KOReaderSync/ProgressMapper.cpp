@@ -765,7 +765,7 @@ class ParagraphStreamer final : public Print {
 
 bool streamSpine(const std::shared_ptr<Epub>& epub, int spineIndex, ParagraphStreamer& s) {
   const auto href = epub->getSpineItem(spineIndex).href;
-  return !href.empty() && epub->readItemContentsToStream(href, s, 1024);
+  return !href.empty() && epub->readItemContentsToStream(href, s, 1024, false, MAX_EPUB_SPINE_BYTES);
 }
 }  // namespace
 

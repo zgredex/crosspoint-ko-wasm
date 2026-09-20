@@ -57,6 +57,7 @@ class BookMetadataCache {
   uint16_t tocCount;
   bool loaded;
   bool buildMode;
+  bool buildFailed;
 
   HalFile bookFile;
   // Temp file handles during build
@@ -71,7 +72,8 @@ class BookMetadataCache {
   // Index for fast href→spineIndex lookup (used only for large EPUBs)
   struct SpineHrefIndexEntry {
     uint64_t hrefHash;  // FNV-1a 64-bit hash
-    uint16_t hrefLen;   // length for collision reduction
+    uint32_t hrefLen;   // length for collision reduction
+    uint32_t fileOffset;
     int16_t spineIndex;
   };
   std::deque<SpineHrefIndexEntry> spineHrefIndex;
@@ -91,14 +93,13 @@ class BookMetadataCache {
 
   uint32_t writeSpineEntry(HalFile& file, const SpineEntry& entry) const;
   uint32_t writeTocEntry(HalFile& file, const TocEntry& entry) const;
-  SpineEntry readSpineEntry(HalFile& file) const;
-  TocEntry readTocEntry(HalFile& file) const;
 
  public:
   BookMetadata coreMetadata;
 
   explicit BookMetadataCache(std::string cachePath)
-      : cachePath(std::move(cachePath)), lutOffset(0), spineCount(0), tocCount(0), loaded(false), buildMode(false) {}
+      : cachePath(std::move(cachePath)), lutOffset(0), spineCount(0), tocCount(0), loaded(false), buildMode(false),
+        buildFailed(false) {}
   ~BookMetadataCache() = default;
 
   // Building phase (stream to disk immediately)

@@ -92,7 +92,7 @@ class ZipFile {
   bool loadAllFileStatSlims();
   bool getInflatedFileSize(const char* filename, size_t* size);
   // Batch lookup: scan ZIP central dir once and fill sizes for matching targets.
-  // targets must be sorted by (hash, len). sizes[target.index] receives uncompressedSize.
+  // targets must be sorted by (hash, path). sizes[target.index] receives uncompressedSize.
   // Returns number of targets matched.
   int fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<uint32_t>& sizes);
   // Due to the memory required to run each of these, it is recommended to not preopen the zip file for multiple

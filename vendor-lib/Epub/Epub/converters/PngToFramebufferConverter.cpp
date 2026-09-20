@@ -286,7 +286,7 @@ void pngMemReadFn(png_structp png, png_bytep out, png_size_t count) {
   reader->offset += count;
 }
 
-// Whole-file read: no streaming, no decoder-object heap budget.
+// Whole-file read only after enforcing the compressed-file cap.
 bool readWholeFilePng(const std::string& path, std::vector<uint8_t>& out) {
   HalFile f;
   if (!Storage.openFileForRead("PNG", path, f)) {
@@ -294,8 +294,8 @@ bool readWholeFilePng(const std::string& path, std::vector<uint8_t>& out) {
     return false;
   }
   const int64_t size = f.size();
-  if (size <= 0) {
-    LOG_ERR("PNG", "Empty file: %s", path.c_str());
+  if (size <= 0 || static_cast<uint64_t>(size) > MAX_IMAGE_FILE_BYTES) {
+    LOG_ERR("PNG", "Empty or oversized file: %s", path.c_str());
     f.close();
     return false;
   }

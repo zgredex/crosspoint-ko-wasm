@@ -567,9 +567,15 @@ int main(int argc, char** argv) {
       tRender += msSince(t0);
       if (!manifestPath.empty()) manifestPages.push_back(std::move(probe));
       t0 = Clock::now();
-      writer.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
+      if (!writer.addPageFromPlanes(rp.bw, rp.lsb, rp.msb)) {
+        fprintf(stderr, "page encoder refused spine %d page %d\n", spine, p);
+        return 1;
+      }
       tWrite += msSince(t0);
-      if (pooled) local.addPageFromPlanes(rp.bw, rp.lsb, rp.msb);
+      if (pooled && !local.addPageFromPlanes(rp.bw, rp.lsb, rp.msb)) {
+        fprintf(stderr, "local page encoder refused spine %d page %d\n", spine, p);
+        return 1;
+      }
       if (dumpPlanes) {
         char base[512];
         snprintf(base, sizeof(base), "%s/p%05d_%05d", planesDir.c_str(), spine, p);

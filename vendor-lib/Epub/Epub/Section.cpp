@@ -318,7 +318,7 @@ bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void(
       // Larger chunks mean far fewer SD writes inflating the HTML; a 1KB chunk turned a 584KB
       // single-spine novel into ~570 tiny writes (multi-second). 8KB keeps the transient buffers
       // small while cutting the write count 8x.
-      streamed = epub->readItemContentsToStream(localPath, tmpHtml, 8192);
+      streamed = epub->readItemContentsToStream(localPath, tmpHtml, 8192, false, MAX_EPUB_SPINE_BYTES);
       fileSize = tmpHtml.size();
       // Explicitly close() file before calling Storage.remove()
       tmpHtml.close();

@@ -110,7 +110,7 @@ All functions exported on the module instance (`createKoEngine()` → `Module`).
 | `ko_set_orientation(0-3)` | KO orientation: portrait, landscape CW, inverted, landscape CCW |
 | `ko_orientation()` | Current KO orientation value |
 | `ko_set_screen_margin(5..40, step 5)` | Apply the firmware screen-margin knob and orientation-aware safe margins |
-| `ko_set_margins(t,r,b,l)` | Logical margins; recomputes viewport |
+| `ko_set_margins(t,r,b,l)` | Checked logical margins; recomputes viewport and returns 0/-1 |
 | `ko_viewport_width/height()` | Current viewport |
 | `ko_logical_width/height()` | X4: 480×800 portrait / 800×480 landscape; X3: 528×792 / 792×528 |
 

@@ -124,6 +124,7 @@ namespace ko {
 // zero — a container that says it has no pages while carrying them. Defined once, used by the writer and
 // by both transaction entry points in the wasm API.
 inline constexpr size_t MAX_XTC_PAGES = 65535;
+inline constexpr size_t MAX_XTC_CHAPTERS = 65535;
 
 enum class XtcMode {
   Mono1Bit = 0,   // "XTC\0", XTG pages (1-bit fast)
@@ -196,10 +197,9 @@ class XtchWriter {
                    const std::vector<uint8_t>& msb, uint16_t LOGICAL_W, uint16_t LOGICAL_H) {
     const auto& g = geometry();
     const size_t planeBytes = g.planeBytes;
-    if (bw.size() < planeBytes) return false;
+    if (bw.size() != planeBytes || lsb.size() != planeBytes || msb.size() != planeBytes) return false;
     std::vector<uint8_t> plane(planeBytes, 0xFF);  // start white (1)
-    const bool haveGray = lsb.size() >= planeBytes && msb.size() >= planeBytes;
-    const bool thinSolid = textAa_ && haveGray;  // AA on: solid ink is thinned too
+    const bool thinSolid = textAa_;  // AA on: solid ink is thinned too
 
     // Bit-parallel: one OUTPUT BYTE (8 pixels) per iteration instead of one pixel. The output
     // byte at [y * outputRowBytes + k] holds x = 8k..8k+7; those pixels sit on descending phyY with
@@ -219,20 +219,18 @@ class XtchWriter {
                                  physicalRowBytes + c;
           const int sh = 8 * (7 - j);
           Lbw |= static_cast<uint64_t>(bw[off]) << sh;
-          if (haveGray) {
-            Llsb |= static_cast<uint64_t>(lsb[off]) << sh;
-            Lmsb |= static_cast<uint64_t>(msb[off]) << sh;
-          }
+          Llsb |= static_cast<uint64_t>(lsb[off]) << sh;
+          Lmsb |= static_cast<uint64_t>(msb[off]) << sh;
         }
         const uint64_t Tbw = transpose8x8(Lbw);
-        const uint64_t Tlsb = haveGray ? transpose8x8(Llsb) : 0;
-        const uint64_t Tmsb = haveGray ? transpose8x8(Lmsb) : 0;
+        const uint64_t Tlsb = transpose8x8(Llsb);
+        const uint64_t Tmsb = transpose8x8(Lmsb);
         for (int b = 0; b < 8; ++b) {
           const int y = c * 8 + b;
           const int sh = 8 * (7 - b);
           // Transposed byte: bit (7-j) holds the pixel at x = 8k + j of this logical row.
           uint8_t inkBits = static_cast<uint8_t>(~((Tbw >> sh) & 0xFF));  // ink bit = 0
-          if (haveGray && inkBits) {
+          if (inkBits) {
             const uint8_t lBits = static_cast<uint8_t>((Tlsb >> sh) & 0xFF);
             const uint8_t mBits = static_cast<uint8_t>((Tmsb >> sh) & 0xFF);
             const uint8_t m3 = static_cast<uint8_t>(~lBits & ~mBits);  // solid ink, no grey
@@ -283,7 +281,7 @@ class XtchWriter {
     const auto& g = geometry();
     const size_t planeBytes = g.planeBytes;
     std::vector<uint8_t> p1(planeBytes, 0), p2(planeBytes, 0);
-    if (bw.size() < planeBytes || lsb.size() < planeBytes || msb.size() < planeBytes) return false;
+    if (bw.size() != planeBytes || lsb.size() != planeBytes || msb.size() != planeBytes) return false;
 
     const int rowBytes = g.physicalRowBytes;
     const int rowsPerCol = LOGICAL_H / 8;
@@ -325,8 +323,8 @@ class XtchWriter {
   // Finalize container bytes: 56B header + 256B metadata + chapters + index + data
   // ---- pooling support -------------------------------------------------------
   // A spine is the unit of parallel work. Workers encode spines into page records; ONE assembler
-  // appends those records in spine order and writes the container. Nothing here re-encodes a page:
-  // addRawPage takes the bytes the same proven encoder produced, and takePagesFrom moves them.
+  // appends those records in spine order and writes the container. addRawPage validates every record
+  // against the assembler's mode, geometry, size, and page ceiling.
   const std::vector<uint8_t>& page(size_t i) const { return pendingPages_[i]; }
 
   // Append an already-encoded page record verbatim.
@@ -354,12 +352,6 @@ class XtchWriter {
     return true;
   }
 
-  // Move every page out of another writer into this one, preserving order.
-  void takePagesFrom(XtchWriter& other) {
-    for (auto& p : other.pendingPages_) pendingPages_.push_back(std::move(p));
-    other.pendingPages_.clear();
-  }
-
   void clearPages() { std::vector<std::vector<uint8_t>>().swap(pendingPages_); }
 
   // The container header carries the book's metadata, so an assembler writer — constructed fresh, with
@@ -378,7 +370,7 @@ class XtchWriter {
   std::vector<uint8_t> buildPrefix(const std::vector<XtchChapter>& chapters,
                                    const std::vector<uint32_t>& pageSizes) const {
     const size_t pageCount = pageSizes.size();
-    if (pageCount > MAX_XTC_PAGES) return {};      // refuse rather than truncate chapter pages
+    if (pageCount > MAX_XTC_PAGES || chapters.size() > MAX_XTC_CHAPTERS) return {};
     const size_t chapterCount = chapters.size();
     const uint64_t metadataOffset = 56;
     const uint64_t chapterOffset = metadataOffset + 256;
@@ -397,6 +389,7 @@ class XtchWriter {
     // buildPrefix reserves the exact final size (it lays out the fixed region itself), so there is no
     // separate reserve here to double the peak.
     std::vector<uint8_t> out = buildPrefix(chapters, sizes);
+    if (out.empty()) return {};
     const size_t pageCount = pendingPages_.size();
 
     // --- data ---

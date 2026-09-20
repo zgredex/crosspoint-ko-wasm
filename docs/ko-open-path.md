@@ -281,8 +281,8 @@ The proposal was that a 1-bit consumer reads only the BW plane, so a 1-bit previ
 both gray passes and save a full extra image decode per page. **The premise is false in this codebase**,
 in two places:
 
-* `xtch_writer.h::addMonoPage()` reads `lsb`/`msb` — `thinSolid = textAa_ && haveGray` — turning grey
-  pixels into ink dots and thinning anti-aliased ink with them;
+* `xtch_writer.h::addMonoPage()` requires and reads `lsb`/`msb`, turning grey pixels into ink dots and
+  thinning anti-aliased ink with them;
 * `wasm_api.cpp::ko_compose_rgba()` reads them too: *"A 1-bit page is never a pure function of the BW
   plane: grey pixels become ink dots."*
 
