@@ -47,6 +47,12 @@ constexpr uint32_t ZIP_SIG_LOCAL = 0x04034b50;
 constexpr size_t ZIP_EOCD_MIN = 22;
 constexpr size_t ZIP_MAX_COMMENT = 65535;    // a ZIP comment is a uint16_t length
 constexpr size_t ZIP_CD_MIN_ENTRY = 46;      // smallest possible central-directory record
+// Parsing the whole central directory once is the trust boundary for every
+// later lookup.  These limits bound the validation set itself: without them,
+// duplicate-name detection could become the archive's next memory attack.
+constexpr uint32_t MAX_ZIP_ENTRIES = 32768;
+constexpr size_t MAX_ZIP_CENTRAL_DIRECTORY_BYTES = 32u * 1024u * 1024u;
+constexpr size_t MAX_ZIP_TOTAL_NAME_BYTES = 8u * 1024u * 1024u;
 
 // RAII zip: opens the zip if not already open, closes on destruction only if
 // it performed the open.  Removes the wasOpen/close boilerplate from every method.
@@ -451,6 +457,41 @@ bool ZipFile::loadZipDetails() {
     LOG_ERR("ZIP", "Entry count exceeds what the central directory can hold");
     return false;
   }
+  if (entries > MAX_ZIP_ENTRIES || centralDirSize > MAX_ZIP_CENTRAL_DIRECTORY_BYTES) {
+    LOG_ERR("ZIP", "Central directory exceeds the supported metadata budget");
+    return false;
+  }
+
+  // Validate the ENTIRE directory, including global name uniqueness, before a
+  // lazy filename lookup may trust any one entry.  The result lives on the
+  // backing Blob, not this short-lived ZipFile: Epub constructs a ZipFile per
+  // member read, and rescanning a 30k-entry directory for every spine/image
+  // would turn this safety check into quadratic work.  HalFile writes
+  // invalidate the mark, so it can never certify mutated bytes.
+  if (!file.isZipDirectoryValidated()) {
+    if (!file.seek(centralDirOffset)) return false;
+    const size_t cdEnd = static_cast<size_t>(centralDirOffset) + centralDirSize;
+    std::unordered_set<std::string> names;
+    names.reserve(entries);
+    size_t totalNameBytes = 0;
+    for (uint32_t i = 0; i < entries; ++i) {
+      CentralEntry entry;
+      if (!readCentralEntry(entry, cdEnd)) {
+        LOG_ERR("ZIP", "Malformed central-directory record");
+        return false;
+      }
+      if (entry.name.size() > MAX_ZIP_TOTAL_NAME_BYTES - totalNameBytes) {
+        LOG_ERR("ZIP", "ZIP filename metadata exceeds the supported budget");
+        return false;
+      }
+      totalNameBytes += entry.name.size();
+      if (!names.insert(entry.name).second) {
+        LOG_ERR("ZIP", "duplicate central-directory name: %s", entry.name.c_str());
+        return false;
+      }
+    }
+    file.markZipDirectoryValidated();
+  }
 
   zipDetails.totalEntries = entries;
   zipDetails.centralDirOffset = centralDirOffset;
@@ -629,17 +670,13 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
     return nullptr;
   }
 
-  // Integrity: the central directory's CRC, computed over the UNCOMPRESSED bytes. A damaged DEFLATE stream
-  // can inflate "successfully" into wrong content, which for a deterministic converter is worse than a clean
-  // rejection. A zero CRC field is treated as unset (an empty member, or a writer that never filled it) and
-  // is not used to reject a book; everything else must match.
-  if (fileStat.crc32 != 0) {
-    const uint32_t actual = crc32Update(0, data, inflatedDataSize);
-    if (actual != fileStat.crc32) {
-      LOG_ERR("ZIP", "CRC mismatch for %s: central %08x, computed %08x", filename, fileStat.crc32, actual);
-      free(data);
-      return nullptr;
-    }
+  // CRC32 value zero is data, not an "unset" sentinel in a central-directory
+  // record.  Every complete read is verified, including a declared 0 CRC.
+  const uint32_t actual = crc32Update(0, data, inflatedDataSize);
+  if (actual != fileStat.crc32) {
+    LOG_ERR("ZIP", "CRC mismatch for %s: central %08x, computed %08x", filename, fileStat.crc32, actual);
+    free(data);
+    return nullptr;
   }
 
   if (trailingNullByte) data[allocSize - 1] = '\0';   // allocSize carries the +1, never the wrapped form
@@ -707,12 +744,10 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
 
     free(buffer);
     // The whole member was consumed, so the central directory's CRC is meaningful and must match.
-    if (fileStat.crc32 != 0) {
-      const uint32_t actual = crc32Update(crc, nullptr, 0);
-      if (actual != fileStat.crc32) {
-        LOG_ERR("ZIP", "CRC mismatch for %s: central %08x, computed %08x", filename, fileStat.crc32, actual);
-        return false;
-      }
+    const uint32_t actual = crc32Update(crc, nullptr, 0);
+    if (actual != fileStat.crc32) {
+      LOG_ERR("ZIP", "CRC mismatch for %s: central %08x, computed %08x", filename, fileStat.crc32, actual);
+      return false;
     }
     return true;
   }
@@ -797,7 +832,7 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
     free(fileReadBuffer);
     // Only a COMPLETE decode can be verified: with allowEarlyStop the sink stopped the read on purpose, so
     // the uncompressed member was never fully inspected and claiming CRC coverage for it would be a lie.
-    if (success && fileStat.crc32 != 0 && totalProduced == static_cast<size_t>(inflatedDataSize)) {
+    if (success && totalProduced == static_cast<size_t>(inflatedDataSize)) {
       if (crc != fileStat.crc32) {
         LOG_ERR("ZIP", "CRC mismatch for %s: central %08x, computed %08x", filename, fileStat.crc32, crc);
         success = false;

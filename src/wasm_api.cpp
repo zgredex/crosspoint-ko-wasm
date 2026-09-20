@@ -16,10 +16,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include "converters/ImagePerf.h"
 #include <cstring>
 #include <algorithm>
 #include <chrono>   // external-read timing (range-backed mount)
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -309,47 +311,74 @@ KO_EXPORT const char* ko_error() {
 
 // ---- Korean typography knobs ------------------------------------------------
 
-KO_EXPORT void ko_set_line_compression(float v) {
+KO_EXPORT int ko_set_line_compression(float v) {
+  if (!std::isfinite(v) || (v != 1.0f && v != 1.2f && v != 1.4f)) {
+    setError("invalid line compression");
+    return -1;
+  }
   if (g_spec.lineCompression != v) { g_spec.lineCompression = v; invalidateLayoutState(); }
+  return 0;
 }
-KO_EXPORT void ko_set_extra_paragraph_spacing(int v) {
+KO_EXPORT int ko_set_extra_paragraph_spacing(int v) {
+  if (v != 0 && v != 1) { setError("invalid extra paragraph spacing"); return -1; }
   if (g_spec.extraParagraphSpacing != v) { g_spec.extraParagraphSpacing = v; invalidateLayoutState(); }
+  return 0;
 }
-KO_EXPORT void ko_set_paragraph_indent(int v) {
+KO_EXPORT int ko_set_paragraph_indent(int v) {
+  if (v != 0 && v != 1) { setError("invalid paragraph indent"); return -1; }
   if (g_spec.paragraphIndent != v) { g_spec.paragraphIndent = v; invalidateLayoutState(); }
+  return 0;
 }
-KO_EXPORT void ko_set_character_wrap(int v) {
+KO_EXPORT int ko_set_character_wrap(int v) {
+  if (v != 0 && v != 1) { setError("invalid character wrap"); return -1; }
   if (g_spec.characterWrap != v) { g_spec.characterWrap = v; invalidateLayoutState(); }
+  return 0;
 }
 // alignment: 0 JUSTIFIED 1 LEFT 2 CENTER 3 RIGHT 4 BOOK_STYLE
-KO_EXPORT void ko_set_paragraph_alignment(int v) {
+KO_EXPORT int ko_set_paragraph_alignment(int v) {
+  if (v < 0 || v > 4) { setError("invalid paragraph alignment"); return -1; }
   if (g_spec.paragraphAlignment != v) { g_spec.paragraphAlignment = v; invalidateLayoutState(); }
+  return 0;
 }
-KO_EXPORT void ko_set_hyphenation(int v) {
+KO_EXPORT int ko_set_hyphenation(int v) {
+  if (v != 0 && v != 1) { setError("invalid hyphenation"); return -1; }
   if (g_spec.hyphenationEnabled != v) { g_spec.hyphenationEnabled = v; invalidateLayoutState(); }
+  return 0;
 }
-KO_EXPORT void ko_set_embedded_style(int v) {
+KO_EXPORT int ko_set_embedded_style(int v) {
+  if (v != 0 && v != 1) { setError("invalid embedded style"); return -1; }
   if (g_spec.embeddedStyle != v) { g_spec.embeddedStyle = v; invalidateLayoutState(); }
+  return 0;
 }
-KO_EXPORT void ko_set_image_rendering(int v) {
+KO_EXPORT int ko_set_image_rendering(int v) {
+  if (v < 0 || v > 2) { setError("invalid image rendering"); return -1; }
   if (g_spec.imageRendering != v) { g_spec.imageRendering = v; invalidateLayoutState(); }
+  return 0;
 }
 // Text anti-aliasing (device Text AA toggle). Off = text renders 1-bit in the
 // BW pass only; images still get their grayscale passes.
-KO_EXPORT void ko_set_text_aa(int v) {
-  const int value = v ? 1 : 0;
-  if (g_spec.textAntiAliasing != value) { g_spec.textAntiAliasing = value; invalidateRenderedPage(); }
+KO_EXPORT int ko_set_text_aa(int v) {
+  if (v != 0 && v != 1) { setError("invalid text anti-aliasing value"); return -1; }
+  if (g_spec.textAntiAliasing != v) { g_spec.textAntiAliasing = v; invalidateRenderedPage(); }
+  return 0;
 }
 // Image dither model (ko::DitherMode code) and the tone depth the export needs
 // (4 for a 2-bit page, 2 for a 1-bit page). Re-render after changing either.
-KO_EXPORT void ko_set_image_dither(int v) {
+KO_EXPORT int ko_set_image_dither(int v) {
+  if (v < 0 || v > 9) { setError("invalid image dither mode"); return -1; }
   if (g_spec.imageDither != v) { g_spec.imageDither = v; invalidateRenderedPage(); }
+  return 0;
 }
-KO_EXPORT void ko_set_image_tone_depth(int v) {
-  const int value = (v == 2) ? 2 : 4;
-  if (g_spec.imageToneDepth != value) { g_spec.imageToneDepth = value; invalidateRenderedPage(); }
+KO_EXPORT int ko_set_image_tone_depth(int v) {
+  if (v != 2 && v != 4) { setError("invalid image tone depth"); return -1; }
+  if (g_spec.imageToneDepth != v) { g_spec.imageToneDepth = v; invalidateRenderedPage(); }
+  return 0;
 }
-KO_EXPORT void ko_set_focus_reading(int v) { (void)v; g_spec.focusReadingEnabled = 0; }  // EN-only; hardcoded off in KO
+KO_EXPORT int ko_set_focus_reading(int v) {
+  if (v != 0 && v != 1) { setError("invalid focus reading value"); return -1; }
+  g_spec.focusReadingEnabled = 0;  // EN-only; hardcoded off in KO
+  return 0;
+}
 
 // CrossPointSettings::ORIENTATION: 0 portrait, 1 landscape CW, 2 portrait
 // inverted, 3 landscape CCW. The web UI exposes the two landscape variants;
@@ -538,6 +567,21 @@ KO_EXPORT int ko_font() { return g_spec.fontId; }
 // Path of the currently installed custom face, so a replacement can retire the old file. Empty when no
 // custom face is installed.
 static std::string g_customFontPath;
+static uint64_t g_customFontAttempt = 0;
+static constexpr size_t MAX_EPDFONT_BYTES = 64u * 1024u * 1024u;
+
+static bool dropRuntimeCustomFont() {
+  const bool wasSelected = g_spec.fontId == CUSTOM_FONT_ID;
+  if (g_renderer && g_renderer->hasFont(CUSTOM_FONT_ID)) {
+    g_renderer->removeFont(CUSTOM_FONT_ID);
+  }
+  if (!g_customFontPath.empty()) {
+    Storage.remove(g_customFontPath.c_str());
+    g_customFontPath.clear();
+  }
+  if (wasSelected) g_spec.fontId = KOPUB_14_FONT_ID;
+  return wasSelected;
+}
 
 // CANDIDATE FIRST (defensive pass, stage 5). The old order removed the working face, mounted the new
 // blob and only then tried to parse it — so a truncated or malformed payload left the engine with NO
@@ -545,12 +589,17 @@ static std::string g_customFontPath;
 // parsed to completion before anything live is touched; on failure the installed face is untouched, and
 // the caller's state (worker + page) is likewise unchanged, so all three layers still agree.
 KO_EXPORT int ko_load_epdfont(const uint8_t* data, size_t size, const char* name) {
-  if (!g_renderer || !data || size < 64) {
+  (void)name;  // display metadata must never choose the backing-storage identity
+  if (!g_renderer || !data || size < sizeof(EpdFontHeader) || size > MAX_EPDFONT_BYTES) {
     setError("bad epdfont payload");
     return -1;
   }
+  if (++g_customFontAttempt == 0) {
+    setError("custom font generation exhausted");
+    return -1;
+  }
   const std::string candidatePath =
-      std::string("/.fonts/") + (name && name[0] ? name : "custom") + ".candidate.epdfont";
+      "/.fonts/.candidate-" + std::to_string(g_customFontAttempt) + ".epdfont";
   Storage.mountBlob(candidatePath, data, size);
   // std::unique_ptr: if load() throws or returns false, the candidate storage is released on every path.
   auto candidate = std::unique_ptr<SdFontFamily>(new SdFontFamily(candidatePath.c_str()));
@@ -575,18 +624,8 @@ KO_EXPORT int ko_load_epdfont(const uint8_t* data, size_t size, const char* name
 }
 
 KO_EXPORT int ko_clear_custom_font() {
-  if (g_renderer && g_renderer->hasFont(CUSTOM_FONT_ID)) {
-    g_renderer->removeFont(CUSTOM_FONT_ID);
-  }
-  // Retire the file too, or the next load's candidate would be the only thing ever removed and the
-  // cleared face would keep a slot in the storage.
-  if (!g_customFontPath.empty()) {
-    Storage.remove(g_customFontPath.c_str());
-    g_customFontPath.clear();
-  }
-  if (g_spec.fontId == CUSTOM_FONT_ID) {
+  if (dropRuntimeCustomFont()) {
     // Back to the reference default face, not to a port-specific one.
-    g_spec.fontId = KOPUB_14_FONT_ID;
     invalidateLayoutState();
   }
   return 0;
@@ -624,6 +663,10 @@ KO_EXPORT int ko_logical_height() {
 // Defined once the remaining output state is declared (it lives further down this file); forward declared
 // so the replacement path can invalidate it without moving declarations around.
 static void beginBookReplacement() {
+  // A registered SdFontFamily owns a path-backed face.  Remove it before the
+  // storage map disappears so renderer state and filesystem state cannot
+  // disagree between replacement and the worker's deliberate re-apply.
+  dropRuntimeCustomFont();
   if (g_driver) g_driver->resetBook();
   Storage.clearAll();
   if (g_xtch) {
@@ -1010,10 +1053,18 @@ KO_EXPORT size_t ko_plane_size(int kind) {
 // stay in agreement by construction.
 static bool textAaEnabled() { return g_spec.textAntiAliasing != 0; }
 
-KO_EXPORT void ko_export_set_mode(int mode) {
-  if (!g_xtch) return;
+KO_EXPORT int ko_export_set_mode(int mode) {
+  if (!g_xtch || (mode != 0 && mode != 1)) {
+    setError("invalid export mode");
+    return -1;
+  }
+  if (g_exportActive || g_asmActive || g_planActive) {
+    setError("cannot change output mode during a transaction");
+    return -1;
+  }
   g_xtch->setMode(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit);
   g_xtch->setTextAa(textAaEnabled());
+  return 0;
 }
 
 // Roll the engine back to "no book". Used by abortBookOpen() when an open fails AFTER the EPUB parsed
@@ -1222,6 +1273,28 @@ static std::unique_ptr<ko::XtchWriter> g_asm;          // the assembler's writer
 static std::vector<ko::ChapterCandidate> g_asmCandidates;
 static std::vector<ko::XtchChapter> g_asmFallback;
 
+static std::string boundedChapterName(const char* value) {
+  if (!value) return {};
+  // The on-disk field is 80 bytes including its terminator.  Retaining more
+  // cannot affect output and only lets an exported C caller force an
+  // unbounded scan/allocation.
+  size_t n = 0;
+  while (n < 79 && value[n] != '\0') ++n;
+  return std::string(value, n);
+}
+
+static int failAssembly(const std::string& why) {
+  g_asmActive = false;
+  g_asmFailed = true;
+  g_asm.reset();
+  g_asmCandidates.clear();
+  g_asmFallback.clear();
+  g_xtchFullReady = 0;
+  g_xtchOut.clear();
+  setError(why);
+  return -1;
+}
+
 // Layout+render+encode one spine into g_enc. Returns the page count, or -1.
 KO_EXPORT int ko_encode_spine(int spine) {
   // Clear the previous encoded spine FIRST: a refused request must not leave the previous spine's bytes
@@ -1323,6 +1396,10 @@ KO_EXPORT int ko_assemble_begin(int mode) {
     setError("assemble already active");
     return -1;
   }
+  if (mode != 0 && mode != 1) {
+    setError("assemble_begin: invalid output mode");
+    return -1;
+  }
   g_asm.reset(new ko::XtchWriter(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit,
                                  g_spec.deviceProfile));
   g_asm->setTextAa(textAaEnabled());
@@ -1331,6 +1408,8 @@ KO_EXPORT int ko_assemble_begin(int mode) {
   g_asmFallback.clear();
   g_asmActive = true;
   g_asmFailed = false;
+  g_xtchFullReady = 0;
+  g_xtchOut.clear();
   g_asmMode = mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit;
   return 0;
 }
@@ -1338,60 +1417,70 @@ KO_EXPORT int ko_assemble_begin(int mode) {
 // Append one spine's page records (flat buffer + per-page offsets/lengths).
 KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCount,
                                     const uint32_t* offsets, const uint32_t* lengths) {
-  if (!g_asm) return -1;
+  if (!g_asm) return failAssembly("assemble_add_spine: no assembly writer");
   if (!g_asmActive || g_asmFailed) {
-    g_asmFailed = true;
-    setError("assemble_add_spine: no healthy assembly");
-    return -1;
+    return failAssembly("assemble_add_spine: no healthy assembly");
   }
-  if (pageCount <= 0) return static_cast<int>(g_asm->pageCount());
+  if (pageCount < 0) return failAssembly("assemble_add_spine: negative page count");
+  if (pageCount == 0) return static_cast<int>(g_asm->pageCount());
   if (data == nullptr || offsets == nullptr || lengths == nullptr) {
-    g_asmFailed = true;
-    setError("assemble_add_spine: null record");
-    return -1;
+    return failAssembly("assemble_add_spine: null record");
   }
   // The format's page count is 16 bits on disk; refuse rather than wrap the header to zero.
   // A legal page count can still describe several GiB of container, so the byte budget is a SEPARATE ceiling.
   if (g_asm->pageCount() + static_cast<size_t>(pageCount) > ko::MAX_XTC_PAGES ||
       g_asm->pageCount() + static_cast<size_t>(pageCount) >
           maxPagesForMode(g_asmMode, g_asm->deviceProfile())) {
-    g_asmFailed = true;
-    setError("assemble_add_spine: container page limit exceeded");
-    return -1;
+    return failAssembly("assemble_add_spine: container page limit exceeded");
   }
   for (int i = 0; i < pageCount; i++) {
     const uint64_t off = offsets[i];
     const uint64_t len = lengths[i];
     if (off + len > size) {                       // a truncated record must never be assembled
-      g_asmFailed = true;
-      setError("assemble_add_spine: truncated page record");
-      return -1;
+      return failAssembly("assemble_add_spine: truncated page record");
     }
     if (!g_asm->addRawPage(data + off, static_cast<size_t>(len))) {
-      g_asmFailed = true;
-      setError("assemble_add_spine: page rejected");
-      return -1;
+      return failAssembly("assemble_add_spine: page rejected");
     }
   }
   return static_cast<int>(g_asm->pageCount());
 }
 
 // One TOC anchor for a spine. spineBase is the spine's first global page.
-KO_EXPORT void ko_assemble_add_toc(int spineBase, const char* title, int localPage) {
+KO_EXPORT int ko_assemble_add_toc(int spineBase, const char* title, int localPage) {
+  if (!g_asmActive || g_asmFailed || !g_asm) {
+    return failAssembly("assemble_add_toc: no healthy assembly");
+  }
+  const int64_t local = localPage < 0 ? 0 : static_cast<int64_t>(localPage);
+  const int64_t page = static_cast<int64_t>(spineBase) + local;
+  if (spineBase < 0 || page < 0 || page >= static_cast<int64_t>(g_asm->pageCount()) ||
+      g_asmCandidates.size() >= ko::MAX_XTC_CHAPTERS) {
+    return failAssembly("assemble_add_toc: page or chapter count out of range");
+  }
   ko::ChapterCandidate c;
-  c.title = title ? title : "";
-  c.page = static_cast<uint32_t>(spineBase + (localPage < 0 ? 0 : localPage));
+  c.title = boundedChapterName(title);
+  c.page = static_cast<uint32_t>(page);
   g_asmCandidates.push_back(c);
+  return 0;
 }
 
 // The per-spine fallback chapter, used only when the book has no usable TOC.
-KO_EXPORT void ko_assemble_add_fallback(int spineBase, const char* name, int pages) {
-  if (pages <= 0) return;
+KO_EXPORT int ko_assemble_add_fallback(int spineBase, const char* name, int pages) {
+  if (!g_asmActive || g_asmFailed || !g_asm) {
+    return failAssembly("assemble_add_fallback: no healthy assembly");
+  }
+  const int64_t end = static_cast<int64_t>(spineBase) + static_cast<int64_t>(pages) - 1;
+  if (spineBase < 0 || pages <= 0 || end < spineBase ||
+      end >= static_cast<int64_t>(g_asm->pageCount()) ||
+      g_asmFallback.size() >= ko::MAX_XTC_CHAPTERS) {
+    return failAssembly("assemble_add_fallback: page or chapter count out of range");
+  }
   ko::XtchChapter ch;
-  ch.name = name ? name : "";
+  ch.name = boundedChapterName(name);
   ch.startPage = static_cast<uint16_t>(spineBase);
-  ch.endPage = static_cast<uint16_t>(spineBase + pages - 1);
+  ch.endPage = static_cast<uint16_t>(end);
   g_asmFallback.push_back(ch);
+  return 0;
 }
 
 KO_EXPORT int ko_assemble_finish() {
@@ -1400,10 +1489,11 @@ KO_EXPORT int ko_assemble_finish() {
     setError("cannot finalize failed assembly");
     return -1;
   }
-  if (!g_asm || !requireBook("assemble_finish")) return -1;
+  if (!g_asm || !requireBook("assemble_finish")) return failAssembly("assemble_finish: book or writer unavailable");
   const uint32_t total = static_cast<uint32_t>(g_asm->pageCount());
   g_chapters = buildChapters(g_asmCandidates, g_asmFallback, total);
   g_xtchOut = g_asm->finish(g_chapters);
+  if (g_xtchOut.empty()) return failAssembly("assemble_finish: container build refused");
   g_xtchFullReady = 1;
   g_totalPages = static_cast<int>(total);   // the container is now the assembler's
   g_asmActive = false;
@@ -1432,10 +1522,25 @@ static std::vector<uint8_t> g_planPrefix;
 static int g_planMode = 1;
 static ko::DeviceProfile g_planDeviceProfile = ko::DeviceProfile::X4;
 
+static int failPlan(const std::string& why) {
+  g_planActive = false;
+  g_planFailed = true;
+  g_planSizes.clear();
+  g_planCandidates.clear();
+  g_planFallback.clear();
+  g_planPrefix.clear();
+  setError(why);
+  return -1;
+}
+
 KO_EXPORT int ko_plan_begin(int mode) {
   if (!requireBook("plan_begin")) return -1;
   if (g_planActive) {
     setError("plan already active");
+    return -1;
+  }
+  if (mode != 0 && mode != 1) {
+    setError("plan_begin: invalid output mode");
     return -1;
   }
   g_planActive = true;
@@ -1452,52 +1557,76 @@ KO_EXPORT int ko_plan_begin(int mode) {
 // One spine's page SIZES, in page order. Add spines in spine order.
 KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
   if (!g_planActive || g_planFailed) {
-    g_planFailed = true;
-    setError("plan_add_spine: no healthy plan");
-    return -1;
+    return failPlan("plan_add_spine: no healthy plan");
   }
   if (count < 0 || (count > 0 && lengths == nullptr)) {
-    g_planFailed = true;
-    setError("plan_add_spine: null lengths");
-    return -1;
+    return failPlan("plan_add_spine: null lengths");
+  }
+  const size_t addCount = static_cast<size_t>(count);
+  const auto planMode = g_planMode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit;
+  const uint64_t expected = recordBytesForMode(planMode, g_planDeviceProfile);
+  // The planner knows the exact record size.  Bound the array walk using the
+  // fixed header+index cost here; actual chapter bytes are added at finish.
+  const size_t bytePageLimit = static_cast<size_t>(
+      (MAX_WASM_CONTAINER_BYTES - 56u - 256u) / (expected + 16u));
+  if (g_planSizes.size() > ko::MAX_XTC_PAGES ||
+      addCount > ko::MAX_XTC_PAGES - g_planSizes.size() ||
+      addCount > bytePageLimit - std::min(bytePageLimit, g_planSizes.size())) {
+    // Refuse an absurd count before indexing `lengths`; a raw C caller may
+    // provide only one readable element alongside INT_MAX.
+    return failPlan("plan_add_spine: container page limit exceeded");
   }
   // The planner is where a caller can describe a container that would never fit: it receives record LENGTHS,
   // so the declared total is known before a single byte is written.
   {
     uint64_t recordBytes = 0;
     for (uint32_t v : g_planSizes) recordBytes += v;
-    for (int i = 0; i < count; i++) recordBytes += lengths[i];
+    for (int i = 0; i < count; i++) {
+      if (lengths[i] != expected) {
+        return failPlan("plan_add_spine: invalid page record length");
+      }
+      recordBytes += lengths[i];
+    }
     const uint64_t projectedPages = g_planSizes.size() + static_cast<uint64_t>(count);
     const uint64_t projected = 56u + 256u + projectedPages * 16u + recordBytes;
     if (projected > MAX_WASM_CONTAINER_BYTES) {
-      g_planFailed = true;
-      setError("plan_add_spine: container byte budget exceeded (" + std::to_string(projected) + " bytes)");
-      return -1;
+      return failPlan("plan_add_spine: container byte budget exceeded (" +
+                      std::to_string(projected) + " bytes)");
     }
-  }
-  if (g_planSizes.size() + static_cast<size_t>(count) > ko::MAX_XTC_PAGES) {
-    g_planFailed = true;
-    setError("plan_add_spine: container page limit exceeded");
-    return -1;
   }
   for (int i = 0; i < count; i++) g_planSizes.push_back(lengths[i]);
   return static_cast<int>(g_planSizes.size());
 }
 
-KO_EXPORT void ko_plan_add_toc(int spineBase, const char* title, int localPage) {
+KO_EXPORT int ko_plan_add_toc(int spineBase, const char* title, int localPage) {
+  if (!g_planActive || g_planFailed) return failPlan("plan_add_toc: no healthy plan");
+  const int64_t local = localPage < 0 ? 0 : static_cast<int64_t>(localPage);
+  const int64_t page = static_cast<int64_t>(spineBase) + local;
+  if (spineBase < 0 || page < 0 || page >= static_cast<int64_t>(g_planSizes.size()) ||
+      g_planCandidates.size() >= ko::MAX_XTC_CHAPTERS) {
+    return failPlan("plan_add_toc: page or chapter count out of range");
+  }
   ko::ChapterCandidate c;
-  c.title = title ? title : "";
-  c.page = static_cast<uint32_t>(spineBase + (localPage < 0 ? 0 : localPage));
+  c.title = boundedChapterName(title);
+  c.page = static_cast<uint32_t>(page);
   g_planCandidates.push_back(c);
+  return 0;
 }
 
-KO_EXPORT void ko_plan_add_fallback(int spineBase, const char* name, int pages) {
-  if (pages <= 0) return;
+KO_EXPORT int ko_plan_add_fallback(int spineBase, const char* name, int pages) {
+  if (!g_planActive || g_planFailed) return failPlan("plan_add_fallback: no healthy plan");
+  const int64_t end = static_cast<int64_t>(spineBase) + static_cast<int64_t>(pages) - 1;
+  if (spineBase < 0 || pages <= 0 || end < spineBase ||
+      end >= static_cast<int64_t>(g_planSizes.size()) ||
+      g_planFallback.size() >= ko::MAX_XTC_CHAPTERS) {
+    return failPlan("plan_add_fallback: page or chapter count out of range");
+  }
   ko::XtchChapter ch;
-  ch.name = name ? name : "";
+  ch.name = boundedChapterName(name);
   ch.startPage = static_cast<uint16_t>(spineBase);
-  ch.endPage = static_cast<uint16_t>(spineBase + pages - 1);
+  ch.endPage = static_cast<uint16_t>(end);
   g_planFallback.push_back(ch);
+  return 0;
 }
 
 KO_EXPORT int ko_plan_finish() {
@@ -1506,7 +1635,7 @@ KO_EXPORT int ko_plan_finish() {
     g_planPrefix.clear();
     return -1;
   }
-  if (!g_xtch || !requireBook("plan_finish")) return -1;
+  if (!g_xtch || !requireBook("plan_finish")) return failPlan("plan_finish: book or writer unavailable");
   ko::XtchWriter w(g_planMode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit,
                    g_planDeviceProfile);
   w.adoptMetadataFrom(*g_xtch);          // the header carries the book's title/author
@@ -1517,15 +1646,11 @@ KO_EXPORT int ko_plan_finish() {
   const uint64_t projected = 56u + 256u + static_cast<uint64_t>(g_chapters.size()) * 96u +
                              static_cast<uint64_t>(g_planSizes.size()) * 16u + recordBytes;
   if (g_chapters.size() > ko::MAX_XTC_CHAPTERS || projected > MAX_WASM_CONTAINER_BYTES) {
-    g_planFailed = true;
-    setError("plan_finish: container byte budget exceeded");
-    return -1;
+    return failPlan("plan_finish: container byte budget exceeded");
   }
   g_planPrefix = w.buildPrefix(g_chapters, g_planSizes);
   if (g_planPrefix.empty()) {                 // buildPrefix refuses an over-limit page count
-    g_planFailed = true;
-    setError("plan_finish: prefix build refused");
-    return -1;
+    return failPlan("plan_finish: prefix build refused");
   }
   g_planActive = false;
   return static_cast<int>(total);
@@ -1568,14 +1693,45 @@ KO_EXPORT size_t ko_xtch_size() { return g_xtchOut.size(); }
 // then per block: u32LE length, bit31 set => raw stored, else LZ4-compressed
 // block bytes; terminator u32LE 0. Requires device firmware >= 5.1.6.
 #include <lz4.h>
-KO_EXPORT void ko_xtcz_wrap() {
-  if (!g_xtchFullReady || g_xtchOut.empty()) return;
+KO_EXPORT int ko_xtcz_wrap() {
+  if (!g_xtchFullReady || g_xtchOut.empty()) {
+    setError("xtcz_wrap: no complete container");
+    return -1;
+  }
+  if (g_xtchOut.size() >= 4 && g_xtchOut[0] == 'X' && g_xtchOut[1] == 'T' &&
+      g_xtchOut[2] == 'Z' && g_xtchOut[3] == '4') {
+    setError("xtcz_wrap: container is already compressed");
+    return -1;
+  }
   const size_t rawLen = g_xtchOut.size();
+  // Wrapping necessarily retains the raw container while building the XTZ4
+  // destination.  The raw export ceiling is 1 GiB, but two such vectors cannot
+  // coexist in a 2 GiB memory32 module.  Half that ceiling is the largest
+  // wrappable source, and the aggregate check below leaves another 512 MiB for
+  // allocator slack, renderer state and transient worker calls.
+  static constexpr uint64_t MAX_XTCZ_RAW_BYTES = MAX_WASM_CONTAINER_BYTES / 2u;
+  static constexpr uint64_t MAX_XTCZ_ACCOUNTED_PEAK = 1536ull * 1024ull * 1024ull;
+  if (rawLen > MAX_XTCZ_RAW_BYTES || rawLen > std::numeric_limits<uint32_t>::max()) {
+    setError("xtcz_wrap: raw container exceeds the safe wrapping limit");
+    return -1;
+  }
   constexpr uint32_t kBlock = 4096;
-  const uint32_t numBlocks = static_cast<uint32_t>((rawLen + kBlock - 1) / kBlock);
+  const size_t numBlocks = (rawLen + kBlock - 1) / kBlock;
 
   // worst case: header (12B) + per block 4B len + LZ4_compressBound(4096) (~4200)
-  const size_t cap = 12 + numBlocks * (4 + LZ4_compressBound(kBlock)) + 4;
+  const size_t perBlock = 4u + static_cast<size_t>(LZ4_compressBound(kBlock));
+  if (numBlocks > (SIZE_MAX - 16u) / perBlock) {
+    setError("xtcz_wrap: compressed-size calculation overflow");
+    return -1;
+  }
+  const size_t cap = 16u + numBlocks * perBlock;
+  const uint64_t storageBytes = Storage.totalBytes();
+  const uint64_t rawAndWorst = static_cast<uint64_t>(rawLen) + cap;
+  if (rawAndWorst > MAX_XTCZ_ACCOUNTED_PEAK ||
+      storageBytes > MAX_XTCZ_ACCOUNTED_PEAK - rawAndWorst) {
+    setError("xtcz_wrap: insufficient safe wasm memory headroom");
+    return -1;
+  }
   std::vector<uint8_t> out;
   out.reserve(cap);
   const auto putU32 = [](std::vector<uint8_t>& v, uint32_t x) {
@@ -1611,6 +1767,7 @@ KO_EXPORT void ko_xtcz_wrap() {
   }
   putU32(out, 0);  // terminator
   g_xtchOut.swap(out);
+  return 0;
 }
 
 // Release the module-lifetime container buffer (frees wasm heap; the JS side
@@ -1695,7 +1852,6 @@ static void clearBookOutputs() {
   g_planFallback.clear();
   g_planPrefix.clear();
   g_rgbaOut.clear();
-  g_customFontPath.clear();   // the font files live in the storage that was just cleared
 }
 
 // Placed after the LAST of the globals it clears, so every identifier is declared above it.

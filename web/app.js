@@ -812,9 +812,18 @@
   let fontIdByFile = {};    // file fingerprint → registered fontId (server fallback only)
   let fontConvIsLocal = true;  // false only if the in-browser converter failed and the
                                // Python endpoint took over (see the ladder guard above)
-  const fontFp = (f) => (f ? f.name + '|' + f.size + '|' + (f.lastModified || 0) : '');
+  const MAX_FONT_SOURCE_BYTES = 64 * 1024 * 1024;
+  const MAX_EPDFONT_BYTES = 64 * 1024 * 1024;
+  let fontFileGeneration = 0;
+  // A new selection is a new identity even when the browser reports the same
+  // name/size/mtime tuple for two distinct files.
+  const fontFp = (f) => (f ? fontFileGeneration + ':' + f.name + '|' + f.size : '');
 
   async function convertFontLocal(fontFile) {
+    if (!fontFile || !Number.isSafeInteger(fontFile.size) || fontFile.size <= 0 ||
+        fontFile.size > MAX_FONT_SOURCE_BYTES) {
+      throw new Error('font file exceeds the supported 64 MiB limit');
+    }
     const raw = await fontFile.arrayBuffer();
     const iv = els.fontIntervals.value.trim();
     const sp = parseInt(els.fontSpacePx.value, 10);
@@ -847,6 +856,10 @@
   }
 
   async function convertFontServer(fontFile) {
+    if (!fontFile || !Number.isSafeInteger(fontFile.size) || fontFile.size <= 0 ||
+        fontFile.size > MAX_FONT_SOURCE_BYTES) {
+      throw new Error('font file exceeds the supported 64 MiB limit');
+    }
     fontConvIsLocal = false;   // the ladder may warm the server cache again
     const fp = fontFp(fontFile);
     const fd = new FormData();
@@ -894,6 +907,10 @@
   }
 
   async function applyCustomFont(meta) {
+    if (!(meta && meta._bytes instanceof ArrayBuffer) || meta._bytes.byteLength === 0 ||
+        meta._bytes.byteLength > MAX_EPDFONT_BYTES) {
+      throw new Error('converted epdfont exceeds the supported 64 MiB limit');
+    }
     // One canonical copy stays here; each engine gets a disposable copy, because transferring detaches
     // the buffer that was sent. The previous version handed meta._bytes straight to the preview worker
     // and kept nothing, so the export engine could be told font:"custom" while owning no such font.
@@ -1290,7 +1307,7 @@
   let warmSpecKey = null;        // outputKey the warm bytes match (null = none)
   const fontFileFp = () => {
     const f = els.fontFile.files && els.fontFile.files[0];
-    return f ? f.name + '|' + f.size + '|' + (f.lastModified || 0) : '';
+    return fontFp(f);
   };
   const fontKnobSig = () => JSON.stringify({
     file: fontFileFp(), name: els.fontName.value.trim(),
@@ -1728,6 +1745,7 @@
     }
   });
   els.fontFile.addEventListener('change', () => {
+    fontFileGeneration++;
     const f = els.fontFile.files && els.fontFile.files[0];
     if (f) {
       const lab = document.querySelector('label[for=fontFile]');

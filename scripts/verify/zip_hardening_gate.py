@@ -264,12 +264,9 @@ def duplicate_name(d):
             return
     raise SystemExit('no two entries share a name length to make a duplicate from')
 
-# The duplicate-name rejection lives in the two ENUMERATING walkers (loadAllFileStatSlims and
-# enumerateFileEntries). The host CLI reaches neither for this fixture: the lazy per-name lookup stops at the
-# first match by construction, loadAllFileStatSlims needs a large-spine book, and discoverCssFilesFromZip()
-# only runs on the cache-hit CSS path. Reported as SKIP rather than PASS so the gate never claims a
-# rejection it did not observe.
-results.append((None, 'a duplicate central-directory name is rejected (reason: no walker reached)', '', ''))
+# Name uniqueness is now validated once for the complete directory before any
+# lazy lookup can trust an entry, so the ordinary host load must observe this.
+mutant('a duplicate central-directory name is rejected globally', duplicate_name, 'duplicate central-directory name')
 
 # ---- 12. central/local flag contradiction -------------------------------------------------------
 def flag_contradiction(d):
@@ -330,6 +327,33 @@ def run_stored_crc_mutant():
             problems.append('stored crc')
 
 run_stored_crc_mutant()
+
+# CRC 0 is a legitimate value, not an "unset" sentinel. Corrupt a complete
+# STORED member and replace its central CRC with zero: the reader must compute
+# the real CRC and reject instead of skipping integrity verification.
+def run_zero_crc_mutant():
+    data = bytearray(STORED_BOOK)
+    for pos, name, lho, _usz in cd_entries(data):
+        if name.lower().endswith(b'.xhtml'):
+            nlen = struct.unpack_from('<H', data, lho + 26)[0]
+            elen = struct.unpack_from('<H', data, lho + 28)[0]
+            data[lho + 30 + nlen + elen + 16] ^= 0xFF
+            struct.pack_into('<I', data, pos + 16, 0)
+            break
+    else:
+        raise SystemExit('no stored XHTML entry found for zero-CRC control')
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, 'z.epub'); out = os.path.join(td, 'z.xtch')
+        open(src, 'wb').write(bytes(data))
+        rc, tail = load(src, out)
+        produced = os.path.exists(out) and os.path.getsize(out) > 0
+        ok = rc != 0 and not produced and 'CRC mismatch' in tail
+        results.append((ok, 'a STORED payload with central CRC zero is still verified',
+                        f'exit={rc} produced={produced}', tail))
+        if not ok:
+            problems.append('zero crc')
+
+run_zero_crc_mutant()
 
 # ---- 15. variable-length fields crossing the declared directory end ------------------------------
 def fields_cross_cd_end(d):

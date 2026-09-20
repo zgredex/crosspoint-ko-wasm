@@ -52,6 +52,9 @@ _CONVERT_CACHE_MAX = 24   # slider scrubbing visits many (size,weight) combos
 # params — the 3–10 MB file never crosses the wire again. LRU-bounded.
 _RAW_FONT_CACHE = {}
 _RAW_FONT_CACHE_MAX = 6
+MAX_FONT_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_EPDFONT_BYTES = 64 * 1024 * 1024
+MAX_FONT_MULTIPART_BYTES = MAX_FONT_SOURCE_BYTES + 1024 * 1024
 
 
 def _read_body(handler):
@@ -98,10 +101,18 @@ def parse_convert_form(handler):
     ctype = handler.headers.get("Content-Type", "")
     if not ctype.startswith("multipart/form-data"):
         return None, "expected multipart/form-data"
+    try:
+        content_length = int(handler.headers.get("Content-Length") or 0)
+    except ValueError:
+        return None, "invalid Content-Length"
+    if content_length <= 0 or content_length > MAX_FONT_MULTIPART_BYTES:
+        return None, "font request exceeds the supported size limit"
     body = _read_body(handler)
     fields = _parse_multipart(body, ctype)
     raw = fields.get("font")
     if isinstance(raw, bytes) and raw:
+        if len(raw) > MAX_FONT_SOURCE_BYTES:
+            return None, "font file exceeds the supported 64 MiB limit"
         h = hashlib.sha256(raw).hexdigest()
         _RAW_FONT_CACHE[h] = raw
         while len(_RAW_FONT_CACHE) > _RAW_FONT_CACHE_MAX:
@@ -398,6 +409,9 @@ class Handler(SimpleHTTPRequestHandler):
             patch_space_advance(data, space_px)
 
         data = bytes(data)
+        if not data or len(data) > MAX_EPDFONT_BYTES:
+            self.send_json(400, {"error": "converted epdfont exceeds the supported 64 MiB limit"})
+            return
 
         import base64
         import struct as _s

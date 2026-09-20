@@ -7,6 +7,7 @@
 #include <Arduino.h>  // Print, String
 #include <climits>   // INT_MAX for the HalFile int contract
 
+#include <algorithm>
 #include <chrono>   // range-window read timing
 #include <cstdint>
 #include <map>
@@ -41,6 +42,20 @@ struct ExternalStats {
 };
 ExternalStats& externalStats();
 
+// Files generated while a book is open (inflated XHTML/images and parser
+// caches) share one allocated-capacity budget.  Charging vector capacity—not
+// just logical length—means geometric growth cannot jump over the ceiling.
+// 768 MiB leaves 1.25 GiB of the
+// module's 2 GiB memory32 ceiling for the mounted book, renderer and export
+// buffers while still allowing the documented 256 MiB spine and 128 MiB image
+// member ceilings to coexist.  Source blobs are not charged here: they are
+// separately bounded at the public EPUB/font boundaries.
+struct StorageBudget {
+  static constexpr size_t kDefaultLimit = 768u * 1024u * 1024u;
+  size_t used = 0;
+  size_t limit = kDefaultLimit;
+};
+
 // ---- In-memory file handle ------------------------------------------------
 // One in-memory file. THREE shapes, because they have different costs:
 //   * writable  — a std::vector, used by everything the engine GENERATES (section caches, extracted
@@ -59,6 +74,47 @@ struct Blob {
   size_t size = 0;
   std::shared_ptr<void> owner;                     // frees `data` when the last reference goes away
   std::shared_ptr<std::vector<uint8_t>> writable;  // non-null iff this file may be written/extended
+  std::shared_ptr<StorageBudget> budget;            // non-null for derived/cache files
+  size_t budgetBytes = 0;                           // allocated capacity charged once per Blob
+  bool zipDirectoryValidated = false;               // invalidated by every writable mutation
+
+  ~Blob() {
+    if (budget) {
+      budget->used = budgetBytes <= budget->used ? budget->used - budgetBytes : 0;
+    }
+  }
+
+  bool reserveWritableSize(size_t wanted) {
+    if (!budget || !writable || wanted <= writable->capacity()) return true;
+    if (budgetBytes > budget->used || budget->used > budget->limit) return false;
+    const size_t otherBytes = budget->used - budgetBytes;
+    if (otherBytes > budget->limit || wanted > budget->limit - otherBytes) return false;
+
+    const size_t available = budget->limit - otherBytes;
+    size_t target = wanted;
+    const size_t current = writable->capacity();
+    if (current != 0) {
+      const size_t doubled = current > SIZE_MAX - current ? SIZE_MAX : current * 2;
+      target = std::max(target, doubled);
+    }
+    target = std::min(target, available);
+    writable->reserve(target);  // resize below can no longer trigger an unaccounted growth allocation
+    const size_t actual = writable->capacity();
+    if (actual > available) {
+      // The standard permits reserve() to allocate more than requested.  A
+      // conforming implementation that does so fails closed, including its
+      // partial cache file, rather than retaining memory above the quota.
+      std::vector<uint8_t>().swap(*writable);
+      data = nullptr;
+      size = 0;
+      budget->used = otherBytes;
+      budgetBytes = 0;
+      return false;
+    }
+    budget->used = otherBytes + actual;
+    budgetBytes = actual;
+    return true;
+  }
 
   // EXTERNAL backing. data stays null and every read is served by readFn through the window below.
   bool external = false;
@@ -225,9 +281,14 @@ class HalFile : public Print {
     // owned view would have to reallocate somebody else's buffer.
     if (!blob_ || !blob_->writable) return 0;
     if (count > SIZE_MAX - pos_) return 0;                 // a wrap here would resize to a small buffer
-    if (pos_ + count > blob_->writable->size()) blob_->writable->resize(pos_ + count);
+    const size_t wanted = pos_ + count;
+    if (wanted > blob_->writable->size()) {
+      if (!blob_->reserveWritableSize(wanted)) return 0;
+      blob_->writable->resize(wanted);
+    }
     blob_->refresh();
     memcpy(blob_->writable->data() + pos_, buf, count);
+    blob_->zipDirectoryValidated = false;
     pos_ += count;
     return count;
   }
@@ -238,6 +299,10 @@ class HalFile : public Print {
   explicit operator bool() const { return isOpen(); }
 
   const std::string& path() const { return path_; }
+  bool isZipDirectoryValidated() const { return blob_ && blob_->zipDirectoryValidated; }
+  void markZipDirectoryValidated() {
+    if (blob_) blob_->zipDirectoryValidated = true;
+  }
 
  private:
   explicit HalFile(std::string path, std::shared_ptr<Blob> blob)
@@ -251,7 +316,7 @@ class HalFile : public Print {
 // ---- In-memory storage -----------------------------------------------------
 class HalStorage {
  public:
-  HalStorage() = default;
+  HalStorage() : derivedBudget_(std::make_shared<StorageBudget>()) {}
   bool begin() { return true; }
   bool ready() const { return true; }
 
@@ -325,6 +390,14 @@ class HalStorage {
   // caches from a previous book don't accumulate in the wasm heap).
   void clearAll() { files_.clear(); }
 
+  size_t derivedBytes() const { return derivedBudget_->used; }
+  size_t derivedByteLimit() const { return derivedBudget_->limit; }
+  bool setDerivedByteLimit(size_t limit) {
+    if (limit < derivedBudget_->used) return false;
+    derivedBudget_->limit = limit;
+    return true;
+  }
+
   // Live storage accounting. heapBytes (wasm linear memory) only reports the high-water mark; this is
   // what HalStorage is actually holding right now — section caches and the mounted EPUB are all
   // RAM-backed here. Shared blobs (mountSharedBlob aliases) are counted once, and capacity() is used
@@ -343,19 +416,22 @@ class HalStorage {
       // capacity() for the writable files (a released vector's slack still occupies the heap) and the
       // view size for adopted ones, which own exactly what they claim.
       const_cast<Blob&>(*blob).refresh();
+      size_t add = 0;
       if (blob->external) {
         // Only the window is actually resident — the book itself is not in this heap. Counting the
         // whole file here was the shape of claim this accounting exists to refuse.
-        total += blob->windowBytes.capacity();
+        add = blob->windowBytes.capacity();
       } else {
-        total += blob->writable ? blob->writable->capacity() : blob->size;
+        add = blob->writable ? blob->writable->capacity() : blob->size;
       }
+      total = add > SIZE_MAX - total ? SIZE_MAX : total + add;
     }
     return total;
   }
 
  private:
   std::map<std::string, std::shared_ptr<Blob>> files_;
+  std::shared_ptr<StorageBudget> derivedBudget_;
 };
 
 #define Storage HalStorage::getInstance()

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <new>
 
 // ============================================================================
@@ -199,6 +200,11 @@ SdFontData& SdFontData::operator=(SdFontData&& other) noexcept {
 // Glyphs are loaded on-demand from SD, so high count doesn't affect memory
 static constexpr uint32_t MAX_INTERVAL_COUNT = 10000;
 static constexpr uint32_t MAX_GLYPH_COUNT = 150000;
+// Runtime custom fonts are copied into HalStorage and, on the host/WASM port,
+// normally preloaded once more for zero-I/O glyph access.  Keep the parser's
+// own ceiling aligned with the public API so a path-based caller cannot bypass
+// the boundary check and force two unbounded allocations.
+static constexpr size_t MAX_EPDFONT_FILE_BYTES = 64u * 1024u * 1024u;
 
 bool SdFontData::load() {
   if (loaded) {
@@ -211,51 +217,119 @@ bool SdFontData::load() {
     return false;
   }
 
-  // Read and validate header
-  if (fontFile.read(&header, sizeof(EpdFontHeader)) != sizeof(EpdFontHeader)) {
-    LOG_ERR("SDF", "Failed to read header from: %s", filePath.c_str());
+  // Validate into locals and commit to the object only after the complete v1
+  // structure has been proved.  A failed load must never leave `loaded` true or
+  // partially trusted offsets in `header`.
+  EpdFontHeader candidateHeader{};
+  const auto fail = [&](const char* why) {
+    LOG_ERR("SDF", "%s: %s", why, filePath.c_str());
     fontFile.close();
+    residentData_.clear();
+    residentGlyphs_.clear();
+    resident_ = false;
+    residentGlyphsReady_ = false;
+    loaded = false;
+    memset(&header, 0, sizeof(header));
     return false;
+  };
+
+  if (fontFile.read(&candidateHeader, sizeof(candidateHeader)) != sizeof(candidateHeader)) {
+    LOG_ERR("SDF", "Failed to read header from: %s", filePath.c_str());
+    return fail("short epdfont header");
   }
 
   // Validate magic number
-  if (header.magic != EPDFONT_MAGIC) {
-    LOG_ERR("SDF", "Invalid magic: 0x%08X (expected 0x%08X)", header.magic, EPDFONT_MAGIC);
-    fontFile.close();
-    return false;
+  if (candidateHeader.magic != EPDFONT_MAGIC) {
+    LOG_ERR("SDF", "Invalid magic: 0x%08X (expected 0x%08X)", candidateHeader.magic, EPDFONT_MAGIC);
+    return fail("invalid epdfont magic");
   }
 
   // Validate version
-  if (header.version != EPDFONT_VERSION) {
-    LOG_ERR("SDF", "Bad version: %u (expected %u)", header.version, EPDFONT_VERSION);
-    fontFile.close();
-    return false;
+  if (candidateHeader.version != EPDFONT_VERSION) {
+    LOG_ERR("SDF", "Bad version: %u (expected %u)", candidateHeader.version, EPDFONT_VERSION);
+    return fail("unsupported epdfont version");
   }
 
-  // Validate header values to prevent absurd on-demand searches
-  if (header.intervalCount > MAX_INTERVAL_COUNT) {
-    LOG_ERR("SDF", "Too many intervals: %u (max %u)", header.intervalCount, MAX_INTERVAL_COUNT);
-    fontFile.close();
-    return false;
+  const size_t fileBytes = fontFile.size();
+  if (fileBytes < sizeof(EpdFontHeader) || fileBytes > MAX_EPDFONT_FILE_BYTES) {
+    return fail("epdfont file size is outside the supported range");
+  }
+  if (candidateHeader.is2Bit > 1 || candidateHeader.advanceY == 0) {
+    return fail("invalid epdfont metrics");
+  }
+  if (candidateHeader.intervalCount == 0 || candidateHeader.intervalCount > MAX_INTERVAL_COUNT) {
+    LOG_ERR("SDF", "Invalid interval count: %u (max %u)", candidateHeader.intervalCount, MAX_INTERVAL_COUNT);
+    return fail("invalid epdfont interval count");
+  }
+  if (candidateHeader.glyphCount == 0 || candidateHeader.glyphCount > MAX_GLYPH_COUNT) {
+    LOG_ERR("SDF", "Invalid glyph count: %u (max %u)", candidateHeader.glyphCount, MAX_GLYPH_COUNT);
+    return fail("invalid epdfont glyph count");
   }
 
-  if (header.glyphCount > MAX_GLYPH_COUNT) {
-    LOG_ERR("SDF", "Too many glyphs: %u (max %u)", header.glyphCount, MAX_GLYPH_COUNT);
-    fontFile.close();
-    return false;
+  // Version 1 has one canonical packed layout.  Compute every boundary in 64
+  // bits before comparing it to the 32-bit fields; otherwise a malicious count
+  // can wrap an offset back into the header.
+  const uint64_t expectedIntervals = sizeof(EpdFontHeader);
+  const uint64_t expectedGlyphs = expectedIntervals +
+                                  static_cast<uint64_t>(candidateHeader.intervalCount) * sizeof(EpdFontInterval);
+  const uint64_t expectedBitmap = expectedGlyphs +
+                                  static_cast<uint64_t>(candidateHeader.glyphCount) * sizeof(EpdFontGlyph);
+  if (expectedBitmap > fileBytes ||
+      candidateHeader.intervalsOffset != expectedIntervals ||
+      candidateHeader.glyphsOffset != expectedGlyphs ||
+      candidateHeader.bitmapOffset != expectedBitmap) {
+    return fail("non-canonical or out-of-range epdfont offsets");
   }
 
-  // The interval table is searched on-demand directly on the SD file (see
-  // findGlyphIndex); it is never copied into RAM, so no large contiguous
-  // allocation is made here. Just sanity-check its location.
-  if (header.intervalsOffset < sizeof(EpdFontHeader)) {
-    LOG_ERR("SDF", "Bad intervalsOffset: %u", header.intervalsOffset);
-    fontFile.close();
-    return false;
+  // The binary search requires sorted, disjoint intervals.  Requiring each
+  // interval's glyph offset to equal the cumulative span proves both that no
+  // interval points past the glyph table and that every glyph is covered once.
+  uint64_t coveredGlyphs = 0;
+  uint32_t previousLast = 0;
+  for (uint32_t i = 0; i < candidateHeader.intervalCount; ++i) {
+    const uint64_t pos = expectedIntervals + static_cast<uint64_t>(i) * sizeof(EpdFontInterval);
+    EpdFontInterval interval{};
+    if (pos > fileBytes - sizeof(interval) || !fontFile.seekSet(static_cast<size_t>(pos)) ||
+        fontFile.read(&interval, sizeof(interval)) != static_cast<int>(sizeof(interval))) {
+      return fail("truncated epdfont interval table");
+    }
+    if (interval.first > interval.last || interval.last > 0x10ffffu ||
+        (i != 0 && interval.first <= previousLast) || interval.offset != coveredGlyphs) {
+      return fail("invalid epdfont interval ordering or glyph offset");
+    }
+    const uint64_t span = static_cast<uint64_t>(interval.last) - interval.first + 1u;
+    if (coveredGlyphs > candidateHeader.glyphCount ||
+        span > static_cast<uint64_t>(candidateHeader.glyphCount) - coveredGlyphs) {
+      return fail("epdfont interval exceeds the glyph table");
+    }
+    coveredGlyphs += span;
+    previousLast = interval.last;
+  }
+  if (coveredGlyphs != candidateHeader.glyphCount) {
+    return fail("epdfont intervals do not cover the glyph table");
   }
 
-  // Keep the file handle open: findGlyphIndex()/getGlyph()/getGlyphBitmap() read
-  // from it on demand (ensureFileOpen() reopens it if it is ever closed).
+  // Runtime EpdGlyph::dataLength is uint16_t.  Reject, never truncate, a v1
+  // uint32_t length that cannot be represented.  Every bitmap span is checked
+  // relative to bitmapOffset with widened arithmetic before later pointer use.
+  const uint64_t bitmapBytes = fileBytes - expectedBitmap;
+  for (uint32_t i = 0; i < candidateHeader.glyphCount; ++i) {
+    const uint64_t pos = expectedGlyphs + static_cast<uint64_t>(i) * sizeof(EpdFontGlyph);
+    EpdFontGlyph glyph{};
+    if (pos > fileBytes - sizeof(glyph) || !fontFile.seekSet(static_cast<size_t>(pos)) ||
+        fontFile.read(&glyph, sizeof(glyph)) != static_cast<int>(sizeof(glyph))) {
+      return fail("truncated epdfont glyph table");
+    }
+    if (glyph.dataLength > std::numeric_limits<uint16_t>::max() ||
+        static_cast<uint64_t>(glyph.dataOffset) > bitmapBytes ||
+        static_cast<uint64_t>(glyph.dataLength) > bitmapBytes - glyph.dataOffset) {
+      return fail("epdfont glyph bitmap lies outside the file");
+    }
+  }
+
+  // COMMIT.  The on-demand path below now consumes only offsets and records
+  // that were fully validated above.
+  header = candidateHeader;
   loaded = true;
   lastIntervalValid = false;
 
@@ -263,7 +337,6 @@ bool SdFontData::load() {
   // Slurp the entire .epdfont into RAM so every subsequent glyph/interval/
   // bitmap lookup is pointer arithmetic in memory. The device-era on-demand
   // paths remain below as fallback (used only if this read fails).
-  const size_t fileBytes = fontFile.size();
   if (fileBytes >= sizeof(EpdFontHeader)) {
     residentData_.resize(fileBytes);
     if (fontFile.seekSet(0) &&
@@ -315,7 +388,7 @@ bool SdFontData::ensureFileOpen() const {
 }
 
 bool SdFontData::loadGlyphFromSD(int glyphIndex, EpdGlyph* outGlyph) const {
-  if (!loaded || glyphIndex < 0 || glyphIndex >= static_cast<int>(header.glyphCount)) {
+  if (!loaded || outGlyph == nullptr || glyphIndex < 0 || glyphIndex >= static_cast<int>(header.glyphCount)) {
     return false;
   }
 
@@ -325,9 +398,11 @@ bool SdFontData::loadGlyphFromSD(int glyphIndex, EpdGlyph* outGlyph) const {
   }
 
   // Calculate position in file
-  uint32_t glyphFileOffset = header.glyphsOffset + (glyphIndex * sizeof(EpdFontGlyph));
+  const uint64_t glyphFileOffset = static_cast<uint64_t>(header.glyphsOffset) +
+                                   static_cast<uint64_t>(glyphIndex) * sizeof(EpdFontGlyph);
+  if (glyphFileOffset > fontFile.size() || sizeof(EpdFontGlyph) > fontFile.size() - glyphFileOffset) return false;
 
-  if (!fontFile.seekSet(glyphFileOffset)) {
+  if (!fontFile.seekSet(static_cast<size_t>(glyphFileOffset))) {
     return false;
   }
 
@@ -377,12 +452,17 @@ int SdFontData::findGlyphIndex(uint32_t codepoint) const {
   auto readInterval = [&](uint32_t index, EpdFontInterval& out) -> bool {
     const size_t off = static_cast<size_t>(index) * sizeof(EpdFontInterval);
     if (resident_) {
-      if (off + sizeof(out) > residentData_.size()) return false;
+      const size_t tableStart = static_cast<size_t>(header.intervalsOffset);
+      if (tableStart > residentData_.size() || off > residentData_.size() - tableStart ||
+          sizeof(out) > residentData_.size() - tableStart - off) return false;
       memcpy(&out, table + off, sizeof(out));
       return true;
     }
-    const uint32_t intervalOffset = header.intervalsOffset + static_cast<uint32_t>(index) * sizeof(EpdFontInterval);
-    return fontFile.seekSet(intervalOffset) && fontFile.read(&out, sizeof(out)) == static_cast<int>(sizeof(out));
+    const uint64_t intervalOffset = static_cast<uint64_t>(header.intervalsOffset) +
+                                    static_cast<uint64_t>(index) * sizeof(EpdFontInterval);
+    if (intervalOffset > fontFile.size() || sizeof(out) > fontFile.size() - intervalOffset) return false;
+    return fontFile.seekSet(static_cast<size_t>(intervalOffset)) &&
+           fontFile.read(&out, sizeof(out)) == static_cast<int>(sizeof(out));
   };
 
   int left = 0;
@@ -469,11 +549,11 @@ const uint8_t* SdFontData::getGlyphBitmap(uint32_t codepoint) const {
     if (meta.dataLength == 0) {
       return nullptr;
     }
-    const size_t off = static_cast<size_t>(header.bitmapOffset) + meta.dataOffset;
-    if (off + meta.dataLength > residentData_.size()) {
+    const uint64_t off = static_cast<uint64_t>(header.bitmapOffset) + meta.dataOffset;
+    if (off > residentData_.size() || meta.dataLength > residentData_.size() - off) {
       return nullptr;
     }
-    return residentData_.data() + off;
+    return residentData_.data() + static_cast<size_t>(off);
   }
 
   // Check cache first (keyed by font identity + codepoint to avoid cross-font aliasing)
@@ -489,8 +569,10 @@ const uint8_t* SdFontData::getGlyphBitmap(uint32_t codepoint) const {
   }
 
   // Read glyph metadata first (we need dataLength and dataOffset)
-  uint32_t glyphFileOffset = header.glyphsOffset + (glyphIndex * sizeof(EpdFontGlyph));
-  if (!fontFile.seekSet(glyphFileOffset)) {
+  const uint64_t glyphFileOffset = static_cast<uint64_t>(header.glyphsOffset) +
+                                   static_cast<uint64_t>(glyphIndex) * sizeof(EpdFontGlyph);
+  if (glyphFileOffset > fontFile.size() || sizeof(EpdFontGlyph) > fontFile.size() - glyphFileOffset ||
+      !fontFile.seekSet(static_cast<size_t>(glyphFileOffset))) {
     return nullptr;
   }
 
@@ -504,7 +586,10 @@ const uint8_t* SdFontData::getGlyphBitmap(uint32_t codepoint) const {
   }
 
   // Seek to bitmap data
-  if (!fontFile.seekSet(header.bitmapOffset + fileGlyph.dataOffset)) {
+  const uint64_t bitmapFileOffset = static_cast<uint64_t>(header.bitmapOffset) + fileGlyph.dataOffset;
+  if (fileGlyph.dataLength > std::numeric_limits<uint16_t>::max() || bitmapFileOffset > fontFile.size() ||
+      fileGlyph.dataLength > fontFile.size() - bitmapFileOffset ||
+      !fontFile.seekSet(static_cast<size_t>(bitmapFileOffset))) {
     return nullptr;
   }
 

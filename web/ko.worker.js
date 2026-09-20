@@ -703,8 +703,13 @@ async function exportWholeBook(opts, onProgress) {
   const rawBytes = api._ko_xtch_size();   // pre-wrap container size
   if (xtcz) {
     tick('xtczWrap');
-    api._ko_xtcz_wrap();          // g_xtchOut → XTZ4 container in place
+    const wrapRc = api._ko_xtcz_wrap();          // g_xtchOut → XTZ4 container in place
     tock('xtczWrap');
+    if (wrapRc !== 0) {
+      const ep = api._ko_error();
+      api._ko_export_abort();
+      throw new Error(api.UTF8ToString(ep) || 'XTCZ wrapping failed');
+    }
   }
   const ptr = api._ko_xtch_ptr();
   const size = api._ko_xtch_size();
@@ -859,19 +864,27 @@ async function applySpec(raw) {
     throw new Error('requested font "' + currentSpec.font + '" is not available in this engine');
   }
 
-  api._ko_set_line_compression(currentSpec.lineCompression);
-  api._ko_set_paragraph_indent(currentSpec.paragraphIndent);
-  api._ko_set_character_wrap(currentSpec.characterWrap);
-  api._ko_set_paragraph_alignment(currentSpec.paragraphAlignment);
-  api._ko_set_extra_paragraph_spacing(currentSpec.extraParagraphSpacing);
+  const setChecked = (fn, value, label) => {
+    if (fn(value) !== 0) {
+      const ep = api._ko_error();
+      throw new Error(api.UTF8ToString(ep) || ('failed to set ' + label));
+    }
+  };
+  setChecked(api._ko_set_line_compression, currentSpec.lineCompression, 'line compression');
+  setChecked(api._ko_set_paragraph_indent, currentSpec.paragraphIndent, 'paragraph indent');
+  setChecked(api._ko_set_character_wrap, currentSpec.characterWrap, 'character wrap');
+  setChecked(api._ko_set_paragraph_alignment, currentSpec.paragraphAlignment, 'paragraph alignment');
+  setChecked(api._ko_set_extra_paragraph_spacing, currentSpec.extraParagraphSpacing, 'paragraph spacing');
   // Firmware gates hyphenation on word-wrap mode (CrossPointSettings::readerRenderSpec):
   // hyphenationEnabled = hyphenationEnabled && characterWrap == 0.
-  api._ko_set_hyphenation((currentSpec.hyphenation && currentSpec.characterWrap === 0) ? 1 : 0);
-  api._ko_set_embedded_style(currentSpec.embeddedStyle);
-  api._ko_set_image_rendering(currentSpec.imageRendering);
-  api._ko_set_text_aa(currentSpec.textAa);
-  api._ko_set_image_dither(currentSpec.imageDither);
-  api._ko_set_image_tone_depth(currentSpec.imageToneDepth);
+  setChecked(api._ko_set_hyphenation,
+             (currentSpec.hyphenation && currentSpec.characterWrap === 0) ? 1 : 0,
+             'hyphenation');
+  setChecked(api._ko_set_embedded_style, currentSpec.embeddedStyle, 'embedded style');
+  setChecked(api._ko_set_image_rendering, currentSpec.imageRendering, 'image rendering');
+  setChecked(api._ko_set_text_aa, currentSpec.textAa, 'text anti-aliasing');
+  setChecked(api._ko_set_image_dither, currentSpec.imageDither, 'image dither');
+  setChecked(api._ko_set_image_tone_depth, currentSpec.imageToneDepth, 'image tone depth');
 
   const deviceCode = currentSpec.deviceProfile === 'x3' ? 3 : 4;
   if (api._ko_set_device_profile(deviceCode) !== 0) {
@@ -1078,6 +1091,8 @@ function reportSectionFailure(spine, error) {
 // sizes this ABI cannot carry, and the truncation would happen somewhere deep inside it. Reject at the
 // boundary, before arrayBuffer(), _ko_epub_alloc, checkedMalloc or the external mount see the Blob.
 const MAX_WASM_BOOK_BYTES = 0x7fffffff;
+const MAX_FONT_SOURCE_BYTES = 64 * 1024 * 1024;
+const MAX_EPDFONT_BYTES = 64 * 1024 * 1024;
 
 function validateBookInput(data) {
   const n = data && data.epub ? data.epub.byteLength : (data && data.blob ? data.blob.size : -1);
@@ -1818,6 +1833,10 @@ case 'openPreview': {
         // bytes never leave the tab and a full Hangul font lands in ~150-400 ms.
         // Parity with tools/ttf_to_epdfont_fast.py is byte-for-byte on every case
         // measured (scripts/verify/epdfont_parity.js).
+        if (!(ev.data.font instanceof ArrayBuffer) || ev.data.font.byteLength === 0 ||
+            ev.data.font.byteLength > MAX_FONT_SOURCE_BYTES) {
+          throw new Error('invalid font input size');
+        }
         tick('convertFont');
         const conv = await getFontConverter();
         const res = conv.convert({
@@ -1831,6 +1850,9 @@ case 'openPreview': {
           spacePx: ev.data.spacePx,
         });
         const buf = res.bytes.buffer;
+        if (!(buf instanceof ArrayBuffer) || buf.byteLength === 0 || buf.byteLength > MAX_EPDFONT_BYTES) {
+          throw new Error('converted epdfont exceeds the supported size limit');
+        }
         tock('convertFont');
         post(id, true, {
           epdfont: buf,
@@ -1854,6 +1876,10 @@ case 'openPreview': {
         // accepted the face. This used to assign customFontBytes/customFontName and bump fontStamp FIRST,
         // so a truncated or malformed payload left the worker describing a font the engine never loaded —
         // and the next book load would then "re-apply" a face that does not exist while reporting success.
+        if (!(ev.data.epdfont instanceof ArrayBuffer) || ev.data.epdfont.byteLength === 0 ||
+            ev.data.epdfont.byteLength > MAX_EPDFONT_BYTES) {
+          throw new Error('invalid epdfont input size');
+        }
         const candidateBytes = new Uint8Array(ev.data.epdfont);
         const candidateName = (ev.data.name || 'custom').replace(/[^\w-]/g, '') || 'custom';
         const fp = checkedMalloc(candidateBytes.length, 'case-loadFont:fp');
@@ -1928,11 +1954,15 @@ case 'openPreview': {
           // metadata variable — the assignment further down then threw "Assignment to constant
           // variable" AFTER the whole book was rendered, so the warm never reported ready.
           const selectedWarmMode = ev.data.mode === 0 ? 0 : 1;
-          api._ko_export_set_mode(selectedWarmMode);
+          if (api._ko_export_set_mode(selectedWarmMode) !== 0) {
+            throw new Error(api.UTF8ToString(api._ko_error()) || 'warm export mode rejected');
+          }
           // the tone depth must follow the MODE (a 1-bit page packs 2 tones); the warm previously
           // inherited whatever the spec said, so a 1-bit warm could pack 4-level pages into one plane
           const warmDepth = selectedWarmMode === 0 ? 2 : 4;
-          api._ko_set_image_tone_depth(warmDepth);
+          if (api._ko_set_image_tone_depth(warmDepth) !== 0) {
+            throw new Error(api.UTF8ToString(api._ko_error()) || 'warm tone depth rejected');
+          }
           if (currentSpec) currentSpec.imageToneDepth = warmDepth;
           // No size preflight and no cap. The preflight paginated every spine to decide whether to
           // paginate every spine, so a book that passed it was laid out TWICE, and a book that failed
@@ -2027,8 +2057,10 @@ case 'openPreview': {
           await stopWarmBeforeMutation();
           if (ev.data.spec) await applySpecIfChanged(ev.data.spec);
           const m = ev.data.mode === 0 ? 0 : 1;
-          api._ko_export_set_mode(m);
-          api._ko_set_image_tone_depth(m === 0 ? 2 : 4);
+          if (api._ko_export_set_mode(m) !== 0 ||
+              api._ko_set_image_tone_depth(m === 0 ? 2 : 4) !== 0) {
+            throw new Error(api.UTF8ToString(api._ko_error()) || 'spine export mode rejected');
+          }
           if (currentSpec) currentSpec.imageToneDepth = m === 0 ? 2 : 4;
           const spine = ev.data.spine | 0;
           invalidateSection();
@@ -2065,38 +2097,54 @@ case 'openPreview': {
         // chapter-table/index and the caller composes [prefix][records…] in the browser. Uncompressed
         // XTC/XTCH only — XTCZ needs the byte stream, so it uses assembleSpines.
         const mode = ev.data.mode === 0 ? 0 : 1;
-        if (api._ko_plan_begin(mode) < 0) { post(id, false, { error: 'plan begin failed' }); break; }
-        let base = 0;
-        let recordBytes = 0;
-        let bad = null;
-        for (const sp of (ev.data.spines || [])) {
-          const pages = sp.pageCount | 0;
-          if (pages <= 0) continue;                       // matches the serial path's `if (added > 0)`
-          const lengths = Uint32Array.from(sp.lengths || []);
-          if (lengths.length !== pages) { bad = 'spine ' + sp.spine + ': ' + lengths.length + ' lengths for ' + pages + ' pages'; break; }
-          const lptr = checkedMalloc(pages * 4, 'case-planPrefix:lptr');
-          try {
-            new Uint32Array(api.HEAPU8.buffer, lptr, pages).set(lengths);
-            if (api._ko_plan_add_spine(lptr, pages) < 0) { bad = 'plan add spine failed'; break; }
-          } finally {
-            api._free(lptr);
+        let started = false, committed = false;
+        try {
+          if (api._ko_plan_begin(mode) < 0) throw new Error('plan begin failed');
+          started = true;
+          let base = 0;
+          let recordBytes = 0;
+          for (const sp of (ev.data.spines || [])) {
+            const pages = sp.pageCount | 0;
+            if (pages <= 0) continue;
+            const lengths = Uint32Array.from(sp.lengths || []);
+            if (lengths.length !== pages) {
+              throw new Error('spine ' + sp.spine + ': ' + lengths.length + ' lengths for ' + pages + ' pages');
+            }
+            const lptr = checkedMalloc(pages * 4, 'case-planPrefix:lptr');
+            try {
+              new Uint32Array(api.HEAPU8.buffer, lptr, pages).set(lengths);
+              if (api._ko_plan_add_spine(lptr, pages) < 0) throw new Error('plan add spine failed');
+            } finally {
+              api._free(lptr);
+            }
+            for (const t of (sp.toc || [])) {
+              if (withCString(t.title, (tp) => api._ko_plan_add_toc(base, tp, t.localPage | 0)) < 0) {
+                throw new Error('plan TOC entry rejected');
+              }
+            }
+            if (withCString(sp.fallbackName,
+                            (fp) => api._ko_plan_add_fallback(base, fp, pages)) < 0) {
+              throw new Error('plan fallback chapter rejected');
+            }
+            for (let i = 0; i < pages; i++) recordBytes += lengths[i];
+            base += pages;
           }
-          for (const t of (sp.toc || [])) {
-            withCString(t.title, (tp) => api._ko_plan_add_toc(base, tp, t.localPage | 0));
-          }
-          withCString(sp.fallbackName, (fp) => api._ko_plan_add_fallback(base, fp, pages));
-          for (let i = 0; i < pages; i++) recordBytes += lengths[i];
-          base += pages;
+          const total = api._ko_plan_finish();
+          if (total < 0) throw new Error('plan finish failed');
+          const pptr = api._ko_plan_prefix_ptr();
+          const psize = api._ko_plan_prefix_size();
+          if (!pptr || psize <= 0) throw new Error('plan produced no prefix');
+          const prefix = api.HEAPU8.slice(pptr, pptr + psize);
+          committed = true;
+          post(id, true, { pages: total, spinePages: base, prefix: prefix.buffer,
+                           prefixBytes: psize, recordBytes, rawBytes: psize + recordBytes },
+               [prefix.buffer]);
+        } catch (e) {
+          const ep = api._ko_error();
+          post(id, false, { error: String((e && e.message) || api.UTF8ToString(ep) || e) });
+        } finally {
+          if (started && !committed) api._ko_export_abort();
         }
-        if (bad) { post(id, false, { error: bad }); break; }
-        const total = api._ko_plan_finish();
-        if (total < 0) { post(id, false, { error: 'plan finish failed' }); break; }
-        const pptr = api._ko_plan_prefix_ptr();
-        const psize = api._ko_plan_prefix_size();
-        const prefix = api.HEAPU8.slice(pptr, pptr + psize);
-        post(id, true, { pages: total, spinePages: base, prefix: prefix.buffer,
-                         prefixBytes: psize, recordBytes, rawBytes: psize + recordBytes },
-             [prefix.buffer]);
         break;
       }
 
@@ -2108,19 +2156,27 @@ case 'openPreview': {
         // shared builder the serial path uses. Completion order must never reach this code, so the
         // caller is responsible for sending spines in index order.
         const mode = ev.data.mode === 0 ? 0 : 1;
-        if (api._ko_assemble_begin(mode) < 0) { post(id, false, { error: 'assemble begin failed' }); break; }
+        let started = false, committed = false;
+        try {
+        if (api._ko_assemble_begin(mode) < 0) throw new Error('assemble begin failed');
+        started = true;
         let base = 0;
         let raw = 0;
-        let bad = null;
         for (const sp of (ev.data.spines || [])) {
           const pages = sp.pageCount | 0;
           if (pages <= 0) continue;                     // matches the serial path's `if (added > 0)`
-          const lengths = sp.lengths;
+          const lengths = Uint32Array.from(sp.lengths || []);
+          if (lengths.length !== pages) {
+            throw new Error('spine ' + sp.spine + ': ' + lengths.length + ' lengths for ' + pages + ' pages');
+          }
+          if (!(sp.bytes instanceof ArrayBuffer)) throw new Error('spine ' + sp.spine + ': invalid byte payload');
           const bytes = new Uint8Array(sp.bytes);
           const offs = new Uint32Array(pages);
           let acc = 0;
           for (let i = 0; i < pages; i++) { offs[i] = acc; acc += lengths[i]; }
-          if (acc !== bytes.length) { bad = 'spine ' + sp.spine + ': lengths sum ' + acc + ' != ' + bytes.length + ' bytes'; break; }
+          if (acc !== bytes.length) {
+            throw new Error('spine ' + sp.spine + ': lengths sum ' + acc + ' != ' + bytes.length + ' bytes');
+          }
           // Allocated before the try: if a later allocation throws, the earlier ones must still be freed.
           let bptr = 0, optr = 0, lptr = 0;
           try {
@@ -2131,7 +2187,7 @@ case 'openPreview': {
             new Uint32Array(api.HEAPU8.buffer, optr, pages).set(offs);
             new Uint32Array(api.HEAPU8.buffer, lptr, pages).set(lengths);
             if (api._ko_assemble_add_spine(bptr, bytes.length, pages, optr, lptr) < 0) {
-              bad = 'assemble add spine failed for spine ' + sp.spine; break;
+              throw new Error('assemble add spine failed for spine ' + sp.spine);
             }
           } finally {
             if (bptr) api._free(bptr);
@@ -2139,27 +2195,38 @@ case 'openPreview': {
             if (lptr) api._free(lptr);
           }
           for (const t of (sp.toc || [])) {
-            const r = withCString(t.title, (tp) => api._ko_assemble_add_toc(base, tp, t.localPage | 0));
-            void r;
+            if (withCString(t.title, (tp) => api._ko_assemble_add_toc(base, tp, t.localPage | 0)) < 0) {
+              throw new Error('assembly TOC entry rejected');
+            }
           }
-          withCString(sp.fallbackName, (fp) => api._ko_assemble_add_fallback(base, fp, pages));
+          if (withCString(sp.fallbackName,
+                          (fp) => api._ko_assemble_add_fallback(base, fp, pages)) < 0) {
+            throw new Error('assembly fallback chapter rejected');
+          }
           base += pages;
           raw += bytes.length;
         }
-        if (bad) { post(id, false, { error: bad }); break; }
         const total = api._ko_assemble_finish();
-        if (total < 0) { post(id, false, { error: 'assemble finish failed' }); break; }
+        if (total < 0) throw new Error('assemble finish failed');
         // rawBytes is the UNCOMPRESSED container — header, metadata, chapters, index and records. It
         // used to be the sum of the page records, which made the UI divide by a number that excluded
         // everything but the records. recordBytes keeps the old figure as an assembly diagnostic.
         const rawBytes = api._ko_xtch_size();
-        if (ev.data.xtcz) api._ko_xtcz_wrap();
+        if (ev.data.xtcz && api._ko_xtcz_wrap() !== 0) throw new Error('XTCZ wrapping failed');
         const p2 = api._ko_xtch_ptr();
         const sz = api._ko_xtch_size();
+        if (!p2 || sz <= 0) throw new Error('assembly produced no bytes');
         const out = api.HEAPU8.slice(p2, p2 + sz);
+        committed = true;
         post(id, true, { pages: total, spinePages: base, recordBytes: raw,
                          xtcz: !!ev.data.xtcz, rawBytes,
                          bytes: out.buffer }, [out.buffer]);
+        } catch (e) {
+          const ep = api._ko_error();
+          post(id, false, { error: String((e && e.message) || api.UTF8ToString(ep) || e) });
+        } finally {
+          if (started && !committed) api._ko_export_abort();
+        }
         break;
       }
 
@@ -2194,9 +2261,13 @@ case 'openPreview': {
         // file is built from are exactly the settings the caller sent with this one message.
         if (ev.data.spec) await applySpecIfChanged(ev.data.spec);
         const exportMode = ev.data.mode === 0 ? 0 : 1;
-        api._ko_export_set_mode(exportMode);
+        if (api._ko_export_set_mode(exportMode) !== 0) {
+          throw new Error(api.UTF8ToString(api._ko_error()) || 'export mode rejected');
+        }
         const exportDepth = exportMode === 0 ? 2 : 4;
-        api._ko_set_image_tone_depth(exportDepth);
+        if (api._ko_set_image_tone_depth(exportDepth) !== 0) {
+          throw new Error(api.UTF8ToString(api._ko_error()) || 'export tone depth rejected');
+        }
         if (currentSpec) currentSpec.imageToneDepth = exportDepth;
         const opts = { xtcz: !!ev.data.xtcz };
           // exportWholeBook owns its own abort cleanup on every abnormal exit (cancel, spine

@@ -168,11 +168,12 @@
       "blob": "59f1d6e005d4033cbfa7350c7ec4ed9a18f3ad46",
       "port_path": "vendor-lib/EpdFont/SdFont.cpp",
       "divergence_kind": "amended",
-      "added_lines": 100,
-      "removed_lines": 11,
+      "added_lines": 217,
+      "removed_lines": 45,
       "changed_functions": [
         "SdFontData",
-        "findGlyphIndex"
+        "findGlyphIndex",
+        "loadGlyphFromSD"
       ],
       "only_in_reference": [],
       "only_in_port": [],
@@ -181,12 +182,12 @@
       "removed_line_sample": [
         "// Use larger cache (64KB) to improve performance with Korean fonts",
         "sharedCache = new GlyphBitmapCache(32768);  // 32KB cache (conserve memory for XTC)",
-        "LOG_DBG(\"SDF\", \"Loaded: %s (advanceY=%u, %u intervals, %u glyphs, on-demand)\", filePath.c_str(), header.advanceY,",
-        "header.intervalCount, header.glyphCount);",
-        "if (header.intervalCount == 0 || !ensureFileOpen()) {",
-        "// Binary search the interval table directly on the SD file. Each EpdFontInterval",
-        "// is 12 bytes, sorted by codepoint, starting at header.intervalsOffset. Keeping",
-        "// the table on SD (rather than a 50KB+ RAM array for CJK fonts) avoids a large"
+        "// Read and validate header",
+        "if (fontFile.read(&header, sizeof(EpdFontHeader)) != sizeof(EpdFontHeader)) {",
+        "if (header.magic != EPDFONT_MAGIC) {",
+        "LOG_ERR(\"SDF\", \"Invalid magic: 0x%08X (expected 0x%08X)\", header.magic, EPDFONT_MAGIC);",
+        "fontFile.close();",
+        "if (header.version != EPDFONT_VERSION) {"
       ]
     },
     "lib/EpdFont/SdFont.h": {

@@ -15,15 +15,13 @@ std::string normalisePath(const std::string& path) {
 void HalStorage::mountBlob(const std::string& path, const uint8_t* data, size_t size) {
   const std::string p = normalisePath(path);
   auto blob = std::make_shared<Blob>();
-  blob->writable = std::make_shared<std::vector<uint8_t>>(data, data + size);
+  blob->writable = std::make_shared<std::vector<uint8_t>>();
+  if (size != 0) {
+    if (!data) return;
+    blob->writable->assign(data, data + size);
+  }
   blob->refresh();
   files_[p] = std::move(blob);
-  // Also register under the SD-ish root view if caller used a bare filename
-  if (p.find('/') != std::string::npos) {
-    // keep a flat alias: basename
-    std::string base = p.substr(p.rfind('/') + 1);
-    files_["/" + base] = files_[p];
-  }
 }
 
 void HalStorage::mountOwnedBlob(const std::string& path, uint8_t* data, size_t size) {
@@ -34,10 +32,6 @@ void HalStorage::mountOwnedBlob(const std::string& path, uint8_t* data, size_t s
   blob->data = data;
   blob->size = size;
   files_[p] = std::move(blob);
-  if (p.find('/') != std::string::npos) {
-    std::string base = p.substr(p.rfind('/') + 1);
-    files_["/" + base] = files_[p];
-  }
 }
 
 void HalStorage::mountExternalBlob(const std::string& path, size_t size,
@@ -51,10 +45,6 @@ void HalStorage::mountExternalBlob(const std::string& path, size_t size,
   blob->readCtx = ctx;
   blob->refresh();                 // sets `size` from externalSize; data stays null on purpose
   files_[p] = std::move(blob);
-  if (p.find('/') != std::string::npos) {
-    std::string base = p.substr(p.rfind('/') + 1);
-    files_["/" + base] = files_[p];
-  }
 }
 
 // One process-wide counter set: the numbers describe the mount, and there is at most one mounted book.
@@ -109,8 +99,9 @@ size_t HalStorage::readFileToBuffer(const char* path, char* buffer, size_t buffe
 
 bool HalStorage::writeFile(const char* path, const String& content) {
   const std::string& s = content.str();
-  mountBlob(path, reinterpret_cast<const uint8_t*>(s.data()), s.size());
-  return true;
+  HalFile file;
+  if (!openFileForWrite("writeFile", path, file)) return false;
+  return s.empty() || file.write(s.data(), s.size()) == s.size();
 }
 
 bool HalStorage::ensureDirectoryExists(const char* path) {
@@ -120,59 +111,30 @@ bool HalStorage::ensureDirectoryExists(const char* path) {
 
 HalFile HalStorage::open(const char* path, const oflag_t oflag) {
   (void)oflag;
-  auto it = files_.find(path ? path : "");
+  const std::string key = normalisePath(path ? path : "");
+  auto it = files_.find(key);
   if (it == files_.end()) return HalFile();
   return HalFile(it->first, it->second);
 }
 
-bool HalStorage::exists(const char* path) { return files_.count(path ? path : "") > 0; }
-
-// Every alias of the same Blob must go, not just the key that was named. The mount functions also install
-// a BASENAME alias whenever the path is nested, so removing "/.fonts/foo.epdfont" used to leave
-// "/foo.epdfont" holding the Blob alive: a stale file that still answered lookups and still counted
-// against the storage. (The condition that installed those aliases, `p.find('/') != npos`, was always
-// true because normalisePath guarantees a leading slash.)
-bool HalStorage::remove(const char* path) {
-  const std::string key = path ? path : "";
-  auto it = files_.find(key);
-  if (it == files_.end()) return false;
-  const std::shared_ptr<Blob> victim = it->second;
-  for (auto i = files_.begin(); i != files_.end();) {
-    if (i->second == victim) {
-      i = files_.erase(i);
-    } else {
-      ++i;
-    }
-  }
-  return true;
+bool HalStorage::exists(const char* path) {
+  return files_.count(normalisePath(path ? path : "")) > 0;
 }
 
-// Same rule as remove(): the mount functions install a BASENAME alias for every nested mount, so moving
-// only the named key left every other alias holding the old Blob under the old name. The named key moves
-// to the requested path; the other aliases move to their own basename under the new directory, so
-// remove()/exists()/open() keep agreeing about what is mounted where.
+bool HalStorage::remove(const char* path) {
+  const std::string key = normalisePath(path ? path : "");
+  return files_.erase(key) != 0;
+}
+
 bool HalStorage::rename(const char* oldPath, const char* newPath) {
   const std::string oldKey = normalisePath(oldPath ? oldPath : "");
   const std::string newKey = normalisePath(newPath ? newPath : "");
   auto it = files_.find(oldKey);
   if (it == files_.end()) return false;
 
-  const std::shared_ptr<Blob> blob = it->second;
-  const std::string newBase = newKey.substr(newKey.rfind('/') + 1);
-
-  std::vector<std::pair<std::string, std::shared_ptr<Blob>>> moved;
-  for (auto i = files_.begin(); i != files_.end();) {
-    if (i->second != blob) {
-      ++i;
-      continue;
-    }
-    const std::string alias = i->first;
-    const std::string aliasBase = alias.substr(alias.rfind('/') + 1);
-    // The explicitly named key takes the requested path; a flat alias keeps its own basename.
-    moved.emplace_back(alias == oldKey ? newKey : "/" + aliasBase, blob);
-    i = files_.erase(i);
-  }
-  for (auto& [key, b] : moved) files_[key] = b;
+  auto blob = std::move(it->second);
+  files_.erase(it);
+  files_[newKey] = std::move(blob);
   return true;
 }
 
@@ -197,6 +159,7 @@ bool HalStorage::openFileForWrite(const char* moduleName, const char* path, HalF
   (void)moduleName;
   auto blob = std::make_shared<Blob>();
   blob->writable = std::make_shared<std::vector<uint8_t>>();
+  blob->budget = derivedBudget_;
   blob->refresh();
   // Same key rule as the read side, so a relative write cannot create a second entry that exists()/open()
   // (both normalised) would never see.
