@@ -7,21 +7,17 @@
 
 ## 0. TL;DR for the next session
 
-- **Live:** https://crosspoint-ko-wasm.pages.dev — deployment `38f9a63f`, wasm sha256 `eaac8614…`,
-  verified equal to `dist/`. (Deploy is now **behind** the local `dist/`: the default face and the
-  reference geometry changed after that deployment.)
+- **Live:** https://crosspoint-ko-wasm.pages.dev — deployment `51afb1ce`, wasm sha256 `3e6de479…`,
+  verified equal to the production build and `dist/` on 2026-09-20.
 - **Tree is clean and green.** Host and wasm both build; every gate passes.
 - **The oracle is enforced, not described.** `crosspoint-reader-ko @ release/korean
   84a39194dfce1ebd772ac9163df0a59daa0d72dc` is the pinned reference; the gate **compiles it and runs
   it** on the same books. Conformance is three layers: exact layout, perceptual raster, and
   plane bytes as a diagnostic only. See `docs/ko-oracle-conformance.md`.
-- **Do NOT externalize KoPub.** The 48% figure that justified it assumed RIDIBatang was the default
-  face. KoPub *is* the default (`getReaderFontId()`), so the split saves 3.4% for an extra request on
-  the critical path. Measured: `docs/ko-font-payload-measurement.md`. **RIDIBatang is the face worth
-  externalizing** (268,627 brotli bytes off every default load, asset 236,244, and its EPD2 path is
-  now proven end-to-end) — but only after a *navigation start → first readable page* benchmark.
-  Nothing is deployed that would need reverting: the shipped worker never fetches a font.
-- **Landscape orientation and the X3 profile are implemented locally:** exact KO layout in both
+- **Production uses variant C:** neither reader face is embedded. KoPub is fetched in parallel with
+  the module at boot and RIDIBatang on selection. The end-to-end cold-boot measurements and rationale
+  are in `docs/ko-cold-boot.md`; the live edge was verified to serve both EPD2 assets with Brotli.
+- **Landscape orientation and the X3 profile are deployed:** exact KO layout in both
   holding directions, orientation-aware safe margins, upright preview, and profile-sized portrait
   XTC/XTH records (X4 480×800, X3 528×792). See `docs/ko-landscape-modes.md` and
   `docs/ko-device-profiles.md`.
