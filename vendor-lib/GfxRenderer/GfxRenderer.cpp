@@ -62,6 +62,15 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
 }
 
 void GfxRenderer::begin() {
+  // The host/WASM facade can switch between the same two runtime profiles as
+  // the Korean firmware (X4 and X3). A second begin() refreshes the geometry;
+  // discard geometry-sized scratch left by the previous profile first.
+  freeBwBufferChunks();
+  _levelOwner.reset();
+  _levelBuf = nullptr;
+  _levelBufSize = 0;
+  _levelRowBytes = 0;
+  _levelCapture = false;
   frameBuffer = display.getFrameBuffer();
   if (!frameBuffer) {
     LOG_ERR("GFX", "!! No framebuffer");
@@ -188,6 +197,7 @@ static inline void rotateCoordinates(const GfxRenderer::Orientation orientation,
   switch (orientation) {
     case GfxRenderer::Portrait: {
       // Logical portrait (480x800) → panel (800x480)
+      // X3 uses the same formula with its runtime 528x792 / 792x528 geometry.
       // Rotation: 90 degrees clockwise
       *phyX = y;
       *phyY = panelHeight - 1 - x;
@@ -195,12 +205,14 @@ static inline void rotateCoordinates(const GfxRenderer::Orientation orientation,
     }
     case GfxRenderer::LandscapeClockwise: {
       // Logical landscape (800x480) rotated 180 degrees (swap top/bottom and left/right)
+      // X3 substitutes its runtime panel dimensions.
       *phyX = panelWidth - 1 - x;
       *phyY = panelHeight - 1 - y;
       break;
     }
     case GfxRenderer::PortraitInverted: {
       // Logical portrait (480x800) → panel (800x480)
+      // X3 uses the same formula with its runtime 528x792 / 792x528 geometry.
       // Rotation: 90 degrees counter-clockwise
       *phyX = panelWidth - 1 - y;
       *phyY = x;
@@ -208,6 +220,7 @@ static inline void rotateCoordinates(const GfxRenderer::Orientation orientation,
     }
     case GfxRenderer::LandscapeCounterClockwise: {
       // Logical landscape (800x480) aligned with panel orientation
+      // X3 substitutes its runtime panel dimensions.
       *phyX = x;
       *phyY = y;
       break;
@@ -2213,15 +2226,21 @@ void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuff
 // unchanged by construction.
 void GfxRenderer::beginLevelCapture() {
   const int rowBytes = getDisplayWidthBytes() * 4;  // 4 px/byte at 2 bits each
-  if (!_levelBuf) {
+  const size_t required = static_cast<size_t>(rowBytes) * panelHeight;
+  if (!_levelBuf || _levelBufSize != required) {
+    _levelOwner.reset();
+    _levelBuf = nullptr;
+    _levelBufSize = 0;
     _levelRowBytes = rowBytes;
-    _levelBuf = static_cast<uint8_t*>(malloc(static_cast<size_t>(rowBytes) * panelHeight));
+    _levelOwner.reset(static_cast<uint8_t*>(malloc(required)));
+    _levelBuf = _levelOwner.get();
     if (!_levelBuf) { _levelRowBytes = 0; return; }
+    _levelBufSize = required;
   }
   // Pre-fill with "no contribution" (level 0). A pixel no draw touches must add
   // NO gray bit, because the gray passes only ever OR set-bits into their planes;
   // an untouched pixel is left exactly as the pass produced it.
-  memset(_levelBuf, 0x00, static_cast<size_t>(_levelRowBytes) * panelHeight);
+  memset(_levelBuf, 0x00, _levelBufSize);
   _levelCapture = true;
 }
 

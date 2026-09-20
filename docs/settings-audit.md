@@ -95,8 +95,13 @@ until a file is chosen.
 
 ## Verified in a real browser, not just by reading the code
 
-`python3 -m http.server` over `dist/`, `/?epub=demo-images.epub` (the app auto-loads via the
-`epub` query param), then: hyphenation row hidden at load (wrap on) → visible after unchecking
-character wrap → hidden again after `Reset defaults` (which sets `.checked` programmatically and
-therefore fires no `change` event — `applyDefaults()` now re-applies the rule by hand). No JS
-errors in the console.
+The deployable `dist/` package was served with Cloudflare Pages' local server so its `_headers`
+rules were active, then opened at `/?epub=demo-images.epub` (the app auto-loads via the `epub`
+query param): hyphenation row hidden at load (wrap on) → visible after unchecking character wrap →
+hidden again after `Reset defaults` (which sets `.checked` programmatically and therefore fires no
+`change` event — `applyDefaults()` now re-applies the rule by hand). No JS errors in the console.
+
+Do not use `python3 -m http.server` over `dist/` for this check: the packaged EPD2 faces are already
+Brotli-compressed and depend on `_headers` to declare `Content-Encoding: br`. A header-blind server
+hands the compressed bytes to the font loader as if they were raw EPD2. For the plain-Python dev
+loop, run `scripts/stage_dev.sh` and serve `web/`, where the staged EPD2 files are raw.

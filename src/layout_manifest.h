@@ -143,8 +143,13 @@ struct ManifestHeader {
   std::string oracleRepo;      // e.g. crosspoint-reader-ko/crosspoint-reader-ko
   std::string oracleCommit;    // 40-hex; empty when the caller does not know it
   std::string oracleBranch;
+  std::string deviceProfile;
+  int physicalWidth = 0;
+  int physicalHeight = 0;
+  int planeBytes = 0;
   int screenWidth = 0;
   int screenHeight = 0;
+  int orientation = 0;
   int marginTop = 0;
   int marginRight = 0;
   int marginBottom = 0;
@@ -175,6 +180,12 @@ inline std::string serializeLayoutManifest(const ManifestHeader& h, const std::v
   jsonString(out, h.oracleCommit);
   out += "},\n  \"screen\": [";
   out += std::to_string(h.screenWidth) + ", " + std::to_string(h.screenHeight) + "],\n";
+  out += "  \"device\": ";
+  jsonString(out, h.deviceProfile);
+  out += ",\n  \"physicalPanel\": [" + std::to_string(h.physicalWidth) + ", " +
+         std::to_string(h.physicalHeight) + "],\n";
+  out += "  \"planeBytes\": " + std::to_string(h.planeBytes) + ",\n";
+  out += "  \"orientation\": " + std::to_string(h.orientation) + ",\n";
   out += "  \"margins\": [";
   out += std::to_string(h.marginTop) + ", " + std::to_string(h.marginRight) + ", " +
          std::to_string(h.marginBottom) + ", " + std::to_string(h.marginLeft) + "],\n";

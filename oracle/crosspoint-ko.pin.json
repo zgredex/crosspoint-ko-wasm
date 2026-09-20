@@ -508,6 +508,7 @@
       "added_lines": 186,
       "removed_lines": 2,
       "changed_functions": [
+        "begin",
         "renderCharImpl",
         "renderCharScaled"
       ],

@@ -1,6 +1,6 @@
-# HANDOFF — ko-wasm (Xteink X4 EPUB → XTC/XTCH converter)
+# HANDOFF — ko-wasm (Xteink X4/X3 EPUB → XTC/XTCH converter)
 
-**Date:** 2026-09-18 · **Repo:** https://github.com/zgredex/crosspoint-ko-wasm (public, MIT)
+**Date:** 2026-09-20 · **Repo:** https://github.com/zgredex/crosspoint-ko-wasm (public, MIT)
 **Working dir:** `/Users/patryk/krxtc/ko-wasm` · **Branch:** `main`
 
 ---
@@ -21,8 +21,12 @@
   externalizing** (268,627 brotli bytes off every default load, asset 236,244, and its EPD2 path is
   now proven end-to-end) — but only after a *navigation start → first readable page* benchmark.
   Nothing is deployed that would need reverting: the shipped worker never fetches a font.
+- **Landscape orientation and the X3 profile are implemented locally:** exact KO layout in both
+  holding directions, orientation-aware safe margins, upright preview, and profile-sized portrait
+  XTC/XTH records (X4 480×800, X3 528×792). See `docs/ko-landscape-modes.md` and
+  `docs/ko-device-profiles.md`.
 - **Parked:** ED dither wiring, cover-path verification, force-push, SKILL.md size fix, README
-  session note, rotation 4-mode. Single-giant-XHTML warm preflight still has no stress fixture;
+  session note. Single-giant-XHTML warm preflight still has no stress fixture;
   `HalStorage::mountBlob()`'s extra copy and the export high-water mark are still open.
 
 ---
@@ -213,9 +217,9 @@ delivers that libpng's loop does not.
 
 ---
 
-# 핸드오프 — ko-wasm (Xteink X4 EPUB → XTC/XTCH 변환기)
+# 핸드오프 — ko-wasm (Xteink X4/X3 EPUB → XTC/XTCH 변환기)
 
-**날짜:** 2026-09-17 · **저장소:** https://github.com/zgredex/crosspoint-ko-wasm (public, MIT)
+**날짜:** 2026-09-20 · **저장소:** https://github.com/zgredex/crosspoint-ko-wasm (public, MIT)
 **작업 디렉터리:** `/Users/patryk/krxtc/ko-wasm` · **브랜치:** `main`
 
 ---

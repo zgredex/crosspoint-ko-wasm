@@ -3,13 +3,14 @@
 // One EPUB → one device file. The container format is the same for both bit
 // depths; only the magic + page payload differ:
 //   - 2-bit "XTCH" (high quality): pages are XTH. Each XTH page is a 22B header
-//     ("XTH\0", w, h, 2 zero bytes, u32 dataSize=96000, 8B digest) followed by
-//     two 48000-byte planes. Device decode contract (XtcReaderActivity):
+//     ("XTH\0", w, h, 2 zero bytes, u32 dataSize, 8B digest) followed by
+//     two profile-sized planes. Device decode contract (XtcReaderActivity):
 //     value = (plane1bit<<1)|plane2bit, columns right→left, 8 vertical px/byte,
 //     MSB=topmost; 0=white 1=dark-grey 2=light-grey 3=black.
 //   - 1-bit "XTC\0" (fast): pages are XTG, a 22B header ("XTG\0", …,
-//     dataSize=48000) followed by one row-major plane, 8 px/byte MSB first,
-//     60 bytes/row × 800 rows. Device decode: bit 0 = BLACK, bit 1 = WHITE.
+//     dataSize) followed by one row-major plane, 8 px/byte MSB first.
+//     X4 is 60 bytes/row × 800; X3 is 66 × 792. Device decode:
+//     bit 0 = BLACK, bit 1 = WHITE.
 //
 // Engine plane mapping (empirically verified, 97.6% AA-edge adjacency):
 //   lsb&msb marks = dark grey (v1), msb-only = light grey (v2),
@@ -19,6 +20,8 @@
 #pragma once
 
 #include <cstdint>
+
+#include "device_profile.h"
 
 #include "../vendor-lib/Epub/Epub/converters/DitherUtils.h"  // the quantizer model
 #include "../vendor-lib/Epub/Epub/converters/BlueNoise64.h"  // 64x64 void-and-cluster
@@ -51,17 +54,21 @@ inline constexpr uint8_t kMonoInkDensity[4] = {
 // black). The 255 layer is NOT optional - the comparison is strict and the table holds all 256
 // values, so 1 in 256 black pixels must not ink. Omitting it cost ~70 wrong bits per page, which is
 // exactly the deficit a gate run measured.
-// Indexed [layer][y & 63][k]; bit (7 - j) answers for the pixel at x = 8k + j (phyY = 479-8k-j).
+// Indexed [layer][fileY & 63][fileX-byte]; bit (7-j) answers the
+// corresponding portrait-file pixel. 66 is X3's 528-pixel portrait width;
+// X4 uses the first 60 entries.
 struct MonoNoiseMasks {
-  uint8_t m[3][64][60];
-  MonoNoiseMasks() {
+  uint8_t m[3][64][66] = {};
+  uint16_t widthBytes = 0;
+  explicit MonoNoiseMasks(const ko::DeviceGeometry& geometry)
+      : widthBytes(static_cast<uint16_t>(geometry.portraitWidth / 8)) {
     const int thr[3] = {kMonoInkDensity[1], kMonoInkDensity[2], kMonoInkDensity[3]};
     for (int t = 0; t < 3; ++t) {
       for (int y = 0; y < 64; ++y) {
-        for (int k = 0; k < 60; ++k) {
+        for (int k = 0; k < widthBytes; ++k) {
           uint8_t mask = 0;
           for (int j = 0; j < 8; ++j) {
-            const int phyY = 479 - 8 * k - j;
+            const int phyY = geometry.physicalHeight - 1 - 8 * k - j;
             if (kBlueNoise64[(phyY & 63) * 64 + (y & 63)] < thr[t]) {
               mask |= static_cast<uint8_t>(1u << (7 - j));
             }
@@ -72,9 +79,10 @@ struct MonoNoiseMasks {
     }
   }
 };
-inline const MonoNoiseMasks& monoNoiseMasks() {
-  static const MonoNoiseMasks inst;
-  return inst;
+inline const MonoNoiseMasks& monoNoiseMasks(ko::DeviceProfile profile) {
+  static const MonoNoiseMasks x4(ko::kX4Geometry);
+  static const MonoNoiseMasks x3(ko::kX3Geometry);
+  return profile == ko::DeviceProfile::X3 ? x3 : x4;
 }
 
 // 8x8 bit-matrix transpose of the eight bytes packed into a uint64 (byte j at bits 8*(7-j)).
@@ -136,10 +144,15 @@ struct ChapterCandidate {
 
 class XtchWriter {
  public:
-  explicit XtchWriter(XtcMode mode = XtcMode::Gray2Bit) : mode_(mode) {}
+  explicit XtchWriter(XtcMode mode = XtcMode::Gray2Bit,
+                      DeviceProfile profile = DeviceProfile::X4)
+      : mode_(mode), deviceProfile_(profile) {}
 
   void setMode(XtcMode mode) { mode_ = mode; }
   XtcMode mode() const { return mode_; }
+  void setDeviceProfile(DeviceProfile profile) { deviceProfile_ = profile; }
+  DeviceProfile deviceProfile() const { return deviceProfile_; }
+  const DeviceGeometry& geometry() const { return deviceGeometry(deviceProfile_); }
 
   void setMetadata(const std::string& title, const std::string& author,
                    const std::string& publisher, const std::string& language) {
@@ -149,9 +162,10 @@ class XtchWriter {
     language_ = language;
   }
 
-  // Encode one logical (480x800 portrait) page from the three physical
-  // (800x480) plane captures. Appends an XTG (1-bit) or XTH (2-bit) page to
-  // pendingPages_ according to mode_.
+  // Encode the selected profile's physical panel capture into its portrait
+  // record geometry consumed by the Korean fork's XtcReaderActivity: X4
+  // 480x800, X3 528x792. In landscape the renderer has already rotated the
+  // logical layout into the physical capture, so the record is pre-rotated.
   // Blue-noise dithering of grey text on 1-bit pages. ON by default: without it every
   // grey edge collapses to a hard threshold and 1-bit output has no anti-aliasing at all.
   // The text-AA switch, as it affects a 1-bit page. Grey-bearing pixels are ALWAYS
@@ -167,8 +181,9 @@ class XtchWriter {
                          const std::vector<uint8_t>& msb) {
     if (pageCount() >= MAX_XTC_PAGES) return false;   // see MAX_XTC_PAGES: the header count wraps
 
-    constexpr uint16_t LOGICAL_W = 480;
-    constexpr uint16_t LOGICAL_H = 800;
+    const auto& g = geometry();
+    const uint16_t LOGICAL_W = g.portraitWidth;
+    const uint16_t LOGICAL_H = g.portraitHeight;
     if (mode_ == XtcMode::Mono1Bit) {
       return addMonoPage(bw, lsb, msb, LOGICAL_W, LOGICAL_H);
     }
@@ -179,27 +194,29 @@ class XtchWriter {
   // 1-bit XTG page: single row-major plane, 8 px/byte MSB first, bit 0 = black.
   bool addMonoPage(const std::vector<uint8_t>& bw, const std::vector<uint8_t>& lsb,
                    const std::vector<uint8_t>& msb, uint16_t LOGICAL_W, uint16_t LOGICAL_H) {
-    std::vector<uint8_t> plane(48000, 0xFF);  // start white (1)
-    const bool haveGray = lsb.size() >= 48000 && msb.size() >= 48000;
+    const auto& g = geometry();
+    const size_t planeBytes = g.planeBytes;
+    if (bw.size() < planeBytes) return false;
+    std::vector<uint8_t> plane(planeBytes, 0xFF);  // start white (1)
+    const bool haveGray = lsb.size() >= planeBytes && msb.size() >= planeBytes;
     const bool thinSolid = textAa_ && haveGray;  // AA on: solid ink is thinned too
 
-    auto physBit = [](const std::vector<uint8_t>& buf, int phyX, int phyY) -> int {
-      return (buf[phyY * 100 + (phyX >> 3)] >> (7 - (phyX & 7))) & 1;
-    };
-
     // Bit-parallel: one OUTPUT BYTE (8 pixels) per iteration instead of one pixel. The output
-    // byte at [y * 60 + k] holds x = 8k..8k+7; those eight pixels sit at phyY = 479-8k-j with
+    // byte at [y * outputRowBytes + k] holds x = 8k..8k+7; those pixels sit on descending phyY with
     // phyX = y fixed, so they are the same bit position (7 - (y & 7)) of eight plane bytes.
     // The dither uses precomputed mask layers instead of a per-pixel table lookup - that lookup
     // was measured at ~0.32 ns/pixel, about one cycle each.
-    const MonoNoiseMasks& nm = monoNoiseMasks();
+    const MonoNoiseMasks& nm = monoNoiseMasks(deviceProfile_);
+    const int physicalRowBytes = g.physicalRowBytes;
+    const int outputRowBytes = LOGICAL_W / 8;
     // One 8x8 block per iteration: 8 strided loads per plane cover 64 pixels (previous version:
     // 24 loads per 8 pixels). Gather, transpose, then decide eight output bytes.
     for (int c = 0; c < LOGICAL_H / 8; ++c) {        // input byte column = phyX >> 3 = y >> 3
       for (int k = 0; k < LOGICAL_W / 8; ++k) {      // output byte column = x >> 3
         uint64_t Lbw = 0, Llsb = 0, Lmsb = 0;
         for (int j = 0; j < 8; ++j) {
-          const size_t off = static_cast<size_t>(479 - 8 * k - j) * 100 + c;
+          const size_t off = static_cast<size_t>(g.physicalHeight - 1 - 8 * k - j) *
+                                 physicalRowBytes + c;
           const int sh = 8 * (7 - j);
           Lbw |= static_cast<uint64_t>(bw[off]) << sh;
           if (haveGray) {
@@ -230,12 +247,12 @@ class XtchWriter {
             keep |= static_cast<uint8_t>(thinSolid ? (m3 & nm.m[2][yc][k]) : m3);
             inkBits = static_cast<uint8_t>(inkBits & keep);
           }
-          plane[static_cast<size_t>(y) * 60 + k] &= static_cast<uint8_t>(~inkBits);
+          plane[static_cast<size_t>(y) * outputRowBytes + k] &= static_cast<uint8_t>(~inkBits);
         }
       }
     }
 
-    const uint32_t dataSize = 48000;
+    const uint32_t dataSize = static_cast<uint32_t>(planeBytes);
     std::vector<uint8_t> page;
     page.reserve(22 + dataSize);
     page.push_back('X'); page.push_back('T'); page.push_back('G'); page.push_back(0);
@@ -254,23 +271,25 @@ class XtchWriter {
   //
   // Optimized from the per-pixel form: it is a byte-aligned permutation, so it
   // runs 8 pixels at a time. For a logical column x every pixel reads physical
-  // row phyY = 479 - x, and a pixel's source bit position (7 - (y & 7)) is the
+  // row phyY = physicalHeight - 1 - x, and a pixel's source bit position (7 - (y & 7)) is the
   // SAME as its destination bit position — so no shifting or bit reversal is
-  // needed and the inner 800-pixel loop becomes 100 byte operations:
+  // needed and the inner portrait-height loop becomes one byte operation per 8 pixels:
   //     ink = ~bw   (BW bit 0 = ink)
   //     v = 0 white | 1 dark grey | 2 light grey | 3 black   (from ink/l/m)
   //     p1 = v & 2  =  ink & ~l              (light grey or black)
   //     p2 = v & 1  =  ink & (l | ~m)        (dark grey or black)
   bool addGrayPage(const std::vector<uint8_t>& bw, const std::vector<uint8_t>& lsb,
                    const std::vector<uint8_t>& msb, uint16_t LOGICAL_W, uint16_t LOGICAL_H) {
-    std::vector<uint8_t> p1(48000, 0), p2(48000, 0);
-    if (bw.size() < 48000 || lsb.size() < 48000 || msb.size() < 48000) return false;
+    const auto& g = geometry();
+    const size_t planeBytes = g.planeBytes;
+    std::vector<uint8_t> p1(planeBytes, 0), p2(planeBytes, 0);
+    if (bw.size() < planeBytes || lsb.size() < planeBytes || msb.size() < planeBytes) return false;
 
-    const int rowBytes = 100;         // physical row stride: 800 px / 8
-    const int rowsPerCol = LOGICAL_H / 8;   // 800 logical y -> 100 bytes
+    const int rowBytes = g.physicalRowBytes;
+    const int rowsPerCol = LOGICAL_H / 8;
     for (int x = 0; x < LOGICAL_W; x++) {
       const int targetCol = LOGICAL_W - 1 - x;   // XTH columns right→left
-      const int phyY = 479 - x;                  // portrait: phyX = y, phyY = 479 - x
+      const int phyY = g.physicalHeight - 1 - x;
       const uint8_t* rowB = bw.data() + static_cast<size_t>(phyY) * rowBytes;
       const uint8_t* rowL = lsb.data() + static_cast<size_t>(phyY) * rowBytes;
       const uint8_t* rowM = msb.data() + static_cast<size_t>(phyY) * rowBytes;
@@ -286,7 +305,7 @@ class XtchWriter {
     }
 
     // XTH page: 22B header + plane1 + plane2
-    const uint32_t dataSize = 96000;
+    const uint32_t dataSize = static_cast<uint32_t>(planeBytes * 2);
     std::vector<uint8_t> page;
     page.reserve(22 + dataSize);
     page.push_back('X'); page.push_back('T'); page.push_back('H'); page.push_back(0);
@@ -315,6 +334,22 @@ class XtchWriter {
     if (pageCount() >= MAX_XTC_PAGES) return false;   // see MAX_XTC_PAGES
 
     if (data == nullptr || size < 22) return false;   // every record carries its 22-byte header
+    const bool mono = data[0] == 'X' && data[1] == 'T' && data[2] == 'G' && data[3] == 0;
+    const bool gray = data[0] == 'X' && data[1] == 'T' && data[2] == 'H' && data[3] == 0;
+    if (!mono && !gray) return false;
+    if ((mode_ == XtcMode::Mono1Bit) != mono) return false;
+    const uint16_t width = static_cast<uint16_t>(data[4] | (data[5] << 8));
+    const uint16_t height = static_cast<uint16_t>(data[6] | (data[7] << 8));
+    const uint32_t payload = static_cast<uint32_t>(data[10]) |
+                             (static_cast<uint32_t>(data[11]) << 8) |
+                             (static_cast<uint32_t>(data[12]) << 16) |
+                             (static_cast<uint32_t>(data[13]) << 24);
+    const auto& g = geometry();
+    const uint32_t expectedPayload = static_cast<uint32_t>(g.planeBytes * (gray ? 2 : 1));
+    if (width != g.portraitWidth || height != g.portraitHeight ||
+        payload != expectedPayload || size != 22u + expectedPayload) {
+      return false;
+    }
     pendingPages_.emplace_back(data, data + size);
     return true;
   }
@@ -336,7 +371,7 @@ class XtchWriter {
 
   // The container's fixed-layout prefix: 56-byte header, 256-byte metadata, the chapter table, and the
   // 16-byte-per-page index. Everything in it is a function of the page SIZES and the chapters — each
-  // index entry is (running offset, size, 480, 800) — so it can be produced without ever holding the
+  // index entry is (running offset, size, profile width, profile height) — so it can be produced without ever holding the
   // page bytes. That is what lets the pool assemble a file as [prefix][records…] in the browser, with
   // no whole-container copy after encoding. finish() below is this same code plus the records, so the
   // format still has exactly one implementation.
@@ -430,8 +465,8 @@ class XtchWriter {
       const uint64_t e = indexOffset + i * 16;
       putU64(out, e + 0x00, cursor);
       putU32(out, e + 0x08, pageSizes[i]);
-      putU16(out, e + 0x0C, 480);
-      putU16(out, e + 0x0E, 800);
+      putU16(out, e + 0x0C, geometry().portraitWidth);
+      putU16(out, e + 0x0E, geometry().portraitHeight);
       cursor += pageSizes[i];
     }
   }
@@ -463,6 +498,7 @@ class XtchWriter {
 
   std::string title_, author_, publisher_, language_;
   XtcMode mode_ = XtcMode::Gray2Bit;
+  DeviceProfile deviceProfile_ = DeviceProfile::X4;
   std::vector<std::vector<uint8_t>> pendingPages_;
   bool textAa_ = true;
 };

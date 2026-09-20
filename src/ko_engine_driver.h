@@ -31,6 +31,7 @@
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
 #include "layout_manifest.h"
+#include "device_profile.h"
 // §5 font-contribution measurement toggles. Default 1 so every other build (native host, any TU
 // that misses the definition) keeps the fonts embedded and behaves exactly as before.
 #ifndef KO_EMBED_KOPUB
@@ -49,19 +50,53 @@
 
 namespace ko {
 
-// Page-plane capture after the 3-pass render, in PHYSICAL (800x480) layout.
-// The encoder converts to logical portrait 480x800 + XTH packing.
+// CrossPointSettings::ORIENTATION values. Keep the numeric values identical to
+// the Korean fork: they are part of the settings/API contract used by the web
+// worker and the host verification binary.
+enum ReaderOrientation : uint8_t {
+  PORTRAIT = 0,
+  LANDSCAPE_CW = 1,
+  PORTRAIT_INVERTED = 2,
+  LANDSCAPE_CCW = 3,
+};
+
+inline bool isReaderOrientation(int orientation) {
+  return orientation >= PORTRAIT && orientation <= LANDSCAPE_CCW;
+}
+
+inline void applyReaderOrientation(GfxRenderer& renderer, int orientation) {
+  switch (orientation) {
+    case LANDSCAPE_CW:
+      renderer.setOrientation(GfxRenderer::LandscapeClockwise);
+      break;
+    case PORTRAIT_INVERTED:
+      renderer.setOrientation(GfxRenderer::PortraitInverted);
+      break;
+    case LANDSCAPE_CCW:
+      renderer.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+      break;
+    case PORTRAIT:
+    default:
+      renderer.setOrientation(GfxRenderer::Portrait);
+      break;
+  }
+}
+
+// Page-plane capture after the 3-pass render, in the selected profile's
+// PHYSICAL panel layout (X4 800x480, X3 792x528). The encoder maps that panel
+// capture into the same profile's portrait XTC record (480x800 or 528x792);
+// landscape content is therefore pre-rotated for XtcReaderActivity.
 struct RenderedPage {
-  std::vector<uint8_t> bw;    // 48000 bytes: BW pass (black=0)
-  std::vector<uint8_t> lsb;   // 48000 bytes: LSB gray plane (dark-grey mask)
-  std::vector<uint8_t> msb;   // 48000 bytes: MSB gray plane (light+dark mask)
+  std::vector<uint8_t> bw;    // profile plane bytes: BW pass (black=0)
+  std::vector<uint8_t> lsb;   // profile plane bytes: LSB gray plane (dark-grey mask)
+  std::vector<uint8_t> msb;   // profile plane bytes: MSB gray plane (light+dark mask)
 };
 
 // Page geometry as the REFERENCE reader computes it.
 //
 // CrossPoint-KO @ release/korean 84a39194, EpubReaderActivity::render():
 //
-//   renderer.getOrientedViewableTRBL(&t,&r,&b,&l);   // portrait 9/3/3/3
+//   renderer.getOrientedViewableTRBL(&t,&r,&b,&l);
 //   t += SETTINGS.screenMargin;  l += SETTINGS.screenMargin;  r += SETTINGS.screenMargin;
 //   b += std::max(SETTINGS.screenMargin, UITheme::getStatusBarHeight());
 //
@@ -72,9 +107,13 @@ struct RenderedPage {
 //   → UITheme::getStatusBarHeight() == metrics.statusBarVerticalMargin == 19
 //     (BaseTheme.h:138 / LyraTheme.h:37 / RoundedRaffTheme.h:37 — all shipped themes)
 //
-// So the reference viewport on the 480x800 panel is 464x764 at the default
-// screenMargin of 5, and every screenMargin step grows top/left/right by 5 while
-// the bottom stays pinned to the 19 px lane until screenMargin exceeds it.
+// The physical safe area is 9/3/3/3 in portrait and rotates with the selected
+// reader orientation. At screenMargin=5 the reference viewports are therefore:
+//   portrait             margins 14/8/22/8  -> 464x764
+//   landscape clockwise  margins  8/14/22/8 -> 778x450
+//   landscape CCW        margins  8/8/22/14 -> 778x450
+// The status lane is added at the logical bottom after the hardware-safe
+// margins are rotated, exactly like EpubReaderActivity::render().
 //
 // The lane is a RESERVATION, not content: nothing of the status bar is ever
 // written into an exported page (the device composites its own chrome at read
@@ -104,10 +143,21 @@ struct Margins {
   int left;
 };
 
-constexpr Margins referenceMargins(int screenMargin) {
-  return Margins{kViewableTop + screenMargin, kViewableRight + screenMargin,
-                 kViewableBottom + (screenMargin > kReferenceStatusLane ? screenMargin : kReferenceStatusLane),
-                 kViewableLeft + screenMargin};
+constexpr Margins orientedViewableMargins(int orientation) {
+  return orientation == LANDSCAPE_CW
+             ? Margins{kViewableLeft, kViewableTop, kViewableRight, kViewableBottom}
+         : orientation == PORTRAIT_INVERTED
+             ? Margins{kViewableBottom, kViewableLeft, kViewableTop, kViewableRight}
+         : orientation == LANDSCAPE_CCW
+             ? Margins{kViewableRight, kViewableBottom, kViewableLeft, kViewableTop}
+             : Margins{kViewableTop, kViewableRight, kViewableBottom, kViewableLeft};
+}
+
+constexpr Margins referenceMargins(int screenMargin, int orientation = PORTRAIT) {
+  const Margins safe = orientedViewableMargins(orientation);
+  return Margins{safe.top + screenMargin, safe.right + screenMargin,
+                 safe.bottom + (screenMargin > kReferenceStatusLane ? screenMargin : kReferenceStatusLane),
+                 safe.left + screenMargin};
 }
 
 constexpr bool isScreenMarginAllowed(int screenMargin) {
@@ -136,6 +186,9 @@ struct Spec {
   int imageDither = 2;                // BLUE_NOISE (the previous fixed behaviour)
   int imageToneDepth = 4;             // 4 = 2-bit XTCH, 2 = 1-bit XTC
   // --- page geometry ---
+  DeviceProfile deviceProfile = DeviceProfile::X4;
+  int orientation = PORTRAIT;         // CrossPointSettings::ORIENTATION (0..3)
+  int screenMargin = geom::kScreenMarginDefault;
   // Reference-reader geometry at the default screenMargin: 14 / 8 / 22 / 8 →
   // viewport 464x764. See ko::geom above for the derivation from
   // EpubReaderActivity::render(). applyScreenMargin() recomputes all four from a
@@ -143,10 +196,10 @@ struct Spec {
   // measurement flags use.
   uint16_t viewportWidth = 0;         // set by driver from margins
   uint16_t viewportHeight = 0;
-  int marginTop = geom::referenceMargins(geom::kScreenMarginDefault).top;
-  int marginRight = geom::referenceMargins(geom::kScreenMarginDefault).right;
-  int marginBottom = geom::referenceMargins(geom::kScreenMarginDefault).bottom;
-  int marginLeft = geom::referenceMargins(geom::kScreenMarginDefault).left;
+  int marginTop = geom::referenceMargins(geom::kScreenMarginDefault, PORTRAIT).top;
+  int marginRight = geom::referenceMargins(geom::kScreenMarginDefault, PORTRAIT).right;
+  int marginBottom = geom::referenceMargins(geom::kScreenMarginDefault, PORTRAIT).bottom;
+  int marginLeft = geom::referenceMargins(geom::kScreenMarginDefault, PORTRAIT).left;
   // --- reader face ---
   // CrossPoint-KO's reader face. CrossPointSettings::getReaderFontId() returns
   // hasCustomFont() ? CUSTOM_FONT_ID : KOPUB_14_FONT_ID — RIDIBatang does not
@@ -157,11 +210,17 @@ struct Spec {
   // first buildSection(); the viewport is derived from the margins, never set
   // independently.
   void applyScreenMargin(int screenMargin) {
-    const geom::Margins m = geom::referenceMargins(screenMargin);
+    this->screenMargin = screenMargin;
+    const geom::Margins m = geom::referenceMargins(screenMargin, orientation);
     marginTop = m.top;
     marginRight = m.right;
     marginBottom = m.bottom;
     marginLeft = m.left;
+  }
+
+  void applyOrientation(int orientation) {
+    this->orientation = isReaderOrientation(orientation) ? orientation : PORTRAIT;
+    applyScreenMargin(screenMargin);
   }
 };
 
@@ -196,6 +255,13 @@ class EngineDriver {
     section_.reset();
     epub_.reset();
     epubPath_.clear();
+    pageCount_ = 0;
+  }
+
+  // A runtime device-profile change keeps the mounted EPUB but invalidates
+  // pagination made for the previous screen geometry.
+  void invalidateSection() {
+    section_.reset();
     pageCount_ = 0;
   }
 
@@ -273,6 +339,7 @@ class EngineDriver {
   // Build a section (spine) and return page count; -1 on failure.
   int buildSection(int spineIndex, const Spec& spec) {
     if (!epub_) return -1;
+    applyReaderOrientation(renderer_, spec.orientation);
     section_.reset();
     ReaderRenderSpec rs = toReaderSpec(spec);
     section_.reset(new Section(epub_, spineIndex, renderer_));
@@ -287,6 +354,7 @@ class EngineDriver {
   // The Section API is unchanged; this only stops calling the build-to-completion wrapper.
   int startSection(int spineIndex, const Spec& spec, int initialPages) {
     if (!epub_) return -1;
+    applyReaderOrientation(renderer_, spec.orientation);
     section_.reset();
     ReaderRenderSpec rs = toReaderSpec(spec);
     section_.reset(new Section(epub_, spineIndex, renderer_));
@@ -419,6 +487,10 @@ class EngineDriver {
   bool renderPageImpl(int pageIndex, const Spec& spec, RenderedPage& out, ManifestPage* probe,
                       int spineIndex, bool dropGrayPlanes) {
     if (!section_) return false;
+    // The export API snapshots Spec at begin(). Re-applying from that snapshot
+    // here makes orientation transactional too: a stray live setter cannot
+    // rotate only the latter half of an export.
+    applyReaderOrientation(renderer_, spec.orientation);
     // Per-render image accounting starts here, in the ONE function every entry point goes through. It used
     // to live in ko_render_page, so when the worker switched to ko_render_page_mode the counters silently
     // accumulated across renders and reported nonsense (5, 6, 7, 8 for one image per page).
@@ -520,7 +592,8 @@ class EngineDriver {
 #ifndef KO_ORACLE_BUILD
     if (captureText) renderer_.endLevelCapture();
 #endif
-    out.bw.assign(display_.getFrameBuffer(), display_.getFrameBuffer() + 48000);
+    const size_t planeBytes = display_.getBufferSize();
+    out.bw.assign(display_.getFrameBuffer(), display_.getFrameBuffer() + planeBytes);
 
     if (dropGrayPlanes) {
       // No gray work at all: no capture, no gray passes, no plane copies. The caller asked for the 1-bit
@@ -549,8 +622,8 @@ class EngineDriver {
     renderer_.copyGrayscaleMsbBuffers();
 
     renderer_.setRenderMode(GfxRenderer::BW);
-    out.lsb.assign(display_.getLsbPlane(), display_.getLsbPlane() + 48000);
-    out.msb.assign(display_.getMsbPlane(), display_.getMsbPlane() + 48000);
+    out.lsb.assign(display_.getLsbPlane(), display_.getLsbPlane() + planeBytes);
+    out.msb.assign(display_.getMsbPlane(), display_.getMsbPlane() + planeBytes);
     return true;
   }
   GfxRenderer& renderer_;

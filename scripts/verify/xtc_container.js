@@ -34,7 +34,8 @@ function xtcPageRecords(input) {
     : (input instanceof Uint8Array ? Buffer.from(input.buffer, input.byteOffset, input.byteLength)
                                    : Buffer.from(input));
   if (buf.length < 0x20) throw new Error(`container shorter than a header (${buf.length} bytes)`);
-  if (buf.toString('latin1', 0, 4) !== 'XTCH') {
+  const containerMagic = buf.toString('latin1', 0, 4);
+  if (containerMagic !== 'XTCH' && containerMagic !== 'XTC\0') {
     throw new Error(`bad container magic: ${JSON.stringify(buf.toString('latin1', 0, 4))}`);
   }
 
@@ -51,7 +52,8 @@ function xtcPageRecords(input) {
     const e = indexOffset + i * PAGE_INDEX_ENTRY;
     const offset = Number(buf.readBigUInt64LE(e));
     const length = buf.readUInt32LE(e + 8);
-    const flags = buf.readUInt32LE(e + 12);
+    const width = buf.readUInt16LE(e + 12);
+    const height = buf.readUInt16LE(e + 14);
     if (length <= 0 || offset + length > buf.length || offset < indexOffset + indexBytes) {
       throw new Error(`invalid page index ${i}: offset ${offset} length ${length} ` +
                       `(container ${buf.length} bytes)`);
@@ -61,7 +63,21 @@ function xtcPageRecords(input) {
     if (magic !== 'XTH\0' && magic !== 'XTG\0' && magic !== 'XTH\u0000') {
       throw new Error(`page ${i} at ${offset} has magic ${JSON.stringify(magic)}, not a page record`);
     }
-    index.push({ offset, length, flags });
+    if (rec.length < 22) throw new Error(`page ${i} record is shorter than its 22-byte header`);
+    const recordWidth = rec.readUInt16LE(4);
+    const recordHeight = rec.readUInt16LE(6);
+    if (recordWidth !== width || recordHeight !== height) {
+      throw new Error(`page ${i} index geometry ${width}x${height} differs from record `
+                      + `${recordWidth}x${recordHeight}`);
+    }
+    const onePlane = width * height / 8;
+    const expectedPayload = onePlane * (magic === 'XTH\0' ? 2 : 1);
+    const payload = rec.readUInt32LE(10);
+    if (!Number.isInteger(onePlane) || payload !== expectedPayload || length !== 22 + expectedPayload) {
+      throw new Error(`page ${i} size is inconsistent with ${width}x${height}: `
+                      + `payload=${payload}, length=${length}`);
+    }
+    index.push({ offset, length, width, height });
     pages.push(rec);
   }
   // The count in the header and the number of records produced are the same number by
@@ -80,11 +96,17 @@ function xtcPageRecords(input) {
 /** Plane payload of a page record: 22-byte record header, then planes. */
 function pagePlanes(record) {
   const magic = record.toString('latin1', 0, 4);
-  const planeBytes = magic === 'XTH\0' ? 96000 : 48000;
-  if (record.length < 22 + planeBytes) {
-    throw new Error(`page record too short: ${record.length} bytes, expected ${22 + planeBytes}`);
+  if (magic !== 'XTH\0' && magic !== 'XTG\0') throw new Error(`bad page magic ${JSON.stringify(magic)}`);
+  const width = record.readUInt16LE(4);
+  const height = record.readUInt16LE(6);
+  const onePlane = width * height / 8;
+  const payloadBytes = onePlane * (magic === 'XTH\0' ? 2 : 1);
+  if (!Number.isInteger(onePlane) || record.length !== 22 + payloadBytes
+      || record.readUInt32LE(10) !== payloadBytes) {
+    throw new Error(`page record has invalid ${width}x${height} payload/length`);
   }
-  return { magic, planes: record.subarray(22, 22 + planeBytes), is2Bit: magic === 'XTH\0' };
+  return { magic, width, height, planeBytes: onePlane,
+    planes: record.subarray(22, 22 + payloadBytes), is2Bit: magic === 'XTH\0' };
 }
 
 module.exports = { xtcPageRecords, pagePlanes };

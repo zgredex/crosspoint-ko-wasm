@@ -133,7 +133,8 @@ After rendering is parallelised, assembly is the serial floor. The old path move
 engine and copied it four times (worker→page transfer, `HEAPU8.set` into the assembler heap, `addRawPage`
 into page vectors, `finish()`'s concatenation, then `HEAPU8.slice` back out). None of that is necessary
 for an uncompressed container: the header, metadata, chapter table and page index are functions of the
-page **sizes** — every index entry is `(running offset, size, 480, 800)`.
+page **sizes** and the selected device profile — every index entry is
+`(running offset, size, profileWidth, profileHeight)` (X4 480×800 or X3 528×792).
 
 So the pool now asks for the **prefix only** (`ko_plan_*`, ~33 KB on the 162 MB book) and composes
 `[prefix][records…]` as a Blob. The format still has one implementation: `buildPrefix()` is the code

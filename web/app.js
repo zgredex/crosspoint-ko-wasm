@@ -30,6 +30,7 @@
     paragraphIndent: $('paragraphIndent'), extraParagraphSpacing: $('extraParagraphSpacing'),
     characterWrap: $('characterWrap'), hyphenation: $('hyphenation'),
     embeddedStyle: $('embeddedStyle'), textAa: $('textAa'), imageDither: $('imageDither'),
+    deviceProfile: $('deviceProfile'), orientation: $('orientation'),
     viewportOut: $('viewportOut'),
     screenMargin: $('screenMargin'), screenMarginOut: $('screenMarginOut'),
     imageRendering: $('imageRendering'), zoom: $('zoom'), zoomOut: $('zoomOut'),
@@ -74,7 +75,7 @@
   function spawnWorker() {
     // Resolve against the page's directory, not the page file — opening
     // /index.html vs / must both yield /ko.worker.js.
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=103');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=105');
     w.onmessage = (ev) => {
       const m = ev.data;
       // Progressive section build: the spine's page count grows while the reader looks at page 1, so
@@ -254,7 +255,7 @@
   let currentBookBlob = null;
 
   function spawnExportWorker() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=103');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=105');
     w.onmessage = (ev) => {
       const m = ev.data;
       if (m && m.progress) {           // progress reports carry no id
@@ -450,6 +451,8 @@
       imageToneDepth: state.mode === 0 ? 2 : 4,
       textAa: els.textAa.checked ? 1 : 0,
       screenMargin: parseInt(els.screenMargin.value, 10),
+      deviceProfile: els.deviceProfile.value,
+      orientation: parseInt(els.orientation.value, 10),
       imageRendering: parseInt(els.imageRendering.value, 10),
       // 'custom' only when a runtime font is actually loaded; otherwise the
       // worker would silently keep the default while the UI claims custom.
@@ -468,6 +471,9 @@
     els.hyphenation.checked = false;
     els.embeddedStyle.checked = true;
     els.textAa.checked = true;                // device default: on
+    els.deviceProfile.value = 'x4';           // CrossPoint-KO fallback/default profile
+    els.orientation.value = '0';              // device default: portrait
+    els.exportName.value = '[X4]';
     els.screenMargin.value = '5';
     els.screenMarginOut.textContent = '5 px';
     // Reference geometry. The reader reserves a 19 px status-bar lane
@@ -569,7 +575,7 @@
     try {
       const r = await call('cover', { kind: 0 });
       const img = bmpToImageData(r.cover);
-      drawCoverFitted(img);          // letterbox into the fixed 480×800 screen
+      drawCoverFitted(img);          // letterbox into the selected logical screen
       els.pageStatus.textContent = '표지';
       els.page.setAttribute('aria-label', '도서 표지 미리보기');
     } catch (e) {
@@ -580,12 +586,22 @@
     }
   }
 
-  // Draw a cover BMP scaled to fit inside the device screen (480×800 logical),
-  // centered with white margins — mirrors how the X4 shows a full-screen cover.
-  // The canvas size NEVER changes: the preview is a 1:1 device screen.
+  function selectedScreen() {
+    const portrait = els.deviceProfile.value === 'x3'
+      ? { width: 528, height: 792 }
+      : { width: 480, height: 800 };
+    const orientation = parseInt(els.orientation.value, 10);
+    return orientation === 1 || orientation === 3
+      ? { width: portrait.height, height: portrait.width }
+      : portrait;
+  }
+
+  // Draw a cover BMP scaled to fit inside the selected logical screen.
   function drawCoverFitted(img) {
     const ctx = els.page.getContext('2d');
-    const SW = 480, SH = 800;
+    const screen = selectedScreen();
+    const SW = screen.width;
+    const SH = screen.height;
     if (els.page.width !== SW || els.page.height !== SH) {
       els.page.width = SW;
       els.page.height = SH;
@@ -618,6 +634,7 @@
     if (!els.viewportOut || !r || !r.viewport || !r.margins) return;
     const m = r.margins;
     els.viewportOut.textContent =
+      (r.screen ? '논리 화면: ' + r.screen.width + '×' + r.screen.height + ' px · ' : '') +
       '본문 영역: ' + r.viewport.width + '×' + r.viewport.height +
       ' px · 여백 T/R/B/L ' + m.top + '/' + m.right + '/' + m.bottom + '/' + m.left +
       ' · 파일에 UI 없음';
@@ -668,12 +685,14 @@
       // Every render reply states the build state; `=== true` makes anything else (including a missing
       // field from an older reply) mean "not proven complete", which is the safe reading.
       state.sectionComplete = r.sectionComplete === true;
-      if (els.page.width !== 480 || els.page.height !== 800) {
-        els.page.width = 480;
-        els.page.height = 800;
+      const frameWidth = r.width || 480;
+      const frameHeight = r.height || 800;
+      if (els.page.width !== frameWidth || els.page.height !== frameHeight) {
+        els.page.width = frameWidth;
+        els.page.height = frameHeight;
       }
       const tDraw = performance.now();
-      drawImage(r.image);
+      drawImage(r.image, frameWidth, frameHeight);
       const canvasDrawMs = performance.now() - tDraw;
       window.__koLastRenderDetail = {
         renderCallMs: +renderCallMs.toFixed(1),
@@ -697,30 +716,30 @@
     }
   }
 
-  function drawImage(buf) {
-    const img = new ImageData(new Uint8ClampedArray(buf), 480, 800);
+  function drawImage(buf, width, height) {
+    const img = new ImageData(new Uint8ClampedArray(buf), width, height);
     drawImageDirect(img);
   }
 
   function updateZoomCss() {
-    // View zoom, applied to the fixed 480x800 logical canvas:
+    // View zoom, applied to the current orientation's logical canvas:
     //   100%  → page sized to FIT the scroll viewport (whole page visible)
     //   <100% → page shrinks below fit
     //   >100% → page magnifies beyond fit; #canvasScroll scrolls to pan
     // This is a pure CSS view-scale — never a re-render, and the exported
-    // file stays 480x800 device pixels at every zoom level.
+    // file stays at the selected device profile's native pixel count.
     const z = (els.zoom.value || 100) / 100;
     const view = els.page.closest ? els.page.closest('#canvasScroll') : null;
     let fit = 0.6;
     if (view) {
       const w = view.clientWidth - 16;   // padding
       const h = view.clientHeight - 16;
-      if (w > 0 && h > 0) fit = Math.min(w / 480, h / 800);
+      if (w > 0 && h > 0) fit = Math.min(w / els.page.width, h / els.page.height);
     }
     const s = fit * z;
     if (s <= 0) return;
-    els.page.style.width = Math.round(480 * s) + 'px';
-    els.page.style.height = Math.round(800 * s) + 'px';
+    els.page.style.width = Math.round(els.page.width * s) + 'px';
+    els.page.style.height = Math.round(els.page.height * s) + 'px';
   }
 
   function updatePager() {
@@ -1102,11 +1121,14 @@
         state.pages = openFrame.pages || 0;
         state.sectionComplete = openFrame.sectionComplete === true;
         state.total = openFrame.total || openFrame.pages || 0;
-        if (els.page.width !== 480 || els.page.height !== 800) {
-          els.page.width = 480;
-          els.page.height = 800;
+        const frameWidth = openFrame.width || 480;
+        const frameHeight = openFrame.height || 800;
+        if (els.page.width !== frameWidth || els.page.height !== frameHeight) {
+          els.page.width = frameWidth;
+          els.page.height = frameHeight;
         }
-        drawImage(openFrame.image);
+        drawImage(openFrame.image, frameWidth, frameHeight);
+        showViewport(openFrame);
         const canvasDrawMs = performance.now() - tDraw;
         updateZoomCss();
         updatePager();
@@ -1546,7 +1568,7 @@
   const PREFS_KEY = 'xtcko.prefs.v1';
   const PREFS_IDS = ['lineCompression', 'paragraphAlignment', 'paragraphIndent',
                      'extraParagraphSpacing', 'characterWrap', 'hyphenation', 'embeddedStyle',
-                     'textAa', 'imageRendering', 'imageDither', 'screenMargin', 'fontPreset',
+                     'textAa', 'imageRendering', 'imageDither', 'deviceProfile', 'orientation', 'screenMargin', 'fontPreset',
                      'fontSize', 'fontWeight', 'fontSpacePx', 'fontHangul', 'fontIntervals',
                      'lz4Wrap', 'exportName'];
 
@@ -1576,6 +1598,9 @@
     if (o.fontPreset === 'custom') {          // the .epdfont itself is not remembered
       const p = els.fontPreset; if (p) p.value = 'kopub';
     }
+    if (els.exportName && /^\[X[34]\]$/.test(els.exportName.value)) {
+      els.exportName.value = els.deviceProfile.value === 'x3' ? '[X3]' : '[X4]';
+    }
     syncFontSeg();                            // the radios mirror the (restored) select
     toggleFontPanel();
     if (els.zoom && o.zoom) els.zoom.value = o.zoom;
@@ -1601,7 +1626,7 @@
   const KNOB_IDS = [
     'lineCompression', 'paragraphAlignment', 'paragraphIndent',
     'extraParagraphSpacing', 'characterWrap', 'hyphenation',
-    'embeddedStyle', 'textAa', 'imageRendering', 'imageDither',
+    'embeddedStyle', 'textAa', 'imageRendering', 'imageDither', 'deviceProfile', 'orientation',
   ];
   KNOB_IDS.forEach((id) => els[id].addEventListener('change', () => {
     // imageDither does not move a single page break (image size is fixed), but the
@@ -1611,6 +1636,13 @@
     scheduleWarm(2000);
     savePrefs();
   }));
+  els.deviceProfile.addEventListener('change', () => {
+    if (/^\[X[34]\]$/.test(els.exportName.value.trim())) {
+      els.exportName.value = els.deviceProfile.value === 'x3' ? '[X3]' : '[X4]';
+    }
+    updateExportSummary();
+    savePrefs();
+  });
 
   // ---- controls that are inert in the current state are not shown -------------
   // Two cases, both measured rather than assumed (scripts/verify/settings_effect.js
@@ -1736,7 +1768,9 @@
   function updateExportSummary() {
     if (!els.exportSummary) return;
     const mode = state && state.mode === 0 ? 'XTC · 1비트 · 작은 파일' : 'XTCH · 2비트 · 이미지 품질 우선';
-    els.exportSummary.textContent = mode + (els.lz4Wrap && els.lz4Wrap.checked ? ' + LZ4 (.xtcz)' : '');
+    const device = els.deviceProfile.value === 'x3' ? 'X3 528×792' : 'X4 480×800';
+    els.exportSummary.textContent = device + ' · ' + mode +
+      (els.lz4Wrap && els.lz4Wrap.checked ? ' + LZ4 (.xtcz)' : '');
   }
 
   function syncExportSeg() {
@@ -1842,7 +1876,7 @@
   }
 
   function spawnPoolEngine() {
-    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=103');
+    const w = new Worker(WORKER_BASE + 'ko.worker.js?v=105');
     const pending = new Map();
     let nextId = 1;
     const engine = { w, pending, loaded: null, spines: 0, busyMs: 0 };

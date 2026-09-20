@@ -5,6 +5,8 @@
 
 #include <cstdint>
 
+#include "device_profile.h"
+
 class HalGPIO {
  public:
   enum class DeviceType : uint8_t { X4, X3 };
@@ -59,7 +61,10 @@ class HalGPIO {
   bool isUsbConnected() const { return false; }
   bool wasUsbStateChanged() const { return false; }
   bool isXteinkDevice() const { return true; }
-  bool deviceIsX3() const { return false; }
-  bool deviceIsX4() const { return true; }
-  void setDeviceType(DeviceType t) { (void)t; }
+  bool deviceIsX3() const { return deviceType_ == DeviceType::X3; }
+  bool deviceIsX4() const { return deviceType_ == DeviceType::X4; }
+  void setDeviceType(DeviceType t) { deviceType_ = t; }
+
+ private:
+  DeviceType deviceType_ = DeviceType::X4;
 };

@@ -40,7 +40,6 @@ import sys
 sys.path.insert(0, __file__.rsplit('/', 1)[0])
 import container_diff as cd  # noqa: E402
 
-W, H = 480, 800
 # ink level -> panel reflectance (project anchors)
 REFLECT = {0: 210, 1: 80, 2: 30, 3: 15}
 
@@ -53,33 +52,39 @@ SHIFT_RESIDUAL = 0.60        # ...and leave the rest under 60% of the unshifted 
 
 
 def decode_page(rec):
-    """(levels, lum) — levels is 0..3 per logical pixel; lum is its reflectance."""
+    """(levels, width, height); levels is 0..3 per portrait-record pixel."""
+    width = int.from_bytes(rec[4:6], 'little')
+    height = int.from_bytes(rec[6:8], 'little')
+    plane_bytes = width * height // 8
     if rec[:4] == b'XTH\x00':
-        p1 = rec[22:22 + 48000]
-        p2 = rec[22 + 48000:22 + 96000]
-        lv = bytearray(W * H)
-        for y in range(H):
-            base = y * W
-            for x in range(W):
-                # physical column-major, columns right->left: byte (479-x)*100 + (y>>3)
-                b1 = p1[(479 - x) * 100 + (y >> 3)] >> (7 - (y & 7)) & 1
-                b2 = p2[(479 - x) * 100 + (y >> 3)] >> (7 - (y & 7)) & 1
+        p1 = rec[22:22 + plane_bytes]
+        p2 = rec[22 + plane_bytes:22 + 2 * plane_bytes]
+        column_bytes = height // 8
+        lv = bytearray(width * height)
+        for y in range(height):
+            base = y * width
+            for x in range(width):
+                # physical column-major, columns right->left.
+                off = (width - 1 - x) * column_bytes + (y >> 3)
+                b1 = p1[off] >> (7 - (y & 7)) & 1
+                b2 = p2[off] >> (7 - (y & 7)) & 1
                 lv[base + x] = (b1 << 1) | b2
-        return lv
-    plane = rec[22:22 + 48000]
-    lv = bytearray(W * H)
-    for y in range(H):
-        base = y * W
-        for x in range(W):
+        return lv, width, height
+    plane = rec[22:22 + plane_bytes]
+    row_bytes = width // 8
+    lv = bytearray(width * height)
+    for y in range(height):
+        base = y * width
+        for x in range(width):
             # XTG: logical row-major, bit 0 = ink
-            ink = (plane[y * 60 + (x >> 3)] >> (7 - (x & 7))) & 1
+            ink = (plane[y * row_bytes + (x >> 3)] >> (7 - (x & 7))) & 1
             lv[base + x] = 3 if ink == 0 else 0
-    return lv
+    return lv, width, height
 
 
-def box_blur(flat, rad=2):
+def box_blur(flat, width, height, rad=2):
     """Separable box blur (matches plane_compare.py's metric, without its O(r^2) inner loop)."""
-    w, h = W, H
+    w, h = width, height
     tmp = [0.0] * (w * h)
     for y in range(h):
         row = y * w
@@ -104,20 +109,20 @@ def box_blur(flat, rad=2):
     return out
 
 
-def shifted_diff_count(a, b, dx, dy):
+def shifted_diff_count(a, b, width, height, dx, dy):
     """Pixels of `a` that differ from `b` when `b` is sampled at (x+dx, y+dy)."""
     n = 0
-    for y in range(0, H, 2):        # every other row: the shift test only needs a robust signal
-        ay = y * W
-        by = min(max(y + dy, 0), H - 1) * W
-        for x in range(0, W, 2):
-            if a[ay + x] != b[by + min(max(x + dx, 0), W - 1)]:
+    for y in range(0, height, 2):   # every other row: the shift test only needs a robust signal
+        ay = y * width
+        by = min(max(y + dy, 0), height - 1) * width
+        for x in range(0, width, 2):
+            if a[ay + x] != b[by + min(max(x + dx, 0), width - 1)]:
                 n += 1
     return n
 
 
-def compare(a_levels, b_levels, label, strict_level1=None):
-    n = W * H
+def compare(a_levels, b_levels, width, height, label, strict_level1=None):
+    n = width * height
     differing = 0
     max_delta = 0
     level_delta_hist = {}
@@ -136,18 +141,18 @@ def compare(a_levels, b_levels, label, strict_level1=None):
                 max_delta = d
     tone = 0.0
     if differing:
-        ba, bb = box_blur(mass_a), box_blur(mass_b)
+        ba, bb = box_blur(mass_a, width, height), box_blur(mass_b, width, height)
         tone = sum(abs(x - y) for x, y in zip(ba, bb)) / n
 
     moved = None
-    unshifted = shifted_diff_count(a_levels, b_levels, 0, 0)
+    unshifted = shifted_diff_count(a_levels, b_levels, width, height, 0, 0)
     if differing and unshifted:
         best = (0, 0, unshifted)
         for dy in range(-SHIFT_RANGE, SHIFT_RANGE + 1):
             for dx in range(-SHIFT_RANGE, SHIFT_RANGE + 1):
                 if dx == 0 and dy == 0:
                     continue
-                c = shifted_diff_count(a_levels, b_levels, dx, dy)
+                c = shifted_diff_count(a_levels, b_levels, width, height, dx, dy)
                 if c < best[2]:
                     best = (dx, dy, c)
         if best[2] < unshifted * (1 - SHIFT_GAIN_RATIO) and best[2] < unshifted * SHIFT_RESIDUAL:
@@ -233,7 +238,13 @@ def main():
     excluded = {'differing': 0, 'max_level_delta': 0, 'pages': 0}
     worst = []
     for i in indices:
-        failures, stats, _un = compare(decode_page(ref[i]), decode_page(cand[i]),
+        ref_levels, ref_width, ref_height = decode_page(ref[i])
+        cand_levels, cand_width, cand_height = decode_page(cand[i])
+        if (ref_width, ref_height) != (cand_width, cand_height):
+            bad_pages.append((i, [f'geometry differs: {ref_width}x{ref_height} vs '
+                                  f'{cand_width}x{cand_height}']))
+            continue
+        failures, stats, _un = compare(ref_levels, cand_levels, ref_width, ref_height,
                                        f'page {i}', strict)
         bucket = excluded if i in image_pages else judged
         bucket['differing'] += stats['differing']

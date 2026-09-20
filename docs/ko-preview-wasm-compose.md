@@ -1,5 +1,11 @@
 # Preview compose in WASM — implementation spec
 
+> Current profile/orientation note: this document records the original X4 portrait fast-path work.
+> The shipped API is now `ko_compose_rgba(int mono)`: it reads the engine-owned page planes and
+> returns upright logical RGBA for X4 (480×800 or 800×480) and X3 (528×792 or 792×528).
+> Profile/orientation preview/file equivalence is enforced by
+> `scripts/verify/orientation_preview_vs_file.js`; see `docs/ko-landscape-modes.md`.
+
 Target: **zero per-pixel JS work** in the preview. The worker stops unpacking planes and
 only wraps engine memory in an `ImageData` and calls `putImageData` once.
 
@@ -29,7 +35,7 @@ each access pulls a whole cache line to use one bit. No further JS tuning can fi
 
 ### 1. `src/wasm_api.cpp` (inside `extern "C"`, both `KO_EXPORT`)
 
-    uint8_t* ko_rgba_ptr();                        // 480*800*4 buffer, allocated once
+    uint8_t* ko_rgba_ptr();                        // selected profile's logical RGBA buffer
     int ko_compose_rgba(const uint8_t* bw,         // fills that buffer
                         const uint8_t* lsb,
                         const uint8_t* msb,
@@ -124,7 +130,7 @@ Only after 2 passes does the JS compose get deleted.
 
 ### 1. `src/wasm_api.cpp` (`extern "C"` 안, 둘 다 `KO_EXPORT`)
 
-    uint8_t* ko_rgba_ptr();                        // 480*800*4 버퍼, 1회 할당
+    uint8_t* ko_rgba_ptr();                        // 선택한 기기 프로파일의 논리 RGBA 버퍼
     int ko_compose_rgba(const uint8_t* bw,         // 그 버퍼를 채운다
                         const uint8_t* lsb,
                         const uint8_t* msb,

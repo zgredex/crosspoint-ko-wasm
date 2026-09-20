@@ -41,7 +41,7 @@ let api = null;            // C-export surface
 let spineCount = 0;
 // Composed-frame cache: a navigation that repeats a (spine, page, mode, spec, font) tuple
 // reuses the frame instead of re-rendering and re-composing. Bounded by bytes because a frame
-// is 1.5 MB (480*800*4) and the wasm heap is 2 GB - 128 frames is ~192 MB.
+// is about 1.6 MB (the larger X3 frame is 528*792*4) and the wasm heap is 2 GB.
 // §5: 192 MB of 1.5 MB RGBA frames was excessive — rendering a text page is sub-millisecond, so a
 // huge retrospective cache bought little and cost mobile memory. 48 MB still holds a few dozen
 // frames (plenty for flipping back and forth) and the next-page prefetch below makes the common
@@ -189,6 +189,8 @@ function defaultSpec() {
     imageDither: 2,        // blue noise
     imageToneDepth: 4,     // 2-bit until the app says otherwise
     screenMargin: 5,
+    deviceProfile: 'x4',  // CrossPoint-KO runtime panel profile: x4 or x3
+    orientation: 0,       // CrossPointSettings: 0 portrait, 1 CW, 2 inverted, 3 CCW
     // Reader face. CrossPoint-KO's own default: CrossPointSettings::
     // getReaderFontId() returns hasCustomFont() ? CUSTOM_FONT_ID : KOPUB_14_FONT_ID.
     // RIDIBatang does not exist upstream — it is an XTCKO extra, selectable but
@@ -222,27 +224,49 @@ function defaultSpec() {
 // whether or not the device has a status bar switched on, because the
 // reservation is a constant here, not a function of a UI setting.
 //
-// Net: default margins 14/8/22/8 → viewport 464x764, matching the reference
-// reader's live layout.
+// At the default screenMargin, portrait is 14/8/22/8 → X4 464x764 / X3
+// 512x756; landscape is 8/14/22/8 or 8/8/22/14 → X4 778x450 / X3 770x498.
 // ---------------------------------------------------------------------------
-const VIEWABLE_MARGIN = { top: 9, right: 3, bottom: 3, left: 3 };  // GfxRenderer::VIEWABLE_MARGIN_*
+const VIEWABLE_MARGIN = { top: 9, right: 3, bottom: 3, left: 3 };  // portrait hardware-safe margins
 const REFERENCE_STATUS_LANE = 19;   // UITheme::getStatusBarHeight() on the shipped defaults
-const SCREEN_W = 480;
-const SCREEN_H = 800;
+
+function screenFor(spec) {
+  const portrait = spec.deviceProfile === 'x3'
+    ? { width: 528, height: 792 }
+    : { width: 480, height: 800 };
+  return spec.orientation === 1 || spec.orientation === 3
+    ? { width: portrait.height, height: portrait.width }
+    : portrait;
+}
+
+function orientedViewableMargins(orientation) {
+  switch (orientation) {
+    case 1: return { top: VIEWABLE_MARGIN.left, right: VIEWABLE_MARGIN.top,
+                     bottom: VIEWABLE_MARGIN.right, left: VIEWABLE_MARGIN.bottom };
+    case 2: return { top: VIEWABLE_MARGIN.bottom, right: VIEWABLE_MARGIN.left,
+                     bottom: VIEWABLE_MARGIN.top, left: VIEWABLE_MARGIN.right };
+    case 3: return { top: VIEWABLE_MARGIN.right, right: VIEWABLE_MARGIN.bottom,
+                     bottom: VIEWABLE_MARGIN.left, left: VIEWABLE_MARGIN.top };
+    default: return VIEWABLE_MARGIN;
+  }
+}
 
 function marginsFor(spec) {
   const m = spec.screenMargin;
+  const safe = orientedViewableMargins(spec.orientation);
   return {
-    top: VIEWABLE_MARGIN.top + m,
-    right: VIEWABLE_MARGIN.right + m,
-    left: VIEWABLE_MARGIN.left + m,
-    bottom: VIEWABLE_MARGIN.bottom + Math.max(m, REFERENCE_STATUS_LANE),
+    top: safe.top + m,
+    right: safe.right + m,
+    left: safe.left + m,
+    bottom: safe.bottom + Math.max(m, REFERENCE_STATUS_LANE),
   };
 }
 
 function viewportFor(spec) {
   const mg = marginsFor(spec);
-  return { width: SCREEN_W - mg.left - mg.right, height: SCREEN_H - mg.top - mg.bottom, margins: mg };
+  const screen = screenFor(spec);
+  return { width: screen.width - mg.left - mg.right,
+           height: screen.height - mg.top - mg.bottom, margins: mg };
 }
 
 // §3: pagination depends on these fields only. Changing XTC/XTCH, the dither model or text AA
@@ -250,6 +274,7 @@ function viewportFor(spec) {
 const LAYOUT_FIELDS = [
   'lineCompression', 'paragraphAlignment', 'paragraphIndent', 'extraParagraphSpacing',
   'characterWrap', 'hyphenation', 'embeddedStyle', 'screenMargin', 'font', 'imageRendering',
+  'deviceProfile', 'orientation',
 ];
 const RENDER_FIELDS = ['textAa', 'imageDither', 'imageToneDepth'];
 function keyOf(spec, fields) {
@@ -310,7 +335,7 @@ async function getFontConverter() {
   return fontConv;
 }
 
-// Copy a 48000-byte plane from wasm heap into a JS Uint8Array.
+// Copy one selected-profile plane from wasm heap into a JS Uint8Array.
 function copyPlane(kind) {
   const ptr = api._ko_plane_ptr(kind);
   const size = api._ko_plane_size(kind);
@@ -318,17 +343,12 @@ function copyPlane(kind) {
   return new Uint8Array(api.HEAPU8.buffer.slice(ptr, ptr + size));
 }
 
-// Compose the 3 physical (800x480) planes into a logical portrait 480x800
-// grayscale image per the device decode contract:
-//   value = !ink?white : lsb?dark-grey : msb?light-grey : black
-//   logical(x,y) ← physical(phyX=y, phyY=479-x)
-const GRAY = [255, 128, 205, 0]; // white, dark-grey, light-grey, black
-
-
-// 1-bit (XTC / XTG) preview: the file stores ONLY the BW plane — no AA greys.
-// Bit 0 = black on the device; this is byte-exactly what addMonoPage() packs.
-// The pixels are composed inside the engine now: ko_compose_rgba() fills an engine-owned
-// 480x800 RGBA buffer and we wrap it as a ZERO-COPY view. No JS pixel loop exists.
+// Compose the three physical profile planes into the selected logical
+// orientation. The pixels are composed inside the engine now:
+// ko_compose_rgba() fills an engine-owned profile-sized RGBA buffer and we wrap it
+// as a ZERO-COPY view. No JS pixel loop exists. In 1-bit mode it applies the
+// same grey halftone/text-AA decision as addMonoPage(), so preview and XTG are
+// pixel-identical after the selected orientation transform.
 // The buffer can move if wasm memory grows, so the pointer is fetched AFTER composing and
 // the view is rebuilt every call. putImageData reads it synchronously, so the view stays valid.
 // tick/tock are the worker's existing stage timers; used defensively so this stays valid if
@@ -351,8 +371,14 @@ function _frameFromEngine() {
     // null pointer here must not become a view at HEAP offset 0, which is a valid address holding garbage.
     throw new Error('no committed RGBA frame: compose must succeed before reading it');
   }
-  const src = new Uint8ClampedArray(api.HEAPU8.buffer, rgbaPtr, 480 * 800 * 4);
-  const img = new ImageData(480, 800);
+  const width = api._ko_logical_width();
+  const height = api._ko_logical_height();
+  const planeBytes = api._ko_plane_size(0);
+  if (planeBytes <= 0 || width * height !== planeBytes * 8) {
+    throw new Error(`unexpected logical screen ${width}x${height} for ${planeBytes}-byte plane`);
+  }
+  const src = new Uint8ClampedArray(api.HEAPU8.buffer, rgbaPtr, width * height * 4);
+  const img = new ImageData(width, height);
   img.data.set(src);
   return img;
 }
@@ -771,20 +797,20 @@ async function applySpec(raw) {
   // fail-closed test: the first call threw correctly, and the very next exportBook still produced a
   // KoPub file — because the failed spec had already been written down.
   try {
-
-  api._ko_set_line_compression(currentSpec.lineCompression);
-  api._ko_set_paragraph_indent(currentSpec.paragraphIndent);
-  api._ko_set_character_wrap(currentSpec.characterWrap);
-  api._ko_set_paragraph_alignment(currentSpec.paragraphAlignment);
-  api._ko_set_extra_paragraph_spacing(currentSpec.extraParagraphSpacing);
-  // Firmware gates hyphenation on word-wrap mode (CrossPointSettings::readerRenderSpec):
-  // hyphenationEnabled = hyphenationEnabled && characterWrap == 0.
-  api._ko_set_hyphenation((currentSpec.hyphenation && currentSpec.characterWrap === 0) ? 1 : 0);
-  api._ko_set_embedded_style(currentSpec.embeddedStyle);
-  api._ko_set_image_rendering(currentSpec.imageRendering);
-  api._ko_set_text_aa(currentSpec.textAa);
-  api._ko_set_image_dither(currentSpec.imageDither);
-  api._ko_set_image_tone_depth(currentSpec.imageToneDepth);
+  // Validate every fallible scalar before touching engine state. This matters
+  // for profile/orientation in particular: changing renderer geometry and then
+  // failing a lazy font load must not leave the engine landscape while
+  // currentSpec rolls back to portrait.
+  if (!Number.isInteger(currentSpec.orientation) || currentSpec.orientation < 0 || currentSpec.orientation > 3) {
+    throw new Error('invalid reader orientation ' + currentSpec.orientation);
+  }
+  if (currentSpec.deviceProfile !== 'x4' && currentSpec.deviceProfile !== 'x3') {
+    throw new Error('invalid device profile ' + currentSpec.deviceProfile);
+  }
+  if (!Number.isInteger(currentSpec.screenMargin) || currentSpec.screenMargin < 5 ||
+      currentSpec.screenMargin > 40 || currentSpec.screenMargin % 5 !== 0) {
+    throw new Error('invalid reader screen margin ' + currentSpec.screenMargin);
+  }
 
   // Fetch the face before touching the engine with it: a lazily-loaded face (anything but the
   // default) may still be in flight, and `applyFont` would otherwise silently fail against a font id
@@ -807,9 +833,33 @@ async function applySpec(raw) {
     throw new Error('requested font "' + currentSpec.font + '" is not available in this engine');
   }
 
+  api._ko_set_line_compression(currentSpec.lineCompression);
+  api._ko_set_paragraph_indent(currentSpec.paragraphIndent);
+  api._ko_set_character_wrap(currentSpec.characterWrap);
+  api._ko_set_paragraph_alignment(currentSpec.paragraphAlignment);
+  api._ko_set_extra_paragraph_spacing(currentSpec.extraParagraphSpacing);
+  // Firmware gates hyphenation on word-wrap mode (CrossPointSettings::readerRenderSpec):
+  // hyphenationEnabled = hyphenationEnabled && characterWrap == 0.
+  api._ko_set_hyphenation((currentSpec.hyphenation && currentSpec.characterWrap === 0) ? 1 : 0);
+  api._ko_set_embedded_style(currentSpec.embeddedStyle);
+  api._ko_set_image_rendering(currentSpec.imageRendering);
+  api._ko_set_text_aa(currentSpec.textAa);
+  api._ko_set_image_dither(currentSpec.imageDither);
+  api._ko_set_image_tone_depth(currentSpec.imageToneDepth);
+
+  const deviceCode = currentSpec.deviceProfile === 'x3' ? 3 : 4;
+  if (api._ko_set_device_profile(deviceCode) !== 0) {
+    throw new Error('invalid device profile ' + currentSpec.deviceProfile);
+  }
+
+  if (api._ko_set_orientation(currentSpec.orientation) !== 0) {
+    throw new Error('invalid reader orientation ' + currentSpec.orientation);
+  }
+
   if (lk !== lkBefore) {
-    const mg = marginsFor(currentSpec);
-    api._ko_set_margins(mg.top, mg.right, mg.bottom, mg.left);
+    if (api._ko_set_screen_margin(currentSpec.screenMargin) !== 0) {
+      throw new Error('invalid reader screen margin ' + currentSpec.screenMargin);
+    }
     COUNTERS.layoutApplies += 1;
   }
   if (rk !== rkBefore) clearFrameCache();  // frames are keyed by render key: old ones are dead weight
@@ -821,13 +871,17 @@ async function applySpec(raw) {
   }
 }
 
-// Margins/viewport for the readout. The firmware's own arithmetic: viewable margins + screenMargin
-// on all four sides, no UI reserve. Shared by the spec and render replies.
+// Margins/viewport for the readout. The firmware's own arithmetic: oriented
+// viewable margins + screenMargin, with its 19 px status-lane reservation at
+// logical bottom. Shared by the spec and render replies.
 function viewportInfo(spec) {
   const mg = marginsFor(spec);
+  const screen = screenFor(spec);
   return {
     margins: mg,
-    viewport: { width: SCREEN_W - mg.left - mg.right, height: SCREEN_H - mg.top - mg.bottom },
+    screen,
+    viewport: { width: screen.width - mg.left - mg.right,
+                height: screen.height - mg.top - mg.bottom },
   };
 }
 
@@ -1399,6 +1453,7 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
   const composeMs = performance.now() - tCompose0;
   const gen = sectionGen;
   const tx = frame.data.buffer;
+  const vpInfo = viewportInfo(currentSpec);
   finishWorkerBookLoad();
   post(id, true, {
     bookGen,                       // stage 7: the generation of the book this frame belongs to
@@ -1409,6 +1464,11 @@ async function handleOpenPreview(ev, id, initWaitMs, earlyRead, t0Open) {
     pages,
     total: Math.max(pages, api._ko_spine_pages_estimated ? api._ko_spine_pages_estimated() : pages),
     image: tx,
+    width: frame.width,
+    height: frame.height,
+    screen: vpInfo.screen,
+    viewport: vpInfo.viewport,
+    margins: vpInfo.margins,
     mono: wantMono,
     cached: false,
     // The first frame states whether the build is finished, so navigation never has to guess from an
@@ -1653,8 +1713,10 @@ case 'openPreview': {
           const reply = new Uint8ClampedArray(cachedFrame.data.length);
           reply.set(cachedFrame.data);
           post(id, true, { page, pages: currentPages, image: reply.buffer, mono: wantMono, cached: true,
+                           width: api._ko_logical_width(), height: api._ko_logical_height(),
                            sectionComplete: est.complete === true,
                            timing: renderTiming(tRender0, 0, 0, 0, true, null),
+                           screen: vpInfo ? vpInfo.screen : null,
                            viewport: vpInfo ? vpInfo.viewport : null,
                            margins: vpInfo ? vpInfo.margins : null },
                [reply.buffer]);
@@ -1686,11 +1748,13 @@ case 'openPreview': {
         // §2: user-visible work is finished — send it NOW. The prefetch is speculative and must never
         // delay the requested frame (it used to run between compose() and post()).
         post(id, true, { page, pages: currentPages, image: tx, mono: wantMono,
+                         width: img.width, height: img.height,
                          // `pages` is what EXISTS (navigation clamps to it); `total` is what to display —
                          // a giant spine still building knows its estimate, not its final count.
                          total: est.complete ? currentPages : Math.max(est.estimated || 0, currentPages),
                          sectionComplete: !!est.complete,
                          timing: renderTiming(tRender0, buildMs, renderMs, composeMs, false, imgPerf),
+                         screen: vpInfo ? vpInfo.screen : null,
                          viewport: vpInfo ? vpInfo.viewport : null,
                          margins: vpInfo ? vpInfo.margins : null }, [tx]);
         if (continuation) continueSection(continuation.spine, continuation.gen, BUILD_CHUNK);

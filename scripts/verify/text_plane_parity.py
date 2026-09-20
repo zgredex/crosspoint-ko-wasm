@@ -18,17 +18,18 @@ rectangles instead of the pages keeps the exemption exactly as large as the thin
 differ.
 
 COORDINATE SYSTEM — the thing this file got wrong for one revision. The dumped `.bw/.lsb/.msb`
-vectors are NOT a logical 480x800 portrait image with 60 bytes per row. They are the raw PHYSICAL
-800x480 framebuffer with 100 bytes per row, dumped verbatim from RenderedPage (see
-src/ko_engine_driver.h: "Page-plane capture after the 3-pass render, in PHYSICAL (800x480) layout").
-The logical portrait buffer is what the XTH/XTG encoder builds from them (src/xtch_writer.h), and its
-byte layout is a different thing entirely. Both are 48000 bytes, which is why nothing caught it.
+vectors are NOT logical portrait images. They are raw PHYSICAL framebuffers: X4 is 800x480 at
+100 bytes/row; X3 is 792x528 at 99 bytes/row. The geometry is read from the layout manifest, which
+the host snapshots from the selected Korean-fork display profile. The logical portrait buffer is
+what the XTH/XTG encoder builds from them (src/xtch_writer.h), and its byte layout is different.
 
 Two conversions are therefore mandatory before a manifest rectangle can be used as a mask:
 
   1. the manifest's image x/y are PAGE-LOCAL; rendering adds marginLeft/marginTop
      (PageImage::render -> imageBlock->render(renderer, xPos + xOffset, yPos + yOffset));
-  2. logical -> physical is a rotation: phyX = logicalY, phyY = 479 - logicalX.
+  2. logical -> physical uses the selected Korean-fork orientation transform.
+     Portrait is phyX=logicalY, phyY=physicalHeight-1-logicalX; landscape CW/CCW and
+     inverted portrait use GfxRenderer::rotateCoordinates verbatim below.
 
 Measured on web/demo-images.epub over all 45 pairs of the ten dither models: with the corrected mapping,
 changing --image-dither moves 0 pixel bits outside the image rectangles, and 0 bits on pages the manifest
@@ -55,14 +56,6 @@ from collections import Counter
 
 PLANES = ('.bw', '.lsb', '.msb')
 
-# PHYSICAL framebuffer geometry — what RenderedPage holds and host_main.cpp dumps.
-# 800 px wide (100 bytes) by 480 px tall. A pixel's byte index is py * ROW_BYTES + px // 8 and its
-# bit is 7 - (px % 8) in all three planes. Both geometries are 48000 bytes, so a size check alone
-# cannot tell them apart; the rotation below is what makes the mask correct.
-PHYS_WIDTH, PHYS_HEIGHT, ROW_BYTES = 800, 480, 100
-PLANE_BYTES = ROW_BYTES * PHYS_HEIGHT
-
-
 def page_files(directory):
     """(spine, page) -> {suffix: path} for one dumped plane directory."""
     found = {}
@@ -82,26 +75,48 @@ def page_files(directory):
     return found
 
 
-def rect_to_physical(r, margin_top, margin_left):
+def logical_to_physical(x, y, orientation, geometry):
+    """CrossPoint-KO GfxRenderer::rotateCoordinates, verbatim as integer math."""
+    physical_width, physical_height, _row_bytes, _plane_bytes = geometry
+    if orientation == 1:      # LandscapeClockwise
+        return physical_width - 1 - x, physical_height - 1 - y
+    if orientation == 2:      # PortraitInverted
+        return physical_width - 1 - y, x
+    if orientation == 3:      # LandscapeCounterClockwise
+        return x, y
+    return y, physical_height - 1 - x
+
+
+def rect_to_physical(r, margin_top, margin_left, orientation, geometry):
     """A manifest image rect -> the PHYSICAL span it covers, or None if it is empty/off-panel.
 
     manifest x/y are page-local logical coordinates; rendering offsets them by the margins. The
-    logical portrait page is then rotated into the physical framebuffer:
-        phyX = logicalY        py spans PHYS_HEIGHT - lx1 .. PHYS_HEIGHT - lx0
-        phyY = 479 - logicalX  px spans ly0 .. ly1
+    logical page is then rotated into the physical framebuffer by the selected
+    CrossPoint-KO orientation.
     """
     lx0 = int(r['x']) + margin_left
     ly0 = int(r['y']) + margin_top
     lx1 = lx0 + int(r['w'])
     ly1 = ly0 + int(r['h'])
-    px0, px1 = max(0, ly0), min(PHYS_WIDTH, ly1)
-    py0, py1 = max(0, PHYS_HEIGHT - lx1), min(PHYS_HEIGHT, PHYS_HEIGHT - lx0)
+    physical_width, physical_height, _row_bytes, _plane_bytes = geometry
+    logical_width, logical_height = ((physical_width, physical_height)
+                                     if orientation in (1, 3)
+                                     else (physical_height, physical_width))
+    lx0, lx1 = max(0, lx0), min(logical_width, lx1)
+    ly0, ly1 = max(0, ly0), min(logical_height, ly1)
+    if lx1 <= lx0 or ly1 <= ly0:
+        return None
+    corners = [logical_to_physical(x, y, orientation, geometry)
+               for x, y in ((lx0, ly0), (lx1 - 1, ly0),
+                            (lx0, ly1 - 1), (lx1 - 1, ly1 - 1))]
+    px0, px1 = min(x for x, _ in corners), max(x for x, _ in corners) + 1
+    py0, py1 = min(y for _, y in corners), max(y for _, y in corners) + 1
     if px1 <= px0 or py1 <= py0:
         return None
     return px0, px1, py0, py1
 
 
-def exempt_rows(rects, margin_top, margin_left):
+def exempt_rows(rects, margin_top, margin_left, orientation, geometry):
     """py -> list of (first_byte, last_byte_exclusive, first_px, last_px) to blank out.
 
     Interior bytes of a rectangle are exempt in full; the two boundary bytes carry a bit mask so the
@@ -109,7 +124,7 @@ def exempt_rows(rects, margin_top, margin_left):
     """
     rows = {}
     for r in rects:
-        span = rect_to_physical(r, margin_top, margin_left)
+        span = rect_to_physical(r, margin_top, margin_left, orientation, geometry)
         if span is None:
             continue
         px0, px1, py0, py1 = span
@@ -125,11 +140,12 @@ def exempt_rows(rects, margin_top, margin_left):
     return out
 
 
-def text_only(data, exempt):
+def text_only(data, exempt, geometry):
     """Return a copy of one plane with only the image pixels blanked, so the text bits can be compared."""
+    _physical_width, _physical_height, row_bytes, _plane_bytes = geometry
     buf = bytearray(data)
     for py, entries in exempt.items():
-        row = py * ROW_BYTES
+        row = py * row_bytes
         for b0, b1, px0, px1 in entries:
             if b1 - b0 > 2:
                 buf[row + b0 + 1: row + b1 - 1] = b'\x00' * (b1 - b0 - 2)   # interior bytes, in full
@@ -144,7 +160,7 @@ def text_only(data, exempt):
 
 
 def load_manifest(path):
-    """(pages, margin_top, margin_left, geometry_problems[]).
+    """(pages, margin_top, margin_left, orientation, geometry, problems[]).
 
     The margins are required, not defaulted: a manifest without them cannot be mapped into the
     physical planes, and silently substituting 0 would mask a region the image does not occupy —
@@ -167,8 +183,32 @@ def load_manifest(path):
     if not margins or len(margins) != 4:
         problems.append('manifest has no usable "margins" [top, right, bottom, left]; the image '
                         'rectangles are page-local and cannot be mapped without them')
-        return pages, 0, 0, problems
-    return pages, int(margins[0]), int(margins[3]), problems
+        return pages, 0, 0, 0, (0, 0, 0, 0), problems
+    orientation = int(doc.get('orientation', 0))
+    if orientation not in (0, 1, 2, 3):
+        problems.append(f'manifest has invalid orientation {orientation}')
+        orientation = 0
+    panel = doc.get('physicalPanel')
+    plane_bytes = int(doc.get('planeBytes', 0))
+    if not panel or len(panel) != 2:
+        problems.append('manifest has no usable "physicalPanel" [width, height]')
+        physical_width = physical_height = 0
+    else:
+        physical_width, physical_height = int(panel[0]), int(panel[1])
+    if physical_width <= 0 or physical_width % 8 != 0 or physical_height <= 0:
+        problems.append(f'invalid physical panel {physical_width}x{physical_height}; width must be byte-aligned')
+    row_bytes = physical_width // 8 if physical_width > 0 else 0
+    expected_plane_bytes = row_bytes * physical_height
+    if plane_bytes != expected_plane_bytes:
+        problems.append(f'manifest planeBytes={plane_bytes}, expected {expected_plane_bytes} from '
+                        f'physical panel {physical_width}x{physical_height}')
+    screen = doc.get('screen')
+    expected_screen = ([physical_width, physical_height] if orientation in (1, 3)
+                       else [physical_height, physical_width])
+    if screen != expected_screen:
+        problems.append(f'manifest screen={screen}, expected {expected_screen} for orientation {orientation}')
+    geometry = (physical_width, physical_height, row_bytes, plane_bytes)
+    return pages, int(margins[0]), int(margins[3]), orientation, geometry, problems
 
 
 def compare(port_dir, oracle_dir, manifest_path):
@@ -180,7 +220,8 @@ def compare(port_dir, oracle_dir, manifest_path):
     """
     problems = []
     image_page_findings = []
-    pages, margin_top, margin_left, problems = load_manifest(manifest_path)
+    pages, margin_top, margin_left, orientation, geometry, problems = load_manifest(manifest_path)
+    physical_width, physical_height, row_bytes, plane_bytes = geometry
     expected = {(int(p['spine']), int(p['page'])) for p in pages}
     rects_for = {(int(p['spine']), int(p['page'])): (p.get('images') or []) for p in pages}
 
@@ -203,7 +244,7 @@ def compare(port_dir, oracle_dir, manifest_path):
     for key in sorted(expected):
         rects = rects_for.get(key, [])
         exempt_pixels += sum(max(0, int(r['w'])) * max(0, int(r['h'])) for r in rects)
-        exempt = exempt_rows(rects, margin_top, margin_left)
+        exempt = exempt_rows(rects, margin_top, margin_left, orientation, geometry)
         checked += 1
         for suffix in PLANES:
             a = port.get(key, {}).get(suffix)
@@ -213,10 +254,10 @@ def compare(port_dir, oracle_dir, manifest_path):
                 continue
             pa = open(a, 'rb').read()
             pb = open(b, 'rb').read()
-            if len(pa) != PLANE_BYTES or len(pb) != PLANE_BYTES:
+            if len(pa) != plane_bytes or len(pb) != plane_bytes:
                 problems.append(f'spine {key[0]} page {key[1]}: {suffix} is {len(pa)}/{len(pb)} bytes, '
-                                f'expected {PLANE_BYTES} (physical {PHYS_WIDTH}x{PHYS_HEIGHT}, '
-                                f'{ROW_BYTES} bytes/row)')
+                                f'expected {plane_bytes} (physical {physical_width}x{physical_height}, '
+                                f'{row_bytes} bytes/row)')
                 continue
             if pa == pb:
                 continue
@@ -224,7 +265,7 @@ def compare(port_dir, oracle_dir, manifest_path):
                 differing = sum(1 for x, y in zip(pa, pb) if x != y)
                 problems.append(f'spine {key[0]} page {key[1]}: {suffix} differs in {differing} text byte(s)')
                 continue
-            ta, tb = text_only(pa, exempt), text_only(pb, exempt)
+            ta, tb = text_only(pa, exempt, geometry), text_only(pb, exempt, geometry)
             if ta != tb:
                 differing = sum(1 for x, y in zip(ta, tb) if x != y)
                 # Differences OUTSIDE the image rectangles on a page that holds an image. Reported
@@ -244,7 +285,8 @@ def self_control(port_dir, oracle_dir, manifest_path):
     Prefers an image-free page; if every page carries an image it falls back to a page with images and
     flips a bit outside the rectangles, which is the harder case and still must be caught.
     """
-    pages, margin_top, margin_left, _problems = load_manifest(manifest_path)
+    pages, margin_top, margin_left, orientation, geometry, _problems = load_manifest(manifest_path)
+    _physical_width, _physical_height, row_bytes, _plane_bytes = geometry
     keys = [(int(p['spine']), int(p['page'])) for p in pages]
     rects_for = {(int(p['spine']), int(p['page'])): (p.get('images') or []) for p in pages}
     target = next((k for k in keys if not rects_for.get(k)), None)
@@ -262,9 +304,9 @@ def self_control(port_dir, oracle_dir, manifest_path):
         if not raw:
             print('  CONTROL VOID: the victim plane is empty', file=sys.stderr)
             return 1
-        exempt = exempt_rows(rects_for.get(target, []), margin_top, margin_left)
+        exempt = exempt_rows(rects_for.get(target, []), margin_top, margin_left, orientation, geometry)
         # Choose a byte the text owns, so the control exercises the mask rather than the exemption.
-        masked = {py * ROW_BYTES + b for py, entries in exempt.items()
+        masked = {py * row_bytes + b for py, entries in exempt.items()
                   for b0, b1, _px0, _px1 in entries for b in range(b0, b1)}
         available = [i for i in range(len(raw)) if i not in masked]
         idx = available[len(available) // 2] if available else len(raw) // 2

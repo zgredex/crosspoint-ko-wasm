@@ -91,8 +91,8 @@ Engine files under `lib/Epub/`, `lib/EpdFont/`, `lib/GfxRenderer/`: **168**
 
 | | count | how it is checked |
 |---|---|---|
-| byte-identical to the reference | 155 | Git blob hash |
-| divergent (audited) | 12 | per-function bodies + line survival |
+| byte-identical to the reference | 148 | Git blob hash |
+| divergent (audited) | 16 | per-function bodies + line survival |
 | absent from the port | 1 | headers only, listed |
 
 ### Divergent files
@@ -109,8 +109,8 @@ Engine files under `lib/Epub/`, `lib/EpdFont/`, `lib/GfxRenderer/`: **168**
 | `lib/Epub/Epub/converters/PngToFramebufferConverter.cpp` | amended | +148/−90 | 3 | 2 | 4 | — |
 | `lib/Epub/Epub/css/CssParser.cpp` | amended | +0/−19 | 2 | 0 | 0 | — |
 | `lib/GfxRenderer/Bitmap.cpp` | amended | +2/−2 | 1 | 0 | 0 | — |
-| `lib/GfxRenderer/GfxRenderer.cpp` | amended | +186/−2 | 2 | 6 | 0 | 13/13 identical |
-| `lib/GfxRenderer/GfxRenderer.h` | **additive** | +55/−0 | 0 | 0 | 0 | — |
+| `lib/GfxRenderer/GfxRenderer.cpp` | amended | ≥+186/−2 | 3 | 6 | 0 | 13/13 identical |
+| `lib/GfxRenderer/GfxRenderer.h` | **additive** | ≥+55/−0 | 0 | 0 | 0 | — |
 
 Read the `kind` column as the strong claim it is: `additive` means **no reference line is
 missing** from the port's copy, which is the only check that also covers inline definitions
@@ -118,7 +118,10 @@ in headers (an extractor never sees those, which is why `setRenderMode()` — a 
 class scope in `GfxRenderer.h` — is covered by line survival rather than by the function
 comparer).
 
-The two functions that genuinely changed inside `GfxRenderer.cpp`:
+The three functions that genuinely changed inside `GfxRenderer.cpp`:
+
+- `begin` — retains the pinned runtime width/height/stride/buffer queries verbatim, and first releases
+  only port-added geometry-sized scratch so a live X4↔X3 profile switch cannot reuse the old size.
 
 - `renderCharScaled` — two `captureAgnostic()` calls added beside `drawPixel()`; the drawing
   is untouched, the calls only feed the port's gray-level scratch.
@@ -399,8 +402,8 @@ Stated rather than glossed:
 - **Fixture list is not exhaustive**: one generated Korean prose book per layout feature and
   three real books. Books that trip CJK edge cases not present here are exactly what the
   `ko-*.epub` fixtures were built to make cheap to extend.
-- **Orientation** — the firmware's four orientation modes remain parked; the export is
-  portrait only.
+- **Portrait-inverted UI** — the engine/API/CLI support all four firmware orientation values, while
+  the web UI intentionally exposes portrait plus the two useful landscape holding directions.
 - **Reference-internal state the host cannot reproduce**: PXC pixel cache behaviour
   (`.pxc` files on SD) and `SdFont`'s device caches. Both are I/O strategies; neither
   changes layout, and both are listed as amended in the pin.
@@ -518,18 +521,20 @@ proven identical.
 
 #### The mask was in the wrong coordinate system for one revision
 
-The dumped `.bw/.lsb/.msb` vectors are the raw **PHYSICAL 800x480 framebuffer at 100 bytes per row** —
-`RenderedPage` says so in as many words and `host_main.cpp` dumps those vectors verbatim. They are *not*
-a logical 480x800 portrait page at 60 bytes per row; the logical portrait buffer is what the XTH/XTG
-encoder *builds from* them (`src/xtch_writer.h`), a different layout entirely. **Both are 48000 bytes**,
-so no size check can tell them apart, and the comparator silently masked the wrong region.
+The dumped `.bw/.lsb/.msb` vectors are raw physical framebuffers—X4 is 800×480 at 100 bytes per
+row and X3 is 792×528 at 99 bytes per row. `host_main.cpp` dumps those vectors verbatim. They are
+*not* logical portrait records; the profile-sized XTH/XTG record is what the encoder builds from
+them (`src/xtch_writer.h`), with a different layout. For X4 both layouts happen to be 48,000 bytes,
+so the old size check could not expose the bad coordinate assumption.
 
 Two conversions have to happen before a manifest rectangle names a region of the dump:
 
 1. the manifest's image `x`/`y` are **page-local**; rendering adds the margins — `PageImage::render` calls
    `imageBlock->render(renderer, xPos + xOffset, yPos + yOffset)` with `xOffset = marginLeft`,
    `yOffset = marginTop`;
-2. **logical → physical is a rotation**: `phyX = logicalY`, `phyY = 479 − logicalX` (row stride 100).
+2. **logical → physical uses the selected renderer orientation and profile geometry**. Portrait is
+   `phyX = logicalY`, `phyY = physicalHeight − 1 − logicalX`; the comparator applies the pinned
+   fork's CW, inverted, and CCW transforms for the other values.
 
 #### The measurement that declared the assumption false was an artefact of that error
 

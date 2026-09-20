@@ -90,7 +90,7 @@ of this work, which confirms nothing else moved. An image-dominated book
 | `screenMargin` (5–40 step 5, default 5) | `SCREEN_MARGIN_*` | same | exact |
 | `focusReadingEnabled` | forced **0** in the KO build | hardcoded 0 | exact |
 | `fontId` | `hasCustomFont() ? CUSTOM : KOPUB_14_FONT_ID` | same — KoPub Batang 14 | exact (RIDIBatang 14 kept as an XTCKO extra) |
-| `orientation` (4 modes) | remaps viewable margins; swaps 480×800 ↔ 800×480 | portrait only | **parked** |
+| `orientation` (4 modes) | remaps viewable margins; swaps 480×800 ↔ 800×480 | same renderer transforms and margins; web UI exposes both landscape directions | exact |
 | `fontPointSize`, `fontFamily` | inert in the KO build (font comes from `getReaderFontId()`) | n/a | exact |
 | status bar, sleep, buttons, clock, theme, tilt, touch | device UI / hardware | absent | exact (see §5) |
 
@@ -110,6 +110,9 @@ viewport = screen − (left + right, top + bottom)
 Default margin 5 → `14 / 8 / 22 / 8` → **464 × 764 px** (statusBarHeight = 19 at the shipped
 defaults, see §5). The port now follows this exactly — `ko::geom::referenceMargins()` in
 `src/ko_engine_driver.h` and `marginsFor()` in `web/ko.worker.js` are the same arithmetic.
+In landscape, the safe margins rotate before the logical-bottom status lane is added: clockwise is
+`8 / 14 / 22 / 8`, counter-clockwise is `8 / 8 / 22 / 14`. X4's landscape viewport is
+**778 × 450 px**; X3's is **770 × 498 px**. X3 portrait is **512 × 756 px** at the same defaults.
 The earlier `14 / 8 / 8 / 8` → 464 × 778 divergence is gone; see
 `docs/ko-oracle-conformance.md` §6 for the measurement and why the reservation is safe to
 bake into page geometry.
@@ -245,7 +248,7 @@ return static_cast<int>(getLineHeight(fontId) * compression);          // 절사
 | `screenMargin` (5–40, 간격 5, 기본 5) | `SCREEN_MARGIN_*` | 동일 | 정확 |
 | `focusReadingEnabled` | 한국어 빌드에서 **0**으로 고정 | 0 하드코딩 | 정확 |
 | `fontId` | `hasCustomFont() ? CUSTOM : KOPUB_14_FONT_ID` | 동일 — KoPub 바탕 14 | 정확 (RIDIBatang 14는 XTCKO 추가 글꼴) |
-| `orientation` (4개 모드) | 가시 영역 여백 재매핑, 480×800 ↔ 800×480 교체 | 세로 모드만 | **보류** |
+| `orientation` (4개 모드) | 가시 영역 여백 재매핑, 480×800 ↔ 800×480 교체 | 동일한 렌더러 변환·여백; 웹 UI는 두 가로 방향 제공 | 정확 |
 | `fontPointSize`, `fontFamily` | 한국어 빌드에서 무효 (`getReaderFontId()`가 글꼴 결정) | 해당 없음 | 정확 |
 | 상태 표시줄, 슬립, 버튼, 시계, 테마, 기울기, 터치 | 기기 UI / 하드웨어 | 없음 | 정확 (§5 참고) |
 

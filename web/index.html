@@ -8,7 +8,7 @@
 <meta property="og:title" content="XTCKO — EPUB → XTC 변환기">
 <meta property="og:description" content="KO 포크 조판 규칙을 따르는 EPUB → XTC 변환기. 모든 변환이 브라우저에서 실행됩니다.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f172a'/%3E%3Cpath d='M9 9l14 14M23 9L9 23' stroke='%23e8eaf0' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=103">
+<link rel="stylesheet" href="style.css?v=105">
 </head>
 <body data-app-state="empty">
 
@@ -40,7 +40,7 @@
       </p>
       <p class="pickedFile" id="pickedFile" hidden></p>
       <p class="privacy">파일은 서버에 업로드되지 않습니다. 모든 변환은 이 브라우저에서 처리됩니다.</p>
-      <p class="dropMeta">EPUB 2/3 · DRM 없는 파일 · 480×800 기기용 XTC / XTCH</p>
+      <p class="dropMeta">EPUB 2/3 · DRM 없는 파일 · X4 480×800 / X3 528×792 XTC·XTCH</p>
     </div>
   </section>
 </main>
@@ -70,7 +70,7 @@
       </label>
       <button id="coverBtn" class="btn secondary small" title="책 표지 보기" disabled>표지</button>
       <label class="tbField scaleCtrl"
-             title="화면 확대 전용 — 다시 렌더링하지 않습니다. 100%에서 창에 맞고, 100%를 넘으면 확대됩니다(스크롤로 이동). 내보내는 파일은 언제나 480×800 기기 픽셀입니다.">
+             title="화면 확대 전용 — 다시 렌더링하지 않습니다. 100%에서 창에 맞고, 100%를 넘으면 확대됩니다(스크롤로 이동). 파일은 선택한 X4/X3 기기의 세로 패널 크기로 저장됩니다.">
         <span class="tbLabel">배율</span>
         <input type="range" id="zoom" min="50" max="400" value="100" aria-label="미리보기 배율">
         <output id="zoomOut">100%</output>
@@ -217,6 +217,26 @@
 
     <section class="card">
       <h2>페이지</h2>
+      <label class="ctrl" title="CrossPoint-KO와 FreeInk가 런타임에 선택하는 실제 패널 프로파일입니다.">
+        <span>기기</span>
+        <select id="deviceProfile">
+          <option value="x4" selected>Xteink X4 · 480×800</option>
+          <option value="x3">Xteink X3 · 528×792</option>
+        </select>
+      </label>
+      <label class="ctrl" title="KO 포크의 읽기 방향과 같은 좌표 변환·안전 여백으로 본문을 다시 조판합니다.">
+        <span>읽기 방향</span>
+        <select id="orientation">
+          <option value="0" selected>세로</option>
+          <option value="1">가로 · 시계 방향</option>
+          <option value="3">가로 · 반시계 방향</option>
+        </select>
+      </label>
+      <details class="help">
+        <summary aria-label="읽기 방향 도움말">?</summary>
+        <p class="hint">CrossPoint-KO의 두 가로 모드를 그대로 사용합니다. 본문은 X4의 800×480 또는 X3의 792×528 가로 좌표에서 다시 조판되고, 비대칭 안전 여백도 방향에 맞춰 회전합니다. XTC/XTCH 레코드는 선택한 기기의 세로 크기(X4 480×800, X3 528×792)로 저장됩니다.</p>
+      </details>
+
       <label class="ctrl">
         <span>화면 여백</span>
         <input type="range" id="screenMargin" min="5" max="40" step="5" value="5" aria-label="화면 여백">
@@ -297,8 +317,10 @@
           본문 글꼴: KoPub Batang 14(기본, getReaderFontId 기본값, advanceY 32), RIDIBatang 14(XTCKO 추가, advanceY 38),
           사용자 .epdfont(OTF/TTF 변환). 줄 높이는 펌웨어 값(반올림):
           KoPub 14는 32/38/45 px, RIDIBatang 14는 38/46/53 px (좁게/보통/넓게)<br>
-          쪽 여백은 리더 계산식 그대로입니다: 가시 영역 9/3/3/3 + screenMargin,
-          아래는 max(screenMargin, 상태 표시줄 19 px). 기본값 14/8/22/8 → 본문 영역 464×764.
+          쪽 여백은 리더 계산식 그대로입니다: 가시 영역 9/3/3/3을 읽기 방향에 맞춰 회전한 뒤 screenMargin을 더하고,
+          논리 화면 아래는 max(screenMargin, 상태 표시줄 19 px)입니다. 기본 세로 14/8/22/8 →
+          X4 464×764, X3 512×756. 가로 시계 방향 8/14/22/8 및 반시계 방향 8/8/22/14 →
+          X4 778×450, X3 770×498.
           상태 표시줄 영역은 <b>예약만</b> 하고 페이지에 그려 넣지 않습니다 — 기기가 읽을 때 자체 크롬을 합성합니다.
         </p>
       </details>
@@ -334,7 +356,7 @@
       </label>
 
       <p class="hint" id="viewportOut"
-         title="내보내는 모든 페이지의 본문 영역: 480×800 화면에서 보기 여백과 여백 설정을 뺀 값. 상태 표시줄도 크롬도 없습니다 — 파일에는 UI가 들어가지 않고, 기기가 읽을 때 자체 UI를 합성합니다."></p>
+         title="선택한 논리 화면에서 안전 여백·화면 여백·상태 표시줄 예약 영역을 뺀 본문 영역입니다. 파일에는 UI가 들어가지 않고, 기기가 읽을 때 자체 UI를 합성합니다."></p>
     </section>
     </div><!-- /.sidebarScroll -->
 
@@ -350,6 +372,6 @@
   </aside>
 </main>
 
-<script src="app.js?v=103"></script>
+<script src="app.js?v=105"></script>
 </body>
 </html>

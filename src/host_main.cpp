@@ -45,6 +45,8 @@ int main(int argc, char** argv) {
             "usage: %s <book.epub> [out.xtch] [--1bit] [--image-dither N] [--image-dither-name NAME]\n"
             "          [--text-aa|--no-text-aa] [--font kopub|ridibatang] [--kopub-external blob]\n"
             "          [--external-font kopub|ridibatang blob] [--no-kern]\n"
+            "          [--device x4|x3] (or --device=x4|x3)\n"
+            "          [--orientation portrait|landscape-cw|inverted|landscape-ccw]\n"
             "          [--screen-margin N | --margin-bottom N]\n"
             "[--manifest PATH] [--dump-planes DIR] [--max-pages N] [--external] [--drop-gray-planes] [--read-helpers] [--fail-render S:P]\n",
             argv[0]);
@@ -58,6 +60,23 @@ int main(int argc, char** argv) {
   // memory cost it never pays. Everything else still reads the file the ordinary way.
   bool preExternal = false;
   for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--external") preExternal = true;
+
+  // CrossPoint-KO selects the X3 FreeInk profile before display.begin(), then
+  // GfxRenderer::begin() reads the profile's runtime panel dimensions. Mirror
+  // that ordering exactly; this cannot be a late canvas-size override.
+  ko::DeviceProfile deviceProfile = ko::DeviceProfile::X4;
+  for (int i = 1; i < argc; i++) {
+    const std::string arg = argv[i];
+    if ((arg == "--device" && i + 1 < argc) || arg.rfind("--device=", 0) == 0) {
+      const std::string name = arg == "--device" ? argv[++i] : arg.substr(strlen("--device="));
+      if (name == "x3" || name == "X3") deviceProfile = ko::DeviceProfile::X3;
+      else if (name == "x4" || name == "X4") deviceProfile = ko::DeviceProfile::X4;
+      else {
+        fprintf(stderr, "unknown device '%s' (x4|x3)\n", name.c_str());
+        return 2;
+      }
+    }
+  }
 
   FILE* f = fopen(epubPath.c_str(), "rb");
   if (!f) { fprintf(stderr, "cannot open %s\n", epubPath.c_str()); return 1; }
@@ -73,6 +92,7 @@ int main(int argc, char** argv) {
   }
   fclose(f);
 
+  display.setDeviceProfile(deviceProfile);
   display.begin();
   GfxRenderer renderer(display);
   renderer.begin();
@@ -301,6 +321,7 @@ int main(int argc, char** argv) {
 
   bool noKern = false;
   ko::Spec spec;
+  spec.deviceProfile = deviceProfile;
   // Verification plumbing (host-only): layout manifest, plane dumps, page cap.
   std::string manifestPath;
   std::string planesDir;
@@ -308,6 +329,7 @@ int main(int argc, char** argv) {
   std::string oracleRepo, oracleCommit, oracleBranch;
 
   ko::XtchWriter writer;
+  writer.setDeviceProfile(deviceProfile);
   // Output-mode flags, for verifying the 1-bit path (the web app sets the same mode
   // through ko_set_output_mode).
   // Images are dithered to 4 levels in 2-bit output and to 2 levels in 1-bit output in
@@ -334,6 +356,21 @@ int main(int argc, char** argv) {
     else if (flag == "--no-text-aa") spec.textAntiAliasing = 0;
     else if (flag == "--text-aa") spec.textAntiAliasing = 1;
     else if (flag == "--no-kern") noKern = true;
+    else if (flag == "--landscape-cw") spec.applyOrientation(ko::LANDSCAPE_CW);
+    else if (flag == "--landscape-ccw") spec.applyOrientation(ko::LANDSCAPE_CCW);
+    else if (flag == "--portrait-inverted") spec.applyOrientation(ko::PORTRAIT_INVERTED);
+    else if (flag == "--orientation" && i + 1 < argc) {
+      const std::string name = argv[++i];
+      if (name == "portrait") spec.applyOrientation(ko::PORTRAIT);
+      else if (name == "landscape-cw") spec.applyOrientation(ko::LANDSCAPE_CW);
+      else if (name == "inverted" || name == "portrait-inverted") spec.applyOrientation(ko::PORTRAIT_INVERTED);
+      else if (name == "landscape-ccw") spec.applyOrientation(ko::LANDSCAPE_CCW);
+      else {
+        fprintf(stderr, "unknown orientation '%s' (portrait|landscape-cw|inverted|landscape-ccw)\n",
+                name.c_str());
+        return 2;
+      }
+    }
     else if (flag == "--screen-margin" && i + 1 < argc) {
       // The reference reader's own knob: all four margins are a function of it.
       const int m = std::atoi(argv[++i]);
@@ -425,9 +462,14 @@ int main(int argc, char** argv) {
 
   // Geometry last: every flag that can move a margin has been parsed, and the
   // viewport is always derived from the margins (never set on its own).
+  ko::applyReaderOrientation(renderer, spec.orientation);
   spec.viewportWidth = static_cast<uint16_t>(renderer.getScreenWidth() - spec.marginLeft - spec.marginRight);
   spec.viewportHeight = static_cast<uint16_t>(renderer.getScreenHeight() - spec.marginTop - spec.marginBottom);
-  fprintf(stderr, "viewport %ux%u (margins t%d r%d b%d l%d) font %d\n", spec.viewportWidth,
+  fprintf(stderr, "device %s physical %ux%u portrait %ux%u; viewport %ux%u "
+                  "(margins t%d r%d b%d l%d) font %d\n",
+          ko::deviceGeometry(deviceProfile).name, display.getDisplayWidth(), display.getDisplayHeight(),
+          ko::deviceGeometry(deviceProfile).portraitWidth, ko::deviceGeometry(deviceProfile).portraitHeight,
+          spec.viewportWidth,
           spec.viewportHeight, spec.marginTop, spec.marginRight, spec.marginBottom, spec.marginLeft,
           spec.fontId);
 
@@ -492,7 +534,7 @@ int main(int argc, char** argv) {
     if (n < 0) { fprintf(stderr, "FATAL: spine %d build failed\n", spine); return 3; }
     fprintf(stderr, "spine %d/%d: %d pages\n", spine, spineCount, n);
     PoolSpine ps;                       // only filled when --pool
-    ko::XtchWriter local(writer.mode());
+    ko::XtchWriter local(writer.mode(), deviceProfile);
     local.setTextAa(spec.textAntiAliasing != 0);
     for (int p = 0; p < n; p++) {
       if (maxPages >= 0 && p >= maxPages) break;
@@ -635,7 +677,7 @@ int main(int argc, char** argv) {
   // serial finalizer uses, and candidates are added in spine order — worker completion order must not
   // reach this code, which in the host means plain spine order.
   if (pooled) {
-    ko::XtchWriter asmW(writer.mode());
+    ko::XtchWriter asmW(writer.mode(), deviceProfile);
     asmW.setTextAa(spec.textAntiAliasing != 0);
     asmW.adoptMetadataFrom(writer);
     std::vector<ko::ChapterCandidate> cands;
@@ -685,8 +727,13 @@ int main(int argc, char** argv) {
     h.oracleRepo = oracleRepo;
     h.oracleBranch = oracleBranch;
     h.oracleCommit = oracleCommit;
+    h.deviceProfile = ko::deviceGeometry(deviceProfile).name;
+    h.physicalWidth = display.getDisplayWidth();
+    h.physicalHeight = display.getDisplayHeight();
+    h.planeBytes = display.getBufferSize();
     h.screenWidth = renderer.getScreenWidth();
     h.screenHeight = renderer.getScreenHeight();
+    h.orientation = spec.orientation;
     h.marginTop = spec.marginTop;
     h.marginRight = spec.marginRight;
     h.marginBottom = spec.marginBottom;

@@ -22,9 +22,10 @@
 #     text bits OUTSIDE them are compared. The rectangles come from the layout manifest, which LAYER 1
 #     has already proven identical. Exempting whole pages was too broad: one small illustration beside
 #     twenty lines of prose could hide wrong glyph rasterisation.
-#     The comparison runs in the PHYSICAL 800x480 / 100-bytes-per-row framebuffer geometry the dump
-#     actually is, with the manifest's page-local image rects translated by the margins and rotated
-#     into it. Getting that transform wrong is not a small error: the 480x800/60 reading reports
+#     The comparison runs in the selected profile's PHYSICAL framebuffer geometry (X4 800x480/100
+#     bytes per row; X3 792x528/99), with the manifest's page-local image rects translated by the
+#     margins and rotated into it. Getting that transform wrong is not a small error: the old X4
+#     480x800/60 reading reports
 #     tens of thousands of phantom "outside the rectangle" bits on a clean render.
 #     Differences outside the rectangles on an image page are REPORTED and not certified; so are the
 #     two limits that keep them out of the mandatory set (a decoder writing past its declared rect,
@@ -161,14 +162,15 @@ if [ -z "$FIXTURES" ]; then
   # NOTE: appended in TWO assignments on purpose. A quoted string continued on the next line is not a
   # continuation — it is a second command, and the first line silently wins, which is how a "full"
   # gate run compared three fixtures and reported PASS for six.
-  FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub"
+  FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-text.epub:--device=x3 oracle/fixtures/ko-text.epub:--landscape-cw"
+  FIXTURES="$FIXTURES oracle/fixtures/ko-text.epub:--landscape-ccw oracle/fixtures/ko-ruby.epub oracle/fixtures/ko-mixed.epub"
   #   ko-glyphs TWICE: sup/sub scaled glyphs, synthesized bold and the fallback face take a DIFFERENT raster
   #   path from ordinary prose, and 1-bit and 2-bit take different paths again — yet those are exactly the
   #   functions the pin cannot hold byte-identical (they carry the port's capture fast path). `path:flags` is
   #   the loop's syntax for "same fixture, different mode".
   FIXTURES="$FIXTURES oracle/fixtures/ko-glyphs.epub oracle/fixtures/ko-glyphs.epub:--1bit"
   FIXTURES="$FIXTURES oracle/fixtures/ko-symbols.epub web/demo-images.epub web/demo-png.epub web/demo.epub"
-  [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-glyphs.epub oracle/fixtures/ko-glyphs.epub:--1bit"
+  [ "$QUICK" = 1 ] && FIXTURES="oracle/fixtures/ko-text.epub oracle/fixtures/ko-text.epub:--device=x3 oracle/fixtures/ko-text.epub:--landscape-cw oracle/fixtures/ko-text.epub:--landscape-ccw oracle/fixtures/ko-glyphs.epub oracle/fixtures/ko-glyphs.epub:--1bit"
 fi
 
 # --- 3. sensitivity control ---------------------------------------------------

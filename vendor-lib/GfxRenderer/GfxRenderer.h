@@ -83,8 +83,13 @@ class GfxRenderer {
   // Text coverage-level scratch for the single-text-blit path: 2 bits per
   // physical pixel, panel-wide (96 KB at 800x480). Allocated on first use and
   // kept for the renderer's lifetime, so a captured page costs no allocation.
+  struct LevelBufferDeleter {
+    void operator()(uint8_t* p) const { free(p); }
+  };
+  mutable std::unique_ptr<uint8_t, LevelBufferDeleter> _levelOwner;
   mutable uint8_t* _levelBuf = nullptr;
   mutable int _levelRowBytes = 0;
+  mutable size_t _levelBufSize = 0;
   mutable bool _levelCapture = false;
 
   // Shared implementation behind both drawText overloads (with/without Korean letter-spacing).
@@ -337,6 +342,7 @@ class GfxRenderer {
   void captureAgnostic(int x, int y, bool state) const;
   void captureAgnosticPhysical(int phyX, int phyY, bool state) const;
   // OR the captured text level mask into a gray plane buffer (48000 bytes):
+  // the X3 runtime profile supplies its larger 52272-byte plane.
   // lsbPlane=true  -> bit set where level == 1
   // lsbPlane=false -> bit set where level == 1 || level == 2
   void orCapturedGrayInto(uint8_t* planeOut, bool lsbPlane) const;

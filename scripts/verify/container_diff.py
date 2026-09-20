@@ -5,17 +5,13 @@ The container-level byte comparison answers "are these the same file"; this answ
 "which page, which plane, how many bytes" — the difference between a gate that fails and
 a gate that tells you why. Both records are parsed by their documented layout:
 
-  XTG (1-bit): 22-byte header + 48000 bytes, logical row-major.
-  XTH (2-bit): 22-byte header + 2 x 48000 bytes (plane 1, plane 2), physical column-major.
+  XTG (1-bit): 22-byte header + width*height/8 bytes, logical row-major.
+  XTH (2-bit): 22-byte header + 2 x width*height/8 bytes, physical column-major.
 
 usage: container_diff.py <a> <b> [--limit N] [--quiet]
 """
 import sys
 import hashlib
-
-XTG_REC = 22 + 48000
-XTH_REC = 22 + 2 * 48000
-
 
 def container(path):
     """(pages, header) parsed through the container's own index — not by scanning for
@@ -52,6 +48,18 @@ def container(path):
         rec = data[off:off + size]
         if rec[:4] not in (b'XTH\x00', b'XTG\x00'):
             raise SystemExit(f'{path}: page {i} at {off} has magic {rec[:4]!r}, not a page record')
+        rw = int.from_bytes(rec[4:6], 'little')
+        rh = int.from_bytes(rec[6:8], 'little')
+        payload = int.from_bytes(rec[10:14], 'little')
+        if rw != w or rh != h:
+            raise SystemExit(f'{path}: page {i} index geometry {w}x{h} != record {rw}x{rh}')
+        if w <= 0 or h <= 0 or w % 8 or h % 8:
+            raise SystemExit(f'{path}: page {i} has unsupported non-byte-aligned geometry {w}x{h}')
+        plane_bytes = w * h // 8
+        expected_payload = plane_bytes * (2 if rec[:4] == b'XTH\x00' else 1)
+        if payload != expected_payload or size != 22 + expected_payload:
+            raise SystemExit(f'{path}: page {i} payload/record size {payload}/{size}, expected '
+                             f'{expected_payload}/{22 + expected_payload} for {w}x{h}')
         pages.append(rec)
         offsets.append(off)
     # The count in the header IS the number of records by construction; asserting it keeps that
@@ -66,9 +74,13 @@ def container(path):
 
 def planes(rec):
     """(payload, name) pairs. XTH carries two planes, XTG one; the record magic decides."""
+    width = int.from_bytes(rec[4:6], 'little')
+    height = int.from_bytes(rec[6:8], 'little')
+    plane_bytes = width * height // 8
     if rec[:4] == b'XTH\x00':
-        return [(rec[22:22 + 48000], 'p1'), (rec[22 + 48000:22 + 96000], 'p2')]
-    return [(rec[22:22 + 48000], 'bw')]
+        return [(rec[22:22 + plane_bytes], 'p1'),
+                (rec[22 + plane_bytes:22 + 2 * plane_bytes], 'p2')]
+    return [(rec[22:22 + plane_bytes], 'bw')]
 
 
 def ink_bits(plane):
@@ -109,6 +121,9 @@ def main():
         ra, rb = a_pages[i], b_pages[i]
         if ra[:4] != rb[:4]:
             differing.append((i, 'record-magic', abs(len(ra) - len(rb))))
+            continue
+        if ra[4:8] != rb[4:8]:
+            differing.append((i, 'geometry', abs(len(ra) - len(rb))))
             continue
         pa, pb = planes(ra), planes(rb)
         for (x, name), (y, _n) in zip(pa, pb):

@@ -7,7 +7,7 @@ An EPUB to XTC converter that follows the KO fork rendering rules — the site i
 
 ---
 
-# KO-Fork EPUB → XTCH WASM Module — Build & API
+# KO-Fork EPUB → XTC/XTCH WASM Module — Xteink X4 + X3
 
 Status: **DONE — verified end-to-end** (2026-09-09)
 
@@ -53,6 +53,7 @@ cmake --build build-wasm -j8
 ### Node smoke test
 ```sh
 node scripts/wasm_smoke.js /path/to/book.epub
+node scripts/verify/orientation_preview_vs_file.js
 ```
 
 ---
@@ -80,7 +81,7 @@ All functions exported on the module instance (`createKoEngine()` → `Module`).
 ### Lifecycle
 | Function | Description |
 |---|---|
-| `ko_init(vw, vh)` | Construct display/renderer/fonts; viewport = 480×800 minus default margins |
+| `ko_init(vw, vh)` | Construct display/renderer/fonts; starts in the KO default portrait orientation |
 | `ko_close()` | Teardown |
 | `ko_version()` → `const char*` | Version string (read with `UTF8ToString`) |
 | `ko_error()` → `const char*` | Last error message (empty if none) |
@@ -104,17 +105,22 @@ All functions exported on the module instance (`createKoEngine()` → `Module`).
 | `ko_set_embedded_style(0/1)` | Honor book CSS (default ON) |
 | `ko_set_image_rendering(0-2)` | 0 DISPLAY 1 PLACEHOLDER 2 SUPPRESS |
 | `ko_set_focus_reading(0/1)` | Focus reading mode |
+| `ko_set_device_profile(4\|3)` | Select X4 or X3 using the fork's pre-`display.begin()` profile contract |
+| `ko_device_profile()` | Current profile (`4` = X4, `3` = X3) |
+| `ko_set_orientation(0-3)` | KO orientation: portrait, landscape CW, inverted, landscape CCW |
+| `ko_orientation()` | Current KO orientation value |
+| `ko_set_screen_margin(5..40, step 5)` | Apply the firmware screen-margin knob and orientation-aware safe margins |
 | `ko_set_margins(t,r,b,l)` | Logical margins; recomputes viewport |
 | `ko_viewport_width/height()` | Current viewport |
-| `ko_logical_width/height()` | 480 × 800 |
+| `ko_logical_width/height()` | X4: 480×800 portrait / 800×480 landscape; X3: 528×792 / 792×528 |
 
 ### Pagination & per-page plane capture
 | Function | Description |
 |---|---|
 | `ko_build_spine(i)` → int | Paginate spine i with current spec; returns page count (−1 error) |
 | `ko_render_page(p)` → int | Render page p of current spine (all 3 passes) |
-| `ko_plane_ptr(kind)` → ptr | 0=BW 1=LSB(dark-grey) 2=MSB(light+dark); 48000 bytes each, physical 800×480 |
-| `ko_plane_size(kind)` | 48000 |
+| `ko_plane_ptr(kind)` → ptr | 0=BW 1=LSB(dark-grey) 2=MSB(light+dark); physical panel packing |
+| `ko_plane_size(kind)` | X4: 48,000; X3: 52,272 |
 
 ### Full-book XTCH
 | Function | Description |
@@ -146,7 +152,7 @@ bigbag/epub-to-xtc-converter; its minified `encodeXTG`/`encodeXTH`/`buildXTCCont
 `compressXtczLz4` were reverse-read and cross-checked against this encoder).
 
 - **XTH page** (22B header + 2 planes): `"XTH\0"`, w u16, h u16, 2 zero bytes, u32 dataSize,
-  8B digest(=0). Planes 48000 B each. Column-major **right→left** (`colIndex = w-1-x`),
+  8B digest(=0). Each plane is `w×h/8` bytes. Column-major **right→left** (`colIndex = w-1-x`),
   8 vertical px/byte **MSB=topmost**.
 - **Pixel value** = `(plane1bit<<1)|plane2bit`; **0=White, 1=Dark Grey, 2=Light Grey, 3=Black**
   (confirmed from `XtcReaderActivity.cpp` decode + real device file probe). Our writer's
@@ -154,8 +160,8 @@ bigbag/epub-to-xtc-converter; its minified `encodeXTG`/`encodeXTH`/`buildXTCCont
 - **Engine plane mapping** (empirically verified, 97.6% AA-edge adjacency): engine LSB pass
   marks dark grey only; MSB marks dark+light → `lsb ⊆ msb`. Encode:
   `!ink→0; lsb→1; msb-only→2; ink-no-grey→3`.
-- **XTG page** (1-bit): row-major 60 B × 800 rows, MSB first, **bit 0 = BLACK** (device
-  `isBlack = !bit`); official encoder writes dark pixels as 0, light as 1 — same semantics.
+- **XTG page** (1-bit): row-major `w/8` bytes per row, MSB first, **bit 0 = BLACK** (device
+  `isBlack = !bit`); X4 is 60×800 bytes and X3 is 66×792 bytes.
 - **Container**: 56B header (magic `XTCH`/`XTC\0`, version **1.0** = `[1,0]`, pageCount@6,
   flags@8..0xB, currentPage@0xC = **1**, offsets: metadata@0x10 = 56, index@0x18, data@0x20,
   chapter@0x30 = **312 always**) + 256B metadata (title 128@0, author 64@0x80, publisher 32@0xC0,
@@ -168,6 +174,13 @@ bigbag/epub-to-xtc-converter; its minified `encodeXTG`/`encodeXTH`/`buildXTCCont
 
 Cross-checks: official site JS encoders/container builder, bigbag `docs/xtc-format-spec.md`,
 on-device `XtcReaderActivity::getPixelValue`, and real `.xtch` file byte dissection all agree.
+
+Every XTG/XTH record uses the selected device's portrait dimensions: X4 480×800, X3 528×792.
+Landscape EPUB layout uses the fork's exact renderer transform and rotated safe margins, then stores
+the physical result pre-rotated in that profile's portrait record because `XtcReaderActivity` does
+not apply the EPUB reader's orientation setting. See
+[`docs/ko-landscape-modes.md`](docs/ko-landscape-modes.md) and
+[`docs/ko-device-profiles.md`](docs/ko-device-profiles.md).
 
 ---
 

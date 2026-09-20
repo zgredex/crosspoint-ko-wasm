@@ -10,9 +10,9 @@
 //   - one-shot "convert whole book" → in-memory XTCH container bytes
 //
 // Memory model: module-lifetime HalDisplay + GfxRenderer + EngineDriver. EPUB
-// injected via ko_load_epub(bytes,len). Planes are 48000 bytes (physical
-// 800x480); JS reads them from HEAPU8. The encoder in JS (or ko_render_xtch)
-// transposes to logical 480x800 + XTH packing.
+// injected via ko_load_epub(bytes,len). Planes follow the selected Korean-fork
+// device profile (X4 physical 800x480/48000 B; X3 792x528/52272 B). The writer
+// converts them to that device's portrait XTC/XTH record geometry.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -80,8 +80,12 @@ EM_JS(int, ko_blob_read_sync, (size_t offset, uint8_t* dst, size_t length), {
 #include "xtch_writer.h"
 #include "xtch_chapters.h"
 
-// Global instances (module-lifetime)
-static HalDisplay* g_display = nullptr;
+// Global instances (module-lifetime). The engine's cover/image converters refer
+// to the firmware-style global `display`, so it must be the SAME object the
+// renderer and driver use; a second heap-owned display would leave those paths
+// on X4 geometry after selecting X3.
+HalDisplay display;
+static HalDisplay* g_display = &display;
 static GfxRenderer* g_renderer = nullptr;
 static ko::EngineDriver* g_driver = nullptr;
 // §6 of the KoPub groundwork: an externally loaded built-in font. The bundle owns the arrays, the
@@ -181,8 +185,11 @@ KO_EXPORT void ko_set_margins(int top, int right, int bottom, int left);
 KO_EXPORT const char* ko_version() { return "crosspoint-ko 1.5.0-ko.3 wasm 0.1"; }
 
 KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
-  if (!g_display) {
-    g_display = new HalDisplay();
+  // A fresh lifecycle starts on the firmware's default X4 profile. Profile
+  // selection happens explicitly afterwards, before book layout/export.
+  g_display->setDeviceProfile(ko::DeviceProfile::X4);
+  g_display->begin();
+  if (!g_renderer) {
     g_renderer = new GfxRenderer(*g_display);
     g_renderer->begin();
     g_driver = new ko::EngineDriver(*g_renderer, *g_display);
@@ -205,8 +212,12 @@ KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
     g_renderer->insertFont(RIDIBATANG_14_FONT_ID, g_ridibatangFamily);
 #endif
     g_xtch = new ko::XtchWriter();
+  } else {
+    g_renderer->begin();
+    if (g_driver) g_driver->invalidateSection();
   }
   g_spec = ko::Spec();
+  ko::applyReaderOrientation(*g_renderer, g_spec.orientation);
   // The width/height arguments are ADVISORY and were, until now, silently discarded: the geometry
   // is derived from the spec's margins (viewport = screen − margins), so ko_init(464, 778) still
   // produced a 464x764 layout. Five verification scripts were initialised with the old 778 and
@@ -226,7 +237,6 @@ KO_EXPORT int ko_init(int viewportWidth, int viewportHeight) {
 KO_EXPORT void ko_close() {
   delete g_driver; g_driver = nullptr;
   delete g_renderer; g_renderer = nullptr;
-  delete g_display; g_display = nullptr;
 #if KO_EMBED_KOPUB
   delete g_kopubFamily; g_kopubFamily = nullptr;
   delete g_kopub; g_kopub = nullptr;
@@ -268,6 +278,66 @@ KO_EXPORT void ko_set_text_aa(int v) { g_spec.textAntiAliasing = v ? 1 : 0; }
 KO_EXPORT void ko_set_image_dither(int v) { g_spec.imageDither = v; }
 KO_EXPORT void ko_set_image_tone_depth(int v) { g_spec.imageToneDepth = (v == 2) ? 2 : 4; }
 KO_EXPORT void ko_set_focus_reading(int v) { (void)v; g_spec.focusReadingEnabled = 0; }  // EN-only; hardcoded off in KO
+
+// CrossPointSettings::ORIENTATION: 0 portrait, 1 landscape CW, 2 portrait
+// inverted, 3 landscape CCW. The web UI exposes the two landscape variants;
+// the full four-value API keeps the host/oracle contract identical to firmware.
+KO_EXPORT int ko_set_orientation(int v) {
+  if (!g_renderer || !ko::isReaderOrientation(v)) {
+    setError("invalid reader orientation");
+    return -1;
+  }
+  g_spec.applyOrientation(v);  // also rotates the reference viewable margins
+  ko::applyReaderOrientation(*g_renderer, g_spec.orientation);
+  ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  return 0;
+}
+
+KO_EXPORT int ko_orientation() { return g_spec.orientation; }
+
+KO_EXPORT int ko_set_screen_margin(int v) {
+  if (!g_renderer || !ko::geom::isScreenMarginAllowed(v)) {
+    setError("invalid reader screen margin");
+    return -1;
+  }
+  g_spec.applyScreenMargin(v);
+  ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  return 0;
+}
+
+// Runtime device profile, matching CrossPoint-KO's X3/X4 FreeInk selection.
+// Values are the model numbers (3 and 4), which keeps the C/JS/CLI contract
+// self-describing. Geometry is refreshed through the renderer's runtime display
+// getters; the mounted book remains available, but its old section is invalid.
+KO_EXPORT int ko_set_device_profile(int v) {
+  if (!g_display || !g_renderer || !g_driver || !ko::isDeviceProfile(v)) {
+    setError("invalid device profile (expected 3 or 4)");
+    return -1;
+  }
+  if (g_exportActive || g_asmActive || g_planActive) {
+    setError("cannot change device profile during export");
+    return -1;
+  }
+  const auto profile = static_cast<ko::DeviceProfile>(v);
+  if (g_spec.deviceProfile != profile) {
+    g_spec.deviceProfile = profile;
+    g_display->setDeviceProfile(profile);
+    g_renderer->begin();
+    g_driver->invalidateSection();
+    g_page = ko::RenderedPage{};
+    g_rgbaReady = false;
+  }
+  if (g_xtch) {
+    g_xtch->reset();
+    g_xtch->setDeviceProfile(profile);
+  }
+  g_spec.applyOrientation(g_spec.orientation);
+  ko::applyReaderOrientation(*g_renderer, g_spec.orientation);
+  ko_set_margins(g_spec.marginTop, g_spec.marginRight, g_spec.marginBottom, g_spec.marginLeft);
+  return 0;
+}
+
+KO_EXPORT int ko_device_profile() { return static_cast<int>(g_spec.deviceProfile); }
 
 // Reader font: KOPUB_14_FONT_ID (reference default) / RIDIBATANG_14_FONT_ID (XTCKO
 // extra) / CUSTOM_FONT_ID.
@@ -809,8 +879,8 @@ KO_EXPORT int ko_render_page(int pageIndex) {
 }
 
 KO_EXPORT const uint8_t* ko_plane_ptr(int kind) {
-  // A pointer is only handed out for a plane of the expected size. Returning data() for an empty vector
-  // (or a partially filled one) let a caller memcpy 48000 bytes out of a buffer that was never that big.
+  // A pointer is only handed out for a complete plane of the selected device
+  // profile. X4 and X3 deliberately have different byte counts.
   const std::vector<uint8_t>* plane = nullptr;
   switch (kind) {
     case 0: plane = &g_page.bw; break;
@@ -818,7 +888,8 @@ KO_EXPORT const uint8_t* ko_plane_ptr(int kind) {
     case 2: plane = &g_page.msb; break;
     default: return nullptr;
   }
-  return plane->size() == 48000 ? plane->data() : nullptr;
+  const size_t expected = g_display ? g_display->getBufferSize() : 0;
+  return expected != 0 && plane->size() == expected ? plane->data() : nullptr;
 }
 // Reports what the plane ACTUALLY holds. It used to claim 48000 for every kind, including after
 // beginBookReplacement() reset g_page — so a caller could size a read against a buffer that no longer
@@ -871,16 +942,16 @@ KO_EXPORT void ko_unload_book() {
 // 625,766 for 13 in 1-bit, i.e. 96,096 and 48,096 bytes per record (plane bytes plus a 96-byte record
 // header).
 static constexpr uint64_t MAX_WASM_CONTAINER_BYTES = 1ull << 30;      // 1 GiB, half the wasm maximum
-static constexpr uint64_t XTC_RECORD_BYTES_GRAY = 96096ull;
-static constexpr uint64_t XTC_RECORD_BYTES_MONO = 48096ull;
-
-static uint64_t recordBytesForMode(ko::XtcMode mode) {
-return mode == ko::XtcMode::Mono1Bit ? XTC_RECORD_BYTES_MONO : XTC_RECORD_BYTES_GRAY;
+static uint64_t recordBytesForMode(ko::XtcMode mode, ko::DeviceProfile profile) {
+  const uint64_t planes = ko::deviceGeometry(profile).planeBytes;
+  // 22-byte record header plus a conservative 74-byte allowance for the
+  // container's index/chapter/metadata share, preserving the previous budget.
+  return 96ull + planes * (mode == ko::XtcMode::Mono1Bit ? 1ull : 2ull);
 }
 
 // How many pages of this mode fit under the budget. Never rely on OOM as the limit.
-static uint32_t maxPagesForMode(ko::XtcMode mode) {
-const uint64_t pages = MAX_WASM_CONTAINER_BYTES / recordBytesForMode(mode);
+static uint32_t maxPagesForMode(ko::XtcMode mode, ko::DeviceProfile profile) {
+const uint64_t pages = MAX_WASM_CONTAINER_BYTES / recordBytesForMode(mode, profile);
 return pages > ko::MAX_XTC_PAGES ? static_cast<uint32_t>(ko::MAX_XTC_PAGES) : static_cast<uint32_t>(pages);
 }
 
@@ -909,8 +980,9 @@ KO_EXPORT int ko_export_begin() {
   g_exportMode = g_xtch->mode();
   // Derived ONCE per transaction: the page ceiling is then a property of the export rather than of whatever
   // the mode happens to be when a spine is appended.
-  g_exportMaxPages = maxPagesForMode(g_exportMode);
+  g_exportMaxPages = maxPagesForMode(g_exportMode, g_exportSpec.deviceProfile);
   g_xtch->reset();
+  g_xtch->setDeviceProfile(g_exportSpec.deviceProfile);
   g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
   g_chapters.clear();
   g_spineFallback.clear();
@@ -1066,7 +1138,7 @@ KO_EXPORT int ko_encode_spine(int spine) {
   g_enc.reset();
   if (!requireSpine(spine, "encode_spine") || !g_xtch) return -1;
   // A local writer: a worker's spine must not touch any shared writer state.
-  ko::XtchWriter w(g_xtch->mode());
+  ko::XtchWriter w(g_xtch->mode(), g_spec.deviceProfile);
   w.setTextAa(textAaEnabled());
   const int n = g_driver->buildSection(spine, g_spec);
   if (n < 0) return -1;
@@ -1160,7 +1232,8 @@ KO_EXPORT int ko_assemble_begin(int mode) {
     setError("assemble already active");
     return -1;
   }
-  g_asm.reset(new ko::XtchWriter(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit));
+  g_asm.reset(new ko::XtchWriter(mode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit,
+                                 g_spec.deviceProfile));
   g_asm->setTextAa(textAaEnabled());
   g_asm->adoptMetadataFrom(*g_xtch);      // the header carries the book's title/author
   g_asmCandidates.clear();
@@ -1189,7 +1262,8 @@ KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCo
 // The format's page count is 16 bits on disk; refuse rather than wrap the header to zero.
   // A legal page count can still describe several GiB of container, so the byte budget is a SEPARATE ceiling.
   if (g_asm->pageCount() + static_cast<size_t>(pageCount) > ko::MAX_XTC_PAGES ||
-      g_asm->pageCount() + static_cast<size_t>(pageCount) > maxPagesForMode(g_asmMode)) {
+      g_asm->pageCount() + static_cast<size_t>(pageCount) >
+          maxPagesForMode(g_asmMode, g_asm->deviceProfile())) {
     g_asmFailed = true;
     setError("assemble_add_spine: container page limit exceeded");
     return -1;
@@ -1250,7 +1324,7 @@ KO_EXPORT int ko_assemble_finish() {
 //
 // For an uncompressed container the page records do not need to pass through an engine at all. The
 // header, metadata, chapter table and page index are functions of the page SIZES and the chapters —
-// every index entry is (running offset, size, 480, 800) — so the pool can ask for the prefix alone and
+// every index entry is (running offset, size, profileWidth, profileHeight) — so the pool can ask for the prefix alone and
 // the browser composes [prefix][records…] as a Blob.
 //
 // This removes the whole-container copies that the full assembler performs after encoding: 162 MB
@@ -1265,6 +1339,7 @@ static std::vector<ko::ChapterCandidate> g_planCandidates;
 static std::vector<ko::XtchChapter> g_planFallback;
 static std::vector<uint8_t> g_planPrefix;
 static int g_planMode = 1;
+static ko::DeviceProfile g_planDeviceProfile = ko::DeviceProfile::X4;
 
 KO_EXPORT int ko_plan_begin(int mode) {
   if (!requireBook("plan_begin")) return -1;
@@ -1279,6 +1354,7 @@ KO_EXPORT int ko_plan_begin(int mode) {
   g_planFallback.clear();
   g_planPrefix.clear();
   g_planMode = mode;
+  g_planDeviceProfile = g_spec.deviceProfile;
   return 0;
 }
 
@@ -1338,7 +1414,8 @@ KO_EXPORT int ko_plan_finish() {
     return -1;
   }
   if (!g_xtch || !requireBook("plan_finish")) return -1;
-  ko::XtchWriter w(g_planMode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit);
+  ko::XtchWriter w(g_planMode == 0 ? ko::XtcMode::Mono1Bit : ko::XtcMode::Gray2Bit,
+                   g_planDeviceProfile);
   w.adoptMetadataFrom(*g_xtch);          // the header carries the book's title/author
   const uint32_t total = static_cast<uint32_t>(g_planSizes.size());
   g_chapters = ko::buildChapters(g_planCandidates, g_planFallback, total);
@@ -1469,17 +1546,20 @@ KO_EXPORT void ko_export_abort() {
   ko_xtch_release();
 }
 
-// Preview compose: three packed 1-bpp planes -> 480x800 RGBA in ONE call, so the JS side
+// Preview compose: three packed 1-bpp planes -> orientation-logical RGBA in ONE call, so the JS side
 // never touches a pixel. Byte-verified against the frozen JS implementation over identical
 // planes; scripts/preview-compose/compose_rgba.cpp holds the standalone, native-tested copy
-// of this exact body. See docs/ko-preview-wasm-compose.md.
+// of the portrait fast path. Landscape is returned upright at 800x480 while
+// the XTC record remains in the selected profile's portrait geometry: rotating
+// the preview back to the selected holding direction reproduces the same
+// physical panel pixels. See docs/ko-preview-wasm-compose.md.
 //
 // Why the 8-bit grouping: for a fixed byte column c, the byte offsets phyX = 8c+0..8c+7 live
 // in eight BITS OF THE SAME BYTE, so one strided fetch serves eight logical rows - 8x fewer
 // strided reads (3 x 384,000 -> 3 x 48,000) while every output row is still written densely.
 // Measured 1.43x faster than the naive per-pixel loop in the same language, which is how we
 // know the win is the grouping and not the move into C++.
-static std::vector<uint32_t> g_rgbaOut;  // 480*800 packed RGBA words, allocated once
+static std::vector<uint32_t> g_rgbaOut;  // one profile-sized logical frame
 
 // The remaining previous-book output state. Nothing here may survive a replacement: every one of these is
 // reachable through an exported accessor, and a failure half-way through a replacement must not leave
@@ -1507,9 +1587,12 @@ static void clearBookOutputs() {
 // Placed after the LAST of the globals it clears, so every identifier is declared above it.
 KO_EXPORT uint8_t* ko_rgba_ptr() {
   // An accessor DESCRIBES committed state; it does not manufacture one. This used to allocate a blank
-  // 480x800 framebuffer on demand, so after a failed render or a book replacement it handed out a
+  // profile-sized portrait framebuffer on demand, so after a failed render or a book replacement it handed out a
   // valid-looking all-black page — and JS then built a typed-array view over it.
-  if (!g_rgbaReady || g_rgbaOut.size() != 480u * 800u) return nullptr;
+  const size_t pixels = g_display ? static_cast<size_t>(g_display->getDisplayWidth()) *
+                                       g_display->getDisplayHeight()
+                                 : 0;
+  if (!g_rgbaReady || g_rgbaOut.size() != pixels) return nullptr;
   return reinterpret_cast<uint8_t*>(g_rgbaOut.data());
 }
 
@@ -1521,7 +1604,14 @@ KO_EXPORT int ko_compose_rgba(int mono) {
   // All three planes must be complete. After a book replacement g_page is reset, so the BW plane can
   // exist while the grey ones are empty; composing then read past the end of the smaller buffers. The
   // sizes are the contract, not just the pointers.
-  if (g_page.bw.size() != 48000 || g_page.lsb.size() != 48000 || g_page.msb.size() != 48000) {
+  if (!g_display || !g_renderer) {
+    setError("engine not initialised");
+    return -1;
+  }
+  const auto& geometry = ko::deviceGeometry(g_spec.deviceProfile);
+  const size_t planeBytes = geometry.planeBytes;
+  if (g_page.bw.size() != planeBytes || g_page.lsb.size() != planeBytes ||
+      g_page.msb.size() != planeBytes) {
     setError("no complete rendered page");
     return -1;
   }
@@ -1533,7 +1623,10 @@ KO_EXPORT int ko_compose_rgba(int mono) {
   const bool textAa = textAaEnabled();
   const uint8_t* lsb = ko_plane_ptr(1);
   const uint8_t* msb = ko_plane_ptr(2);
-  if (g_rgbaOut.size() != 480u * 800u) g_rgbaOut.assign(480u * 800u, 0);
+  const int logicalW = g_renderer->getScreenWidth();
+  const int logicalH = g_renderer->getScreenHeight();
+  const size_t pixels = static_cast<size_t>(logicalW) * logicalH;
+  if (g_rgbaOut.size() != pixels) g_rgbaOut.assign(pixels, 0);
   uint32_t* out = g_rgbaOut.data();
 
   // Preview palette: the four page levels at the PANEL's own relative reflectances (white 210,
@@ -1554,58 +1647,65 @@ KO_EXPORT int ko_compose_rgba(int mono) {
   // 1-bit: the panel's two extremes (210 and 15), already faithful under the same normalisation.
   static constexpr uint32_t kMono32[2] = {0xFF000000u, 0xFFFFFFFFu};  // indexed by plane bit
   static constexpr uint8_t kLevelByMask[4] = {3, 2, 1, 1};
-  const int colBytes = 100;  // physical row width in bytes
+  const int physicalW = geometry.physicalWidth;
+  const int physicalH = geometry.physicalHeight;
+  const int rowBytes = geometry.physicalRowBytes;
   // Same blue-noise masks the XTG writer inks with (ko::monoNoiseMasks): layer 0 =
   // dark grey v=1, layer 1 = light grey v=2, layer 2 = black v=3. Sharing the table
   // is what makes the 1-bit preview pixel-exact against the exported file.
-  const MonoNoiseMasks& nm = monoNoiseMasks();
+  const MonoNoiseMasks& nm = monoNoiseMasks(g_spec.deviceProfile);
 
-  for (int c = 0; c < colBytes; ++c) {
-    for (int phyY = 0; phyY < 480; ++phyY) {
-      const size_t idx = static_cast<size_t>(phyY) * colBytes + c;
-      const uint8_t bwByte = bw[idx];
-      const uint8_t lsbByte = lsb ? lsb[idx] : 0;
-      const uint8_t msbByte = msb ? msb[idx] : 0;
-      const int x = 479 - phyY;  // logical column for this physical row
-      // Branchless (verified equivalent, 6.8x faster in the native harness): the 4-level
-      // decision is a masked 4-entry lookup, and mono is hoisted out of the inner loop.
-      // kLevelByMask maps (lsb<<1|msb) to v with lsb winning; (0 - !ink) zeroes it for non-ink.
-      // The c * 8 * kW offset is essential: eight consecutive logical rows start at row c*8.
-      uint32_t* dst = out + static_cast<size_t>(c) * 8 * 480 + x;
-      if (mono) {
-        const int k = x >> 3;
-        const int jshift = 7 - (x & 7);  // the pixel's bit position inside a mask byte
-        for (int b = 0; b < 8; ++b, dst += 480) {
-          // Mirror of addMonoPage. NOTE the two different bit layouts: a plane byte
-          // holds this pixel at bit (7 - (y & 7)) = (7 - b), while the mask byte holds
-          // it at bit (7 - (x & 7)) = jshift, because the writer transposes the plane
-          // bytes into the mask's layout before ANDing. So the level's mask bit must be
-          // selected per pixel, not ANDed byte-wise.
-          int ink = ((bwByte >> (7 - b)) & 1) ^ 1;  // bw bit 0 = ink
-          if (ink) {
-            const int pshift = 7 - b;
-            const uint8_t l = (lsbByte >> pshift) & 1;
-            const uint8_t m = (msbByte >> pshift) & 1;
-            if (l || m) {
-              // Grey pixel: always halftoned (dark = layer 0, light = layer 1).
-              const uint8_t yc = static_cast<uint8_t>((c * 8 + b) & 63);
-              ink = (nm.m[l ? 0 : 1][yc][k] >> jshift) & 1;
-            } else if (textAa) {
-              // Solid ink: thinned by the 255 layer only with text AA on.
-              const uint8_t yc = static_cast<uint8_t>((c * 8 + b) & 63);
-              ink = (nm.m[2][yc][k] >> jshift) & 1;
-            }
+  const int orientation = g_spec.orientation;
+  // The fork's rotateCoordinates() with runtime panel dimensions. The file
+  // transform is its portrait inverse: fileX=physicalH-1-phyY, fileY=phyX.
+  // Using that same file coordinate for mono noise makes preview and XTG bytes
+  // identical for both device profiles and all four orientations.
+  for (int y = 0; y < logicalH; ++y) {
+    for (int x = 0; x < logicalW; ++x) {
+      int phyX = 0;
+      int phyY = 0;
+      switch (orientation) {
+        case ko::LANDSCAPE_CW:
+          phyX = physicalW - 1 - x;
+          phyY = physicalH - 1 - y;
+          break;
+        case ko::PORTRAIT_INVERTED:
+          phyX = physicalW - 1 - y;
+          phyY = x;
+          break;
+        case ko::LANDSCAPE_CCW:
+          phyX = x;
+          phyY = y;
+          break;
+        default:
+          phyX = y;
+          phyY = physicalH - 1 - x;
+          break;
+      }
+      const size_t idx = static_cast<size_t>(phyY) * rowBytes + (phyX >> 3);
+      const int shift = 7 - (phyX & 7);
+      const int ink = ((bw[idx] >> shift) & 1) ^ 1;
+      uint32_t pixel = mono ? kMono32[1] : kGray32[0];
+      if (ink) {
+        const int l = (lsb[idx] >> shift) & 1;
+        const int m = (msb[idx] >> shift) & 1;
+        if (mono) {
+          int monoInk = 1;
+          const int fileX = physicalH - 1 - phyY;
+          const int fileY = phyX;
+          if (l || m) {
+            monoInk = (nm.m[l ? 0 : 1][fileY & 63][fileX >> 3] >>
+                       (7 - (fileX & 7))) & 1;
+          } else if (textAa) {
+            monoInk = (nm.m[2][fileY & 63][fileX >> 3] >>
+                       (7 - (fileX & 7))) & 1;
           }
-          dst[0] = ink ? kMono32[0] : kMono32[1];
-        }
-      } else {
-        for (int b = 0; b < 8; ++b, dst += 480) {
-          const int shift = 7 - b;
-          const int bit = (bwByte >> shift) & 1;
-          const int m = (((lsbByte >> shift) & 1) << 1) | ((msbByte >> shift) & 1);
-          dst[0] = kGray32[kLevelByMask[m] & (0 - (bit ^ 1))];
+          pixel = monoInk ? kMono32[0] : kMono32[1];
+        } else {
+          pixel = kGray32[kLevelByMask[(l << 1) | m]];
         }
       }
+      out[static_cast<size_t>(y) * logicalW + x] = pixel;
     }
   }
   g_rgbaReady = true;      // committed: ko_rgba_ptr() may hand this out now
