@@ -52,9 +52,11 @@ oracle gate is the one that compares against the reference.
 ## Spine labels behind the first frame
 
 The load reply built one string per spine and the page made one `<option>` per spine before showing
-anything. Now `spineHrefs` serves them in batches of 100 after the first frame (rAF-yielded, token
-cancelled on a new book). Verified 60/60 labels and working navigation; the cost removed grows with spine
-count, which is the omnibus case.
+anything. Now `spineLabels` serves them in batches of 100 after the first frame (rAF-yielded, token
+cancelled on a new book). Each label is the first EPUB TOC title assigned to that spine—the same parsed
+navigation metadata used by the Korean reader and the XTC chapter table—and only falls back to the spine
+basename when the book has no TOC item for that spine. Verified 60/60 labels and working navigation; the
+cost removed grows with spine count, which is the omnibus case.
 
 ## Adopting the EPUB instead of copying it
 

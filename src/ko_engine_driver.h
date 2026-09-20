@@ -445,6 +445,18 @@ class EngineDriver {
     if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return "";
     return epub_->getTocItem(i).title;
   }
+  // The first navigation title that belongs to this spine. SpineEntry::tocIndex
+  // is O(1), but for spines without their own TOC item the cache deliberately
+  // inherits the previous index for section parsing. Verify ownership before
+  // returning it so an unlisted preface/colophon never borrows a neighbour's
+  // visible chapter name.
+  std::string spineTocTitle(int spineIndex) const {
+    if (!epub_ || spineIndex < 0 || spineIndex >= epub_->getSpineItemsCount()) return "";
+    const int tocIndex = epub_->getTocIndexForSpineIndex(spineIndex);
+    if (tocIndex < 0 || tocIndex >= epub_->getTocItemsCount()) return "";
+    const auto entry = epub_->getTocItem(tocIndex);
+    return entry.spineIndex == spineIndex ? entry.title : "";
+  }
   std::string tocAnchor(int i) const {
     if (!epub_ || i < 0 || i >= epub_->getTocItemsCount()) return "";
     return epub_->getTocItem(i).anchor;

@@ -849,6 +849,16 @@ KO_EXPORT const char* ko_get_spine_href(int spineIndex) {
   return last.c_str();
 }
 
+// First EPUB navigation title assigned to a spine; pointer valid until the
+// next call. An empty result means the book has no TOC item for that spine and
+// lets the UI fall back to the basename rather than inventing metadata.
+KO_EXPORT const char* ko_get_spine_title(int spineIndex) {
+  if (!g_driver || spineIndex < 0 || spineIndex >= g_driver->spineCount()) return "";
+  static std::string last;
+  last = g_driver->spineTocTitle(spineIndex);
+  return last.c_str();
+}
+
 // Cover/thumbnail generation — mirrors the device library path. Generates the
 // prescaled cover BMP via JpegToBmpConverter (handles oversized covers that the
 // in-page decoder's RAM cap refuses). Returns bytes via ko_cover_ptr/size.

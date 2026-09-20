@@ -591,6 +591,12 @@ async function init() {
   Module = await factory({ locateFile: (path) => asset(path) });
   api = Module;
   BOOT.wasmReady = performance.now();
+  // A worker/engine cache mismatch must fail visibly. Falling back to hrefs
+  // here would make the app look healthy while silently restoring the exact
+  // wrong chapter labels this API exists to prevent.
+  if (typeof api._ko_get_spine_title !== 'function') {
+    throw new Error('engine missing required ko_get_spine_title export');
+  }
   // deterministic viewport: engine computes from margins; init with full logical
   api._ko_init(464, 764); // will be fixed up by ko_set_margins on first spec
   // Register external faces AFTER ko_init, not before: the loader needs the renderer that ko_init
@@ -2024,18 +2030,21 @@ case 'openPreview': {
 // instead of relying on the JS glue to marshal a string for a char* argument: it is not obvious from
 // the call site whether that conversion happens, and a silently-null path is exactly the kind of thing
 // that would produce a container with missing chapter names and no error.
-      case 'spineHrefs': {
-        if (!requireWorkerBook(id, 'spineHrefs')) break;
-        // On demand again: safe because ko_get_spine_href() copies the href into its own buffer instead of
-        // pointing into a by-value temporary (see the note where the snapshot used to be).
+      case 'spineLabels': {
+        if (!requireWorkerBook(id, 'spineLabels')) break;
+        // On demand again: the actual display name comes from the EPUB's parsed navigation table, the
+        // same source used by the Korean reader and by XTC chapter export. The href is retained only as
+        // a fallback for spine entries the book did not put in its TOC.
         const start = Math.max(0, ev.data.start | 0);
         const count = Math.max(1, ev.data.count | 0);
         const end = Math.min(spineCount, start + count);
         const hrefs = [];
+        const titles = [];
         for (let s = start; s < end; s++) {
           hrefs.push(api.UTF8ToString(api._ko_get_spine_href(s)));
+          titles.push(api.UTF8ToString(api._ko_get_spine_title(s)));
         }
-        post(id, true, { start, hrefs });
+        post(id, true, { start, hrefs, titles });
         break;
       }
 

@@ -958,10 +958,16 @@
     await refresh(true, true);
     return r;
   }
-  function spineLabel(h, i) {
-    const label = normalizeDisplayText(h.replace(/\.(xhtml|html|htm)$/i, '')
-                      .replace(/[_]+/g, ' ')) || ('spine ' + i);
-    return (i + 1) + '. ' + label;
+  function spineLabel(title, href, i) {
+    // Match what the book shows in its own navigation document. Filenames are
+    // implementation details and only belong on screen when the EPUB supplied
+    // no navigation item for this spine at all.
+    const tocTitle = normalizeDisplayText(title).trim();
+    if (tocTitle) return tocTitle;
+    const fallback = normalizeDisplayText(String(href || '')
+      .replace(/\.(xhtml|html|htm)$/i, '')
+      .replace(/[_]+/g, ' ')).trim();
+    return fallback || ('장 ' + (i + 1));
   }
 
   // Labels arrive in batches AFTER the first page is on screen. Building one <option> per spine in
@@ -976,7 +982,7 @@
       if (token !== spinePopulateToken) return;          // a new book superseded this one
       let r;
       try {
-        r = await call('spineHrefs', { start, count: Math.min(batch, spineCount - start) });
+        r = await call('spineLabels', { start, count: Math.min(batch, spineCount - start) });
       } catch (_) {
         return;                                          // labels are cosmetic; the reader keeps working
       }
@@ -985,7 +991,7 @@
       r.hrefs.forEach((h, i) => {
         const opt = document.createElement('option');
         opt.value = r.start + i;
-        opt.textContent = spineLabel(h, r.start + i);
+        opt.textContent = spineLabel(r.titles && r.titles[i], h, r.start + i);
         frag.appendChild(opt);
       });
       els.spineSel.appendChild(frag);
@@ -996,14 +1002,12 @@
     }
   }
 
-  function populateSpines(hrefs) {
+  function populateSpines(hrefs, titles) {
     els.spineSel.innerHTML = '';
     hrefs.forEach((h, i) => {
-      const label = normalizeDisplayText(h.replace(/\.(xhtml|html|htm)$/i, '')
-                        .replace(/[_]+/g, ' ')) || ('spine ' + i);
       const opt = document.createElement('option');
       opt.value = i;
-      opt.textContent = (i + 1) + '. ' + label;
+      opt.textContent = spineLabel(titles && titles[i], h, i);
       els.spineSel.appendChild(opt);
     });
     els.spineSel.disabled = false;
