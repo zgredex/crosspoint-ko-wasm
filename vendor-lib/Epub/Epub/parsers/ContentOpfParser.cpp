@@ -179,6 +179,13 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   }
 
   if (self->state == IN_MANIFEST && (strcmp(name, "item") == 0 || strcmp(name, "opf:item") == 0)) {
+    if (self->manifestItemCount >= MAX_EPUB_MANIFEST_ITEMS) {
+      LOG_ERR("COF", "OPF manifest exceeds supported item count (%zu)", MAX_EPUB_MANIFEST_ITEMS);
+      XML_StopParser(self->parser, XML_FALSE);
+      return;
+    }
+    self->manifestItemCount++;
+
     std::string itemId;
     std::string href;
     std::string mediaType;

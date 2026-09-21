@@ -577,7 +577,7 @@ int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<u
 }
 
 uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const bool trailingNullByte,
-                                   const size_t maxOutputBytes) {
+                                   const size_t maxOutputBytes, InflateBudget& workBudget) {
   const ScopedOpenClose zip{*this};
   if (!zip) return nullptr;
 
@@ -594,6 +594,12 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
 
   const long fileOffset = getDataOffset(fileStat, filename);
   if (fileOffset < 0) return nullptr;
+
+  if (!workBudget.charge(fileStat.uncompressedSize)) {
+    LOG_ERR("ZIP", "entry declares %u bytes but only %llu bytes remain in the cumulative expansion budget",
+            fileStat.uncompressedSize, static_cast<unsigned long long>(workBudget.remainingBytes()));
+    return nullptr;
+  }
 
   file.seek(fileOffset);
 
@@ -685,7 +691,8 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
 }
 
 bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t chunkSize,
-                               const bool allowEarlyStop, const size_t maxOutputBytes) {
+                               const bool allowEarlyStop, const size_t maxOutputBytes,
+                               InflateBudget& workBudget) {
   const ScopedOpenClose zip{*this};
   if (!zip) return false;
 
@@ -702,6 +709,12 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
 
   const long fileOffset = getDataOffset(fileStat, filename);
   if (fileOffset < 0) return false;
+
+  if (!workBudget.charge(fileStat.uncompressedSize)) {
+    LOG_ERR("ZIP", "entry declares %u bytes but only %llu bytes remain in the cumulative expansion budget",
+            fileStat.uncompressedSize, static_cast<unsigned long long>(workBudget.remainingBytes()));
+    return false;
+  }
 
   file.seek(fileOffset);
   const auto deflatedDataSize = fileStat.compressedSize;

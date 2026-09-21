@@ -79,6 +79,10 @@
 
   // ---- worker plumbing (hardened: timeouts + crash surfacing + respawn) ----
   const CALL_TIMEOUT_MS = 90000;  // generous: giant spine rebuilds take a while
+  // Automatic ?epub= loading is only a local/testing convenience. Keep its
+  // network and memory boundary at the worker's copying-path limit rather than
+  // materializing an arbitrarily large response before validation.
+  const MAX_REMOTE_EPUB_BYTES = 512 * 1024 * 1024;
   let nextId = 1;
   const pending = new Map();      // id -> {resolve, reject, timer}
   let worker = null;
@@ -189,7 +193,7 @@
       } else {
         const q = new URLSearchParams(location.search);
         const auto = q.get('epub');
-        if (auto) fetch(auto).then((r) => r.blob()).then((b) => { pendingBookFile = null; return loadBook(b, auto.split('/').pop()); });
+        if (auto) return loadRemoteEpub(auto).catch((e) => reportError(e, 'EPUB 자동 열기'));
       }
     }).catch(() => { respawning = false; });
   }
@@ -1253,6 +1257,66 @@
   // worker-respawn recovery, which reloaded from els.file.
   let pendingBookFile = null;    // the File behind the in-flight load
   let currentBookFile = null;    // the File behind the book that is actually loaded
+
+  async function responseBlobWithinLimit(response, maxBytes) {
+    const lengthHeader = response.headers.get('content-length');
+    if (lengthHeader !== null) {
+      const declared = Number(lengthHeader);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        throw new Error('EPUB 다운로드 크기가 허용 한도(512 MiB)를 초과합니다.');
+      }
+    }
+
+    // Enforce the boundary while bytes arrive even when Content-Length is
+    // missing or dishonest. TransformStream avoids retaining a second JS array
+    // of every chunk on browsers that support streamed fetch responses.
+    if (response.body && typeof response.body.pipeThrough === 'function' &&
+        typeof TransformStream === 'function') {
+      let received = 0;
+      const limited = response.body.pipeThrough(new TransformStream({
+        transform(chunk, controller) {
+          const bytes = chunk && Number(chunk.byteLength);
+          if (!Number.isSafeInteger(bytes) || bytes < 0 || received > maxBytes - bytes) {
+            throw new Error('EPUB 다운로드 크기가 허용 한도(512 MiB)를 초과합니다.');
+          }
+          received += bytes;
+          controller.enqueue(chunk);
+        },
+      }));
+      const blob = await new Response(limited, {
+        headers: { 'content-type': response.headers.get('content-type') || 'application/epub+zip' },
+      }).blob();
+      if (blob.size > maxBytes) throw new Error('EPUB 다운로드 크기가 허용 한도를 초과합니다.');
+      return blob;
+    }
+
+    const blob = await response.blob();
+    if (blob.size > maxBytes) throw new Error('EPUB 다운로드 크기가 허용 한도(512 MiB)를 초과합니다.');
+    return blob;
+  }
+
+  async function loadRemoteEpub(rawUrl) {
+    const url = new URL(rawUrl, location.href);
+    if (url.origin !== location.origin) {
+      throw new Error('다른 출처의 EPUB 주소는 열 수 없습니다.');
+    }
+
+    // Redirects are rejected rather than followed: otherwise a same-origin URL
+    // could bounce to another origin after the pre-fetch origin check.
+    const response = await fetch(url.href, { credentials: 'same-origin', redirect: 'error' });
+    if (!response.ok) {
+      throw new Error('EPUB 다운로드 실패: HTTP ' + response.status);
+    }
+    const finalUrl = new URL(response.url || url.href, location.href);
+    if (finalUrl.origin !== location.origin) {
+      throw new Error('다른 출처의 EPUB 주소는 열 수 없습니다.');
+    }
+    const blob = await responseBlobWithinLimit(response, MAX_REMOTE_EPUB_BYTES);
+    let name = url.pathname.split('/').pop() || 'book.epub';
+    try { name = decodeURIComponent(name); } catch (_) {}
+    pendingBookFile = null;
+    return loadBook(blob, name);
+  }
 
   function startLoad(f) {
     if (!f) return;
@@ -2362,8 +2426,7 @@
     if (auto) {
       // Blob, not ArrayBuffer: the same object goes to both engines, and a transfer would detach it.
       // (The previous shape fetched the book twice — the first download was discarded.)
-      pendingBookFile = null;       // §8: no File behind a fetch-loaded book
-      fetch(auto).then((r) => r.blob()).then((b) => loadBook(b, auto.split('/').pop()));
+      loadRemoteEpub(auto).catch((e) => reportError(e, 'EPUB 자동 열기'));
     }
   });
 })();

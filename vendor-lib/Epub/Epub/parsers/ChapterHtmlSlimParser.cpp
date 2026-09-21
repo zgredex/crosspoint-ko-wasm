@@ -13,7 +13,6 @@
 #include <new>
 
 #include "../../../../src/fontIds.h"
-#include "../../../../src/utf8_utils.h"
 #include "Epub.h"
 #include "Epub/Page.h"
 #include "Epub/VisibleTextUtils.h"
@@ -25,10 +24,7 @@
 // Minimum file size (in bytes) to show indexing popup - smaller chapters don't benefit from it
 constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
 constexpr size_t PARSE_BUFFER_SIZE = 1024;
-constexpr size_t MAX_CHAPTER_HEADINGS = 256;
-constexpr size_t MAX_CHAPTER_HEADING_TITLE_BYTES = 1024;
-constexpr size_t MAX_CHAPTER_HEADING_ANCHOR_BYTES = 4096;
-constexpr size_t MAX_CHAPTER_HEADING_METADATA_BYTES = 128 * 1024;
+constexpr size_t MAX_XHTML_ELEMENT_DEPTH = 512;
 
 // This number comes from PR #73
 // If we have > 750 words buffered up, perform the layout and consume out all but the last line
@@ -155,7 +151,30 @@ void ChapterHtmlSlimParser::applyTextDecorationToEntry(StyleStackEntry& entry, c
   }
 }
 
-void ChapterHtmlSlimParser::pushDecorationStyleEntry(const CssTextDecoration defaultDecoration,
+bool ChapterHtmlSlimParser::rejectResourceLimit(const char* message) {
+  LOG_ERR("EHP", "%s", message);
+  if (xmlParser_) XML_StopParser(xmlParser_, XML_FALSE);
+  return false;
+}
+
+bool ChapterHtmlSlimParser::pushInlineStyleEntry(const StyleStackEntry& entry) {
+  if (inlineStyleStack.size() >= MAX_XHTML_ELEMENT_DEPTH) {
+    return rejectResourceLimit("XHTML inline style nesting exceeds supported depth");
+  }
+  inlineStyleStack.push_back(entry);
+  return true;
+}
+
+bool ChapterHtmlSlimParser::pushBlockStyleEntry(const BlockStyle& entry) {
+  // One extra entry is the non-document root style installed by beginParse().
+  if (blockStyleStack.size() >= MAX_XHTML_ELEMENT_DEPTH + 1) {
+    return rejectResourceLimit("XHTML block style nesting exceeds supported depth");
+  }
+  blockStyleStack.push_back(entry);
+  return true;
+}
+
+bool ChapterHtmlSlimParser::pushDecorationStyleEntry(const CssTextDecoration defaultDecoration,
                                                      const CssStyle& cssStyle) {
   StyleStackEntry entry;
   entry.depth = depth;
@@ -170,8 +189,9 @@ void ChapterHtmlSlimParser::pushDecorationStyleEntry(const CssTextDecoration def
     entry.italic = cssStyle.fontStyle == CssFontStyle::Italic;
   }
   applyDirectionToEntry(entry, cssStyle);
-  inlineStyleStack.push_back(entry);
+  if (!pushInlineStyleEntry(entry)) return false;
   updateEffectiveInlineStyle();
+  return true;
 }
 
 // Update effective bold/italic/decorations based on block style and inline style stack
@@ -400,6 +420,11 @@ void ChapterHtmlSlimParser::emitHorizontalRule(const BlockStyle& blockStyle) {
 
 void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char* name, const XML_Char** atts) {
   auto* self = static_cast<ChapterHtmlSlimParser*>(userData);
+  if (self->xmlElementDepth >= MAX_XHTML_ELEMENT_DEPTH) {
+    self->rejectResourceLimit("XHTML element nesting exceeds supported depth (512)");
+    return;
+  }
+  self->xmlElementDepth++;
   if (strcasecmp(name, "body") == 0) {
     // Case-insensitive to match ParagraphStreamer's tag matching (ProgressMapper). A case
     // mismatch here would leave visibleTextOffset at 0 for the whole section, so every page
@@ -427,7 +452,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
   std::string classAttr;
   std::string styleAttr;
   std::string dirAttr;
-  std::string elementId;
   if (atts != nullptr) {
     for (int i = 0; atts[i]; i += 2) {
       if (strcmp(atts[i], "class") == 0) {
@@ -435,7 +459,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       } else if (strcmp(atts[i], "style") == 0) {
         styleAttr = atts[i + 1];
       } else if (strcmp(atts[i], "id") == 0) {
-        elementId = atts[i + 1];
         // Defer both anchor recording and TOC page breaks until startNewTextBlock,
         // after the previous block is flushed to pages via makePages().
         //
@@ -446,10 +469,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         const char* idValue = atts[i + 1];
         const bool isTocAnchor =
             std::find(self->tocAnchors.begin(), self->tocAnchors.end(), idValue) != self->tocAnchors.end();
-        if (isTocAnchor) {
-          self->latestTocAnchor = idValue;
-          self->latestTocAnchorVisibleOffset = self->visibleTextOffset;
-        }
         if (isTocAnchor || (!isNonNavigableInlineElement(name) && self->anchorData.size() < MAX_ANCHORS_PER_CHAPTER)) {
           // Flush a displaced anchor before overwriting. Consecutive non-block elements
           // (e.g. <aside id="fn1">text</aside><aside id="fn2">) with no intervening block
@@ -507,23 +526,6 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     return;
   }
 
-  if (self->headingDepth < 0 && matches(name, HEADER_TAGS, std::size(HEADER_TAGS))) {
-    self->headingDepth = self->depth;
-    self->headingLevel = static_cast<uint8_t>(name[1] - '0');
-    self->headingVisibleOffset = self->visibleTextOffset;
-    self->headingText.clear();
-    self->headingAnchor = elementId;
-    if (self->headingAnchor.empty() && !self->pendingAnchorId.empty() &&
-        std::find(self->tocAnchors.begin(), self->tocAnchors.end(), self->pendingAnchorId) !=
-            self->tocAnchors.end()) {
-      self->headingAnchor = self->pendingAnchorId;
-    }
-    if (self->headingAnchor.empty() && !self->latestTocAnchor.empty() &&
-        self->latestTocAnchorVisibleOffset == self->visibleTextOffset) {
-      self->headingAnchor = self->latestTocAnchor;
-    }
-  }
-
   // Special handling for tables/cells: flatten into per-cell paragraphs with a prefixed header.
   if (strcmp(name, "table") == 0) {
     // skip nested tables
@@ -571,7 +573,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     headerStyle.bold = false;
     headerStyle.hasItalic = true;
     headerStyle.italic = true;
-    self->inlineStyleStack.push_back(headerStyle);
+    if (!self->pushInlineStyleEntry(headerStyle)) return;
     self->updateEffectiveInlineStyle();
     const CssTextDecoration savedTextDecoration = self->effectiveTextDecoration;
     self->effectiveTextDecoration = CssTextDecoration::None;
@@ -973,7 +975,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       entry.hasTextDecoration = true;
       entry.textDecoration = CssTextDecoration::Underline;
       applyDirectionToEntry(entry, cssStyle);
-      self->inlineStyleStack.push_back(entry);
+      if (!self->pushInlineStyleEntry(entry)) return;
       self->updateEffectiveInlineStyle();
 
       // Skip CSS resolution — we already handled styling for this <a> tag
@@ -1014,7 +1016,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     }
     const auto accumulated =
         self->blockStyleStack.back().getCombinedBlockStyle(headerBlockStyle, BlockStyle::CombineAxis::Horizontal);
-    self->blockStyleStack.push_back(accumulated);
+    if (!self->pushBlockStyleEntry(accumulated)) return;
     self->startNewTextBlock(accumulated.withoutBottom());
     self->boldUntilDepth = std::min(self->boldUntilDepth, self->depth);
     self->updateEffectiveInlineStyle();
@@ -1046,7 +1048,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       self->currentCssStyle = cssStyle;
       const auto accumulated = self->blockStyleStack.back().getCombinedBlockStyle(userAlignmentBlockStyle,
                                                                                   BlockStyle::CombineAxis::Horizontal);
-      self->blockStyleStack.push_back(accumulated);
+      if (!self->pushBlockStyleEntry(accumulated)) return;
       self->startNewTextBlock(accumulated.withoutBottom());
       self->updateEffectiveInlineStyle();
 
@@ -1061,14 +1063,14 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       self->flushPartWordBuffer();
       self->nextWordContinues = true;
     }
-    self->pushDecorationStyleEntry(CssTextDecoration::Underline, cssStyle);
+    if (!self->pushDecorationStyleEntry(CssTextDecoration::Underline, cssStyle)) return;
   } else if (matches(name, LINETHROUGH_TAGS, std::size(LINETHROUGH_TAGS))) {
     // Flush buffer before style change so preceding text gets current style
     if (self->partWordBufferIndex > 0) {
       self->flushPartWordBuffer();
       self->nextWordContinues = true;
     }
-    self->pushDecorationStyleEntry(CssTextDecoration::LineThrough, cssStyle);
+    if (!self->pushDecorationStyleEntry(CssTextDecoration::LineThrough, cssStyle)) return;
   } else if (matches(name, BOLD_TAGS, std::size(BOLD_TAGS))) {
     // Flush buffer before style change so preceding text gets current style
     if (self->partWordBufferIndex > 0) {
@@ -1087,7 +1089,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     }
     applyTextDecorationToEntry(entry, cssStyle);
     applyDirectionToEntry(entry, cssStyle);
-    self->inlineStyleStack.push_back(entry);
+    if (!self->pushInlineStyleEntry(entry)) return;
     self->updateEffectiveInlineStyle();
   } else if (matches(name, ITALIC_TAGS, std::size(ITALIC_TAGS))) {
     // Flush buffer before style change so preceding text gets current style
@@ -1107,7 +1109,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     }
     applyTextDecorationToEntry(entry, cssStyle);
     applyDirectionToEntry(entry, cssStyle);
-    self->inlineStyleStack.push_back(entry);
+    if (!self->pushInlineStyleEntry(entry)) return;
     self->updateEffectiveInlineStyle();
   } else if (strcmp(name, "sup") == 0 || strcmp(name, "sub") == 0) {
     if (self->partWordBufferIndex > 0) {
@@ -1123,7 +1125,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       entry.hasSub = true;
       entry.sub = true;
     }
-    self->inlineStyleStack.push_back(entry);
+    if (!self->pushInlineStyleEntry(entry)) return;
     self->updateEffectiveInlineStyle();
   } else if (strcmp(name, "span") == 0 || !isHeaderOrBlock(name)) {
     // Handle span and other inline elements for CSS styling
@@ -1155,7 +1157,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
           entry.sub = true;
         }
       }
-      self->inlineStyleStack.push_back(entry);
+      if (!self->pushInlineStyleEntry(entry)) return;
       self->updateEffectiveInlineStyle();
     }
   }
@@ -1185,12 +1187,6 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
   // Middle of skip
   if (self->skipUntilDepth < self->depth) {
     return;
-  }
-
-  if (self->headingDepth >= 0 && self->nonVisibleTextDepth == 0 && !self->collectingRubyText &&
-      self->headingText.size() < 4096) {
-    const size_t take = std::min<size_t>(static_cast<size_t>(len), 4096 - self->headingText.size());
-    self->headingText.append(s, take);
   }
 
   // Collect ruby text instead of normal word processing
@@ -1396,37 +1392,9 @@ void XMLCALL ChapterHtmlSlimParser::defaultHandlerExpand(void* userData, const X
 
 void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* name) {
   auto* self = static_cast<ChapterHtmlSlimParser*>(userData);
+  if (self->xmlElementDepth > 0) self->xmlElementDepth--;
   if (self->nonVisibleTextDepth > 0) {
     self->nonVisibleTextDepth--;
-  }
-
-  if (self->headingDepth >= 0 && self->depth - 1 == self->headingDepth &&
-      matches(name, HEADER_TAGS, std::size(HEADER_TAGS))) {
-    std::string title = trimAndNormalize(self->headingText);
-    if (title.size() > MAX_CHAPTER_HEADING_TITLE_BYTES) {
-      title.resize(ko::utf8SafePrefixLength(title.data(), title.size(), MAX_CHAPTER_HEADING_TITLE_BYTES));
-    }
-    if (self->headingAnchor.size() > MAX_CHAPTER_HEADING_ANCHOR_BYTES) {
-      self->headingAnchor.resize(ko::utf8SafePrefixLength(
-          self->headingAnchor.data(), self->headingAnchor.size(), MAX_CHAPTER_HEADING_ANCHOR_BYTES));
-    }
-    const size_t metadataBytes = sizeof(ParsedChapterHeading) + title.size() + self->headingAnchor.size();
-    if (!title.empty() && self->chapterHeadings.size() < MAX_CHAPTER_HEADINGS &&
-        metadataBytes <= MAX_CHAPTER_HEADING_METADATA_BYTES -
-                             std::min(self->chapterHeadingMetadataBytes,
-                                      MAX_CHAPTER_HEADING_METADATA_BYTES)) {
-      self->chapterHeadings.push_back(
-          {std::move(title), std::move(self->headingAnchor), self->headingVisibleOffset, self->headingLevel});
-      self->chapterHeadingMetadataBytes += metadataBytes;
-    }
-    self->headingDepth = -1;
-    self->headingLevel = 0;
-    self->headingVisibleOffset = 0;
-    if (!self->headingAnchor.empty() && self->headingAnchor == self->latestTocAnchor) {
-      self->latestTocAnchor.clear();
-    }
-    self->headingAnchor.clear();
-    self->headingText.clear();
   }
 
   // Ruby text: </rt> distributes ruby to base words, </ruby> resets ruby state
@@ -1612,6 +1580,8 @@ bool ChapterHtmlSlimParser::beginParse() {
   blockStyleStack.clear();
   blockStyleStack.reserve(8);
   blockStyleStack.push_back(rootBlockStyle);
+  inlineStyleStack.clear();
+  xmlElementDepth = 0;
 
   auto paragraphAlignmentBlockStyle = BlockStyle();
   paragraphAlignmentBlockStyle.textAlignDefined = true;

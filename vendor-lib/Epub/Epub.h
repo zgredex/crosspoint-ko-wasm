@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <InflateBudget.h>
+
 #include "Epub/BookMetadataCache.h"
 #include "Epub/css/CssParser.h"
 
@@ -17,6 +19,8 @@ class ZipFile;
 inline constexpr size_t MAX_EPUB_IMAGE_BYTES = 128u * 1024u * 1024u;
 inline constexpr size_t MAX_EPUB_SPINE_BYTES = 256u * 1024u * 1024u;
 inline constexpr size_t MAX_EPUB_GUIDE_XHTML_BYTES = 16u * 1024u * 1024u;
+inline constexpr uint64_t MAX_EPUB_INFLATED_WORK_BYTES = 512ull * 1024ull * 1024ull;
+inline constexpr size_t MAX_EPUB_MANIFEST_ITEMS = 32768u;
 
 class Epub {
   // the ncx file (EPUB 2)
@@ -35,6 +39,10 @@ class Epub {
   std::unique_ptr<CssParser> cssParser;
   // CSS files
   std::vector<std::string> cssFiles;
+  // One monotonic budget follows the book for its entire lifetime. This counts
+  // every requested ZIP expansion, including repeated probes/retries, before
+  // the member payload is touched.
+  mutable InflateBudget inflateBudget{MAX_EPUB_INFLATED_WORK_BYTES};
 
   bool findContentOpfFile(std::string* contentOpfFile) const;
   bool parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, bool writeSpineEntries = true);
@@ -63,10 +71,10 @@ class Epub {
   std::string getThumbBmpPath() const;
   std::string getThumbBmpPath(int height) const;
   bool generateThumbBmp(int height) const;
-  uint8_t* readItemContentsToBytes(const std::string& itemHref, size_t* size = nullptr,
-                                   bool trailingNullByte = false, size_t maxOutputBytes = SIZE_MAX) const;
+  uint8_t* readItemContentsToBytes(const std::string& itemHref, size_t* size,
+                                   bool trailingNullByte, size_t maxOutputBytes) const;
   bool readItemContentsToStream(const std::string& itemHref, Print& out, size_t chunkSize,
-                                bool allowEarlyStop = false, size_t maxOutputBytes = SIZE_MAX) const;
+                                bool allowEarlyStop, size_t maxOutputBytes) const;
   // Extract an item to a file on SD. On failure the partial file is removed.
   bool extractItemToFile(const std::string& itemHref, const std::string& destPath,
                          size_t maxOutputBytes = MAX_EPUB_IMAGE_BYTES) const;

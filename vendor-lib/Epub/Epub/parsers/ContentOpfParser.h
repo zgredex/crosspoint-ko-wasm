@@ -41,6 +41,7 @@ class ContentOpfParser final : public Print {
   };
   std::deque<ItemIndexEntry> itemIndex;
   bool useItemIndex = false;
+  size_t manifestItemCount = 0;
 
   // FNV-1a hash function
   static uint32_t fnvHash(const std::string& s) {

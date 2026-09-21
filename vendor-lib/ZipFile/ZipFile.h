@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "InflateBudget.h"
+
 class ZipFile {
  public:
   // ONE record shape for every walker. Four independent re-decodings of the same structure is how the
@@ -99,13 +101,13 @@ class ZipFile {
   // These functions will open and close the zip as needed
   // maxOutputBytes bounds the DECLARED uncompressed size before anything is inflated: a decoder-side check
   // happens after the member has already expanded into memory-backed storage, which is too late.
-  uint8_t* readFileToMemory(const char* filename, size_t* size = nullptr, bool trailingNullByte = false,
-                            size_t maxOutputBytes = SIZE_MAX);
+  uint8_t* readFileToMemory(const char* filename, size_t* size, bool trailingNullByte,
+                            size_t maxOutputBytes, InflateBudget& workBudget);
   // allowEarlyStop: a short write from `out` is treated as the sink asking to
   // stop (returns true) instead of a write failure — used by header probes
   // that only need the first bytes of an entry.
-  bool readFileToStream(const char* filename, Print& out, size_t chunkSize, bool allowEarlyStop = false,
-                        size_t maxOutputBytes = SIZE_MAX);
+  bool readFileToStream(const char* filename, Print& out, size_t chunkSize, bool allowEarlyStop,
+                        size_t maxOutputBytes, InflateBudget& workBudget);
 
   template <typename F>
   bool enumerateFilePaths(F&& callback) {

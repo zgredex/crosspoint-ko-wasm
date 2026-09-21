@@ -193,6 +193,18 @@ not apply the EPUB reader's orientation setting. See
 - Layout verified on decoded pages: 28 px line height, uniform 38 px pitch, justified right
   edge ~465-471, paragraph indents (left edge outliers at +17/+46 px).
 
+## Defensive EPUB limits
+
+- Every ZIP expansion requires an explicit per-member ceiling; the generic ZIP and EPUB APIs have no
+  unlimited default. One EPUB instance also has a monotonic **512 MiB cumulative declared-expansion
+  budget**. Repeated and early-stopped reads remain charged so retries cannot multiply decompression work.
+- XHTML is rejected above **512 simultaneously open elements** using a counter independent of the
+  renderer's layout depth. OPF manifests are capped at **32,768 items**, matching the archive-entry ceiling.
+- The development/test `?epub=` loader accepts only same-origin URLs, rejects non-2xx responses, checks
+  `Content-Length`, and enforces a **512 MiB streaming byte limit** before constructing the EPUB Blob.
+- Chapter names and chapter-table entries come only from EPUB 3 navigation or EPUB 2 NCX. XHTML headings,
+  document titles, filenames, and synthetic `Chapter N` labels are neither captured nor used as names.
+
 ## Known limitations
 
 1. Image decode relies on JPEGDEC/PNGdec (portable C); very wide/slim PNGs beyond the PNGdec

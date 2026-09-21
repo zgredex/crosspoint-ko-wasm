@@ -394,12 +394,24 @@ else()
     add_executable(xtch_writer_integrity_test tests/xtch_writer_integrity_test.cpp)
     target_link_libraries(xtch_writer_integrity_test PRIVATE koengine)
     add_test(NAME xtch_writer_integrity COMMAND xtch_writer_integrity_test)
+    add_executable(resource_budget_test tests/resource_budget_test.cpp)
+    target_link_libraries(resource_budget_test PRIVATE koengine)
+    add_test(NAME resource_budget COMMAND resource_budget_test)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME epub_resource_limits
+               COMMAND ${Python3_EXECUTABLE}
+                       ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify/epub_resource_limits_gate.py
+                       $<TARGET_FILE:ko_xtch_host>)
+    endif()
     find_program(NODE_EXECUTABLE node)
     if(NODE_EXECUTABLE)
       add_test(NAME font_limits COMMAND ${NODE_EXECUTABLE}
                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify/font_limits_gate.js)
       add_test(NAME ui_defaults COMMAND ${NODE_EXECUTABLE}
                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify/ui_defaults_gate.js)
+      add_test(NAME remote_epub COMMAND ${NODE_EXECUTABLE}
+               ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify/remote_epub_gate.js)
     endif()
   endif()
 endif()

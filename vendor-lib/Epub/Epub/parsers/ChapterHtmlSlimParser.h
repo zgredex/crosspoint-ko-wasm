@@ -20,13 +20,6 @@ class Page;
 class GfxRenderer;
 class Epub;
 
-struct ParsedChapterHeading {
-  std::string title;
-  std::string anchor;
-  uint32_t visibleTextOffset = 0;
-  uint8_t level = 0;
-};
-
 #define MAX_WORD_SIZE 200
 
 class ChapterHtmlSlimParser {
@@ -36,6 +29,10 @@ class ChapterHtmlSlimParser {
   std::function<void(std::unique_ptr<Page>, uint16_t, uint16_t, uint32_t)> completePageFn;
   std::function<void()> popupFn;  // Popup callback
   bool imagePopupFired = false;   // popupFn fired for the first image probe (single-shot)
+  // This is deliberately independent from `depth`: the layout state machine
+  // skips depth changes for some ignored structures (notably nested tables),
+  // while the XML resource boundary must count every element.
+  size_t xmlElementDepth = 0;
   int depth = 0;
   int skipUntilDepth = INT_MAX;
   int boldUntilDepth = INT_MAX;
@@ -115,23 +112,6 @@ class ChapterHtmlSlimParser {
   bool syntheticCharacterData = false;
   uint16_t nonVisibleTextDepth = 0;
 
-  // Visible h1..h6 text is captured during the same parse that produces the
-  // pages.  This is deliberately not inferred from filenames or generic nav
-  // labels: the offset below maps the heading to the rendered page users see.
-  int headingDepth = -1;
-  uint8_t headingLevel = 0;
-  uint32_t headingVisibleOffset = 0;
-  std::string headingAnchor;
-  std::string headingText;
-  std::vector<ParsedChapterHeading> chapterHeadings;
-  size_t chapterHeadingMetadataBytes = 0;
-  // A TOC target is often placed on a wrapping <section>/<div> immediately
-  // before its heading rather than on the heading itself. Keep that exact
-  // zero-visible-text association so a same-page earlier heading cannot steal
-  // the navigation title during export.
-  std::string latestTocAnchor;
-  uint32_t latestTocAnchorVisibleOffset = 0;
-
   // Footnote link tracking
   bool insideFootnoteLink = false;
   int footnoteLinkDepth = -1;
@@ -159,7 +139,10 @@ class ChapterHtmlSlimParser {
   static EpdFontFamily::Style fontStyleForTextDecoration(CssTextDecoration decoration);
   static void applyDirectionToEntry(StyleStackEntry& entry, const CssStyle& css);
   static void applyTextDecorationToEntry(StyleStackEntry& entry, const CssStyle& css);
-  void pushDecorationStyleEntry(CssTextDecoration defaultDecoration, const CssStyle& cssStyle);
+  bool rejectResourceLimit(const char* message);
+  bool pushInlineStyleEntry(const StyleStackEntry& entry);
+  bool pushBlockStyleEntry(const BlockStyle& entry);
+  bool pushDecorationStyleEntry(CssTextDecoration defaultDecoration, const CssStyle& cssStyle);
   void emitHorizontalRule(const BlockStyle& blockStyle);
   // XML callbacks
   static void XMLCALL startElement(void* userData, const XML_Char* name, const XML_Char** atts);
@@ -218,8 +201,6 @@ class ChapterHtmlSlimParser {
 
   void addLineToPage(std::shared_ptr<TextBlock> line, uint32_t visibleOffset);
   const std::vector<std::pair<std::string, uint16_t>>& getAnchors() const { return anchorData; }
-  const std::vector<ParsedChapterHeading>& getChapterHeadings() const { return chapterHeadings; }
-
   // Byte progress of the in-flight parse, used to estimate a still-building section's total page
   // count (a giant single-spine book never fully lays out, so its real count is unknown). Valid
   // between beginParse() and finishParse()/abortParse().

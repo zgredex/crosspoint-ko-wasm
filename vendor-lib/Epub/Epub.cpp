@@ -796,7 +796,8 @@ uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size
 
   const std::string path = FsHelpers::normalisePath(itemHref);
 
-  const auto content = ZipFile(filepath).readFileToMemory(path.c_str(), size, trailingNullByte, maxOutputBytes);
+  const auto content =
+      ZipFile(filepath).readFileToMemory(path.c_str(), size, trailingNullByte, maxOutputBytes, inflateBudget);
   if (!content) {
     LOG_DBG("EBP", "Failed to read item %s", path.c_str());
     return nullptr;
@@ -813,7 +814,8 @@ bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, con
   }
 
   const std::string path = FsHelpers::normalisePath(itemHref);
-  return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize, allowEarlyStop, maxOutputBytes);
+  return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize, allowEarlyStop, maxOutputBytes,
+                                            inflateBudget);
 }
 
 bool Epub::extractItemToFile(const std::string& itemHref, const std::string& destPath,
