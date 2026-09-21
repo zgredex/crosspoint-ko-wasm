@@ -124,6 +124,7 @@ class ChapterHtmlSlimParser {
   std::string headingAnchor;
   std::string headingText;
   std::vector<ParsedChapterHeading> chapterHeadings;
+  size_t chapterHeadingMetadataBytes = 0;
   // A TOC target is often placed on a wrapping <section>/<div> immediately
   // before its heading rather than on the heading itself. Keep that exact
   // zero-visible-text association so a same-page earlier heading cannot steal

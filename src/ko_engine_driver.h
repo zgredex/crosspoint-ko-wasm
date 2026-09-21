@@ -270,6 +270,7 @@ class EngineDriver {
     pageCount_ = 0;
     spineDisplayTitles_.clear();
     spineDisplayTitlesResolved_.clear();
+    spineTitleProbeBytesRemaining_ = kMaxSpineTitleProbeBytesPerBook;
   }
 
   // A runtime device-profile change keeps the mounted EPUB but invalidates
@@ -308,6 +309,7 @@ class EngineDriver {
     }
     spineDisplayTitles_.assign(static_cast<size_t>(epub_->getSpineItemsCount()), std::string());
     spineDisplayTitlesResolved_.assign(static_cast<size_t>(epub_->getSpineItemsCount()), false);
+    spineTitleProbeBytesRemaining_ = kMaxSpineTitleProbeBytesPerBook;
     // Lazy image extraction: section builds only header-probe images; the first
     // render of an image page pulls the file out of the EPUB through this hook
     // (mirrors EpubReaderActivity::onEnter).
@@ -478,16 +480,22 @@ class EngineDriver {
       if (entry.spineIndex == spineIndex) navTitle = normalizeChapterTitle(entry.title);
     }
 
-    ChapterTitleProbe probe;
+    const size_t probeLimit = std::min(ChapterTitleProbe::kMaxProbeBytes,
+                                       spineTitleProbeBytesRemaining_);
+    ChapterTitleProbe probe(probeLimit);
     const auto item = epub_->getSpineItem(spineIndex);
-    // The ZIP member keeps its normal 256 MiB declared-size ceiling. The sink
-    // asks the inflater to stop after the first heading or 256 KiB, so labels
-    // do not materialize every spine merely to name the picker.
+    // The per-spine ceiling is backed by a per-book ceiling, so an adversarial
+    // EPUB with tens of thousands of tiny spines cannot multiply a bounded
+    // probe into gigabytes of decompression.
+    if (probeLimit > 0) {
 #ifdef KO_ORACLE_BUILD
-    epub_->readItemContentsToStream(item.href, probe, 2048, true);
+      epub_->readItemContentsToStream(item.href, probe, 2048, true);
 #else
-    epub_->readItemContentsToStream(item.href, probe, 2048, true, MAX_EPUB_SPINE_BYTES);
+      epub_->readItemContentsToStream(item.href, probe, 2048, true, MAX_EPUB_SPINE_BYTES);
 #endif
+      const size_t consumed = std::min(probe.consumedBytes(), spineTitleProbeBytesRemaining_);
+      spineTitleProbeBytesRemaining_ -= consumed;
+    }
     std::string visible = probe.headingTitle();
     if (visible.empty() && epub_->getSpineItemsCount() == 1) visible = probe.documentTitle();
 
@@ -623,8 +631,11 @@ class EngineDriver {
 
  private:
 
+  static constexpr size_t kMaxSpineTitleProbeBytesPerBook = 16u * 1024u * 1024u;
+
   mutable std::vector<std::string> spineDisplayTitles_;
   mutable std::vector<bool> spineDisplayTitlesResolved_;
+  mutable size_t spineTitleProbeBytesRemaining_ = kMaxSpineTitleProbeBytesPerBook;
 
   // Private implementation. No defaults: every argument is supplied by the two entry points above, so a
   // defaulted `dropGrayPlanes` can never be reached by accident — which is the whole point of the split.

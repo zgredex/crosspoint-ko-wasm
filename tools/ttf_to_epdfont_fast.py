@@ -14,6 +14,7 @@ Output is byte-for-byte identical to ttf_to_epdfont.py for the same inputs
 import argparse
 import ctypes
 import math
+import os
 import struct
 import sys
 from collections import namedtuple
@@ -22,6 +23,12 @@ import freetype
 
 EPDFONT_MAGIC = 0x46445045  # "EPDF"
 EPDFONT_VERSION = 1
+MAX_UNICODE = 0x10FFFF
+MAX_EXTRA_INTERVALS = 64
+MAX_REQUESTED_CODEPOINTS = 131072
+MAX_FONT_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_EPDFONT_BYTES = 64 * 1024 * 1024
+MAX_GLYPH_BITMAP_BYTES = 4 * 1024 * 1024
 
 # Synthetic bold via FreeType's FT_Outline_Embolden (26.6 px, 1/64 px units).
 # freetype-py exposes no embolden API, so load libfreetype directly. Resolution
@@ -118,6 +125,52 @@ def norm_ceil(val):
     return int(math.ceil(val / (1 << 6)))
 
 
+def require_range(value, lo, hi, label):
+    if not isinstance(value, int) or value < lo or value > hi:
+        raise ValueError(f"{label} is not representable in EPDFont v1: {value}")
+    return value
+
+
+def parse_additional_intervals(specs):
+    """Parse bounded MIN,MAX / MIN-MAX / MIN:MAX CLI ranges, fail closed."""
+    out = []
+    for spec in specs or ():
+        chunks = str(spec).split(';')
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            import re
+            match = re.fullmatch(r"(0[xX][0-9a-fA-F]+)\s*[-:,]\s*(0[xX][0-9a-fA-F]+)", chunk)
+            if not match:
+                raise ValueError(f"invalid Unicode interval: {chunk}")
+            a, b = int(match.group(1), 16), int(match.group(2), 16)
+            if a < 0 or b < a or b > MAX_UNICODE:
+                raise ValueError(f"invalid Unicode interval: {chunk}")
+            out.append((a, b))
+            if len(out) > MAX_EXTRA_INTERVALS:
+                raise ValueError("too many extra Unicode intervals")
+    return out
+
+
+def bounded_merged_intervals(intervals):
+    for a, b in intervals:
+        if not isinstance(a, int) or not isinstance(b, int) or a < 0 or b < a or b > MAX_UNICODE:
+            raise ValueError(f"invalid Unicode interval: {a!r},{b!r}")
+    merged = []
+    for a, b in sorted(intervals):
+        if merged and a <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    total = 0
+    for a, b in merged:
+        total += b - a + 1
+        if total > MAX_REQUESTED_CODEPOINTS:
+            raise ValueError("font intervals exceed the 131072-codepoint limit")
+    return merged
+
+
 def pack_2bit(raw):
     """Pack 8-bit gray rows (pitch==width, flat) into 2-bit glyph bytes.
 
@@ -172,6 +225,20 @@ def pack_1bit(raw):
 
 def convert_ttf_to_epdfont(font_files, font_name, size, output_path, additional_intervals=None,
                            is_2bit=False, embolden_px64=0):
+    if not 1 <= len(font_files) <= 4:
+        raise ValueError("font stack must contain between 1 and 4 faces")
+    total_source_size = 0
+    for path in font_files:
+        source_size = os.path.getsize(path)
+        if source_size < 4 or source_size > MAX_FONT_SOURCE_BYTES:
+            raise ValueError("invalid font source size")
+        total_source_size += source_size
+        if total_source_size > MAX_FONT_SOURCE_BYTES:
+            raise ValueError("font stack exceeds the supported 64 MiB source limit")
+    if not 6 <= size <= 72:
+        raise ValueError("font size must be in the range 6..72")
+    if not isinstance(embolden_px64, int) or not 0 <= embolden_px64 <= 160:
+        raise ValueError("embolden strength must be in the range 0..160")
     font_stack = [freetype.Face(f) for f in font_files]
     for face in font_stack:
         face.set_char_size(size << 6, size << 6, 150, 150)
@@ -187,23 +254,13 @@ def convert_ttf_to_epdfont(font_files, font_name, size, output_path, additional_
         (0x2200, 0x22FF), (0x2190, 0x21FF),
     ]
     korean_intervals = [
-        (0xAC00, 0xD7AF), (0x1100, 0x11FF), (0x3130, 0x318F), (0x3000, 0x303F),
+        (0xAC00, 0xD7A3), (0x1100, 0x11FF), (0x3130, 0x318F), (0x3000, 0x303F),
     ]
-    if additional_intervals:
-        for interval in additional_intervals:
-            parts = interval.split(',')
-            if len(parts) == 2:
-                intervals.append((int(parts[0], 0), int(parts[1], 0)))
+    intervals.extend(parse_additional_intervals(additional_intervals))
     if 'hangul' in font_name.lower() or 'korean' in font_name.lower() or 'hangeuljaemin' in font_name.lower():
         intervals.extend(korean_intervals)
 
-    unmerged = sorted(intervals)
-    merged = []
-    for a, b in unmerged:
-        if merged and a <= merged[-1][1] + 1:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
-        else:
-            merged.append((a, b))
+    merged = bounded_merged_intervals(intervals)
 
     # Validation: existence only — get_char_index, NO raster (stock rasterises here)
     validated = []
@@ -218,6 +275,11 @@ def convert_ttf_to_epdfont(font_files, font_name, size, output_path, additional_
             validated.append((start, b))
 
     print(f"Processing {len(validated)} intervals...")
+
+    glyph_count = sum(b - a + 1 for a, b in validated)
+    fixed_bytes = 32 + len(validated) * 12 + glyph_count * 16
+    if fixed_bytes > MAX_EPDFONT_BYTES:
+        raise ValueError("EPDFont metadata exceeds the supported 64 MiB limit")
 
     total_size = 0
     all_glyphs = []
@@ -237,28 +299,49 @@ def convert_ttf_to_epdfont(font_files, font_name, size, output_path, additional_
                     face = f
                     break
             if face is None:
-                continue
+                raise RuntimeError(f"validated glyph disappeared at U+{cp:04X}")
             bm = face.glyph.bitmap
             w, rows = bm.width, bm.rows
+            require_range(w, 0, 255, f"glyph width at U+{cp:04X}")
+            require_range(rows, 0, 255, f"glyph height at U+{cp:04X}")
             if w == 0 or rows == 0:
                 packed = b''
             else:
                 # Zero-copy C read of the glyph bitmap (freetype-py's .buffer
                 # builds a Python list per element — tens of millions of calls).
-                raw = ctypes.string_at(bm._FT_Bitmap.buffer, rows * abs(bm.pitch))
+                raw_size = rows * abs(bm.pitch)
+                if abs(bm.pitch) < w or raw_size > MAX_GLYPH_BITMAP_BYTES or \
+                        w * rows > MAX_GLYPH_BITMAP_BYTES:
+                    raise ValueError(f"glyph bitmap exceeds the 4 MiB limit at U+{cp:04X}")
+                if bm.pixel_mode != freetype.FT_PIXEL_MODE_GRAY or not bm._FT_Bitmap.buffer:
+                    raise RuntimeError(f"invalid FreeType grayscale bitmap at U+{cp:04X}")
+                raw_pitched = ctypes.string_at(bm._FT_Bitmap.buffer, raw_size)
+                pitch = abs(bm.pitch)
+                if pitch == w:
+                    raw = raw_pitched
+                else:
+                    row_order = range(rows - 1, -1, -1) if bm.pitch < 0 else range(rows)
+                    raw = b''.join(raw_pitched[y * pitch:y * pitch + w] for y in row_order)
                 packed = pack(raw)
+            if total_size > MAX_EPDFONT_BYTES - fixed_bytes - len(packed):
+                raise ValueError("converted epdfont exceeds the supported 64 MiB limit")
             total_size += len(packed)
             adv_x = face.glyph.advance.x
             if do_embolden:
                 # FT_Outline_Embolden leaves the advance untouched; a bolder
                 # glyph needs its pen advance grown by the same amount (26.6).
                 adv_x += embolden_px64
+            advance_x = require_range(norm_floor(adv_x), 0, 255, f"glyph advance at U+{cp:04X}")
+            left = require_range(face.glyph.bitmap_left, -32768, 32767,
+                                 f"glyph left bearing at U+{cp:04X}")
+            top = require_range(face.glyph.bitmap_top, -32768, 32767,
+                                f"glyph top bearing at U+{cp:04X}")
             all_glyphs.append((GlyphProps(
                 width=w,
                 height=rows,
-                advance_x=norm_floor(adv_x),
-                left=face.glyph.bitmap_left,
-                top=face.glyph.bitmap_top,
+                advance_x=advance_x,
+                left=left,
+                top=top,
                 data_length=len(packed),
                 data_offset=total_size - len(packed),
                 code_point=cp,
@@ -273,6 +356,9 @@ def convert_ttf_to_epdfont(font_files, font_name, size, output_path, additional_
     advance_y = norm_ceil(face.size.height)
     ascender = norm_ceil(face.size.ascender)
     descender = norm_floor(face.size.descender)
+    require_range(advance_y, 1, 255, "font line height")
+    require_range(ascender, -128, 127, "font ascender")
+    require_range(descender, -128, 127, "font descender")
 
     print(f"Generated {len(all_glyphs)} glyphs")
     print(f"Font metrics: advanceY={advance_y}, ascender={ascender}, descender={descender}")
@@ -287,6 +373,9 @@ def write_epdfont(output_path, intervals, all_glyphs, advance_y, ascender, desce
     intervals_offset = header_size
     glyphs_offset = intervals_offset + intervals_size
     bitmap_offset = glyphs_offset + glyphs_size
+    bitmap_bytes = sum(len(p) for _, p in all_glyphs)
+    if bitmap_offset > MAX_EPDFONT_BYTES or bitmap_bytes > MAX_EPDFONT_BYTES - bitmap_offset:
+        raise ValueError("converted epdfont exceeds the supported 64 MiB limit")
     bitmap_data = b''.join(p for _, p in all_glyphs)
 
     with open(output_path, 'wb') as f:

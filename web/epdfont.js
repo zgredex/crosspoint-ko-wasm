@@ -27,6 +27,12 @@
   var FT_JS = 'ft_wasm.js';
   var EPDFONT_MAGIC = 0x46445045;  // "EPDF"
   var EPDFONT_VERSION = 1;
+  var MAX_UNICODE = 0x10FFFF;
+  var MAX_EXTRA_INTERVALS = 64;
+  var MAX_REQUESTED_CODEPOINTS = 131072;
+  var MAX_FONT_SOURCE_BYTES = 64 * 1024 * 1024;
+  var MAX_EPDFONT_BYTES = 64 * 1024 * 1024;
+  var MAX_GLYPH_BITMAP_BYTES = 4 * 1024 * 1024;
 
   // ---- intervals (identical to the tool) ----------------------------------
   var DEFAULT_INTERVALS = [
@@ -56,16 +62,55 @@
     return out;
   }
 
-  // server.py accepts "0xNNNN-0xNNNN" / "0xNNNN:0xNNNN" chunks; keep that shape working.
-  function parseIntervalSpec(text) {
+  function validateIntervals(list, label, maxIntervals) {
+    if (!Array.isArray(list)) throw new Error(label + ' must be an array');
+    if (list.length > maxIntervals) throw new Error(label + ' contains too many ranges');
     var out = [];
-    String(text || '').split(',').forEach(function (chunk) {
-      chunk = chunk.trim();
-      if (!chunk) return;
-      var m = /^(0[xX][0-9a-fA-F]+)\s*[-:]\s*(0[xX][0-9a-fA-F]+)$/.exec(chunk);
-      if (m) out.push([parseInt(m[1], 16), parseInt(m[2], 16)]);
+    list.forEach(function (iv) {
+      if (!Array.isArray(iv) || iv.length !== 2 ||
+          !Number.isSafeInteger(iv[0]) || !Number.isSafeInteger(iv[1]) ||
+          iv[0] < 0 || iv[1] < iv[0] || iv[1] > MAX_UNICODE) {
+        throw new Error('invalid Unicode interval in ' + label);
+      }
+      out.push([iv[0], iv[1]]);
     });
     return out;
+  }
+
+  function boundedMergedIntervals(list) {
+    var merged = mergeIntervals(validateIntervals(list, 'font intervals',
+                                                   DEFAULT_INTERVALS.length + KOREAN_INTERVALS.length +
+                                                   MAX_EXTRA_INTERVALS + 1));
+    var total = 0;
+    merged.forEach(function (iv) {
+      total += iv[1] - iv[0] + 1;
+      if (!Number.isSafeInteger(total) || total > MAX_REQUESTED_CODEPOINTS) {
+        throw new Error('font intervals exceed the 131072-codepoint limit');
+      }
+    });
+    return merged;
+  }
+
+  // One or more ranges separated by semicolons. Each range accepts MIN-MAX,
+  // MIN:MAX, or the historical server form MIN,MAX. Non-empty malformed input
+  // is rejected rather than silently broadening/narrowing the requested font.
+  function parseIntervalSpec(text) {
+    var out = [];
+    String(text || '').split(';').forEach(function (chunk) {
+      chunk = chunk.trim();
+      if (!chunk) return;
+      var m = /^(0[xX][0-9a-fA-F]+)\s*[-:,]\s*(0[xX][0-9a-fA-F]+)$/.exec(chunk);
+      if (!m) throw new Error('invalid Unicode interval: ' + chunk);
+      out.push([parseInt(m[1], 16), parseInt(m[2], 16)]);
+    });
+    return validateIntervals(out, 'extra font intervals', MAX_EXTRA_INTERVALS);
+  }
+
+  function requireRange(value, min, max, label) {
+    if (!Number.isSafeInteger(value) || value < min || value > max) {
+      throw new Error(label + ' is not representable in EPDFont v1: ' + value);
+    }
+    return value;
   }
 
   // ---- packing (LUT + bit order identical to the tool) --------------------
@@ -144,37 +189,75 @@
   // ---- conversion ---------------------------------------------------------
   function createConverter(ft) {
     function convert(opts) {
+      opts = opts || {};
       var fontFiles = opts.fontFiles || [opts.fontBytes];
       var name = (opts.name || 'custom').replace(/[^\w-]/g, '') || 'custom';
-      var size = Math.max(6, Math.min(opts.size || 14, 72));
+      var requestedSize = opts.size === undefined ? 14 : Number(opts.size);
+      if (!Number.isFinite(requestedSize)) throw new Error('invalid font size');
+      var size = Math.max(6, Math.min(Math.trunc(requestedSize), 72));
       var twoBit = opts.twoBit !== false;
-      var weight = Math.max(100, Math.min(opts.weight || 500, 900));
+      var requestedWeight = opts.weight === undefined ? 500 : Number(opts.weight);
+      if (!Number.isFinite(requestedWeight)) throw new Error('invalid font weight');
+      var weight = Math.max(100, Math.min(Math.trunc(requestedWeight), 900));
       var onProgress = opts.onProgress || function () {};
-      var spacePx = (typeof opts.spacePx === 'number' && opts.spacePx >= 0 && opts.spacePx <= 255)
+      var spacePx = (Number.isSafeInteger(opts.spacePx) && opts.spacePx >= 0 && opts.spacePx <= 255)
         ? opts.spacePx : null;
 
+      if (!Array.isArray(fontFiles) || fontFiles.length < 1 || fontFiles.length > 4) {
+        throw new Error('font stack must contain between 1 and 4 faces');
+      }
+      var sourceBytes = 0;
+      fontFiles.forEach(function (b) {
+        if (!(b instanceof Uint8Array) || b.length < 4 || b.length > MAX_FONT_SOURCE_BYTES) {
+          throw new Error('invalid font source size');
+        }
+        sourceBytes += b.length;
+        if (!Number.isSafeInteger(sourceBytes) || sourceBytes > MAX_FONT_SOURCE_BYTES) {
+          throw new Error('font stack exceeds the supported 64 MiB source limit');
+        }
+      });
+
       ft._ftw_reset();
+      try {
       var handles = [];
       for (var f = 0; f < fontFiles.length; f++) {
         var b = fontFiles[f];
         var ptr = ft._malloc(b.length);
-        ft.HEAPU8.set(b, ptr);
-        var idx = ft._ftw_add_face(ptr, b.length);
-        ft._free(ptr);
+        if (!ptr) throw new Error('out of memory while loading font face ' + f);
+        var idx = -1;
+        try {
+          ft.HEAPU8.set(b, ptr);
+          idx = ft._ftw_add_face(ptr, b.length);
+        } finally {
+          ft._free(ptr);
+        }
         if (idx < 0) throw new Error('FreeType could not open the font (face ' + f + ')');
         handles.push(idx);
       }
-      handles.forEach(function (h) { ft._ftw_set_char_size(h, size << 6, 150); });
+      handles.forEach(function (h) {
+        if (!ft._ftw_set_char_size(h, size << 6, 150)) {
+          throw new Error('FreeType rejected the requested font size');
+        }
+      });
 
       // weight: variable fonts interpolate on their own axis; static faces embolden.
       var appliedEmbolden = 0, weightMode = 'native', native = null, effectiveWeight = weight;
       var minP = ft._malloc(4), maxP = ft._malloc(4);
+      if (!minP || !maxP) {
+        if (minP) ft._free(minP);
+        if (maxP) ft._free(maxP);
+        throw new Error('out of memory while reading font axes');
+      }
       var hasAxis = ft._ftw_wght_range(handles[0], minP, maxP) === 1;
       var axisMin = ft.HEAP32[minP >> 2], axisMax = ft.HEAP32[maxP >> 2];
       ft._free(minP); ft._free(maxP);
       if (hasAxis) {
         effectiveWeight = Math.max(axisMin, Math.min(weight, axisMax));
-        handles.forEach(function (h) { ft._ftw_set_wght(h, effectiveWeight); });
+        handles.forEach(function (h) {
+          if (!ft._ftw_set_wght(h, effectiveWeight)) {
+            throw new Error('FreeType rejected the requested weight');
+          }
+        });
         weightMode = 'wght-instance';
       } else {
         native = nativeWeight(fontFiles[0]);
@@ -188,11 +271,13 @@
         intervals = intervals.concat(KOREAN_INTERVALS);
       }
       if (!opts.noHangul) intervals.push(HANGUL_FULL);  // server.py default
+      var extras = [];
       (opts.extraIntervals || []).forEach(function (iv) {
-        if (Array.isArray(iv)) intervals.push(iv);
-        else intervals = intervals.concat(parseIntervalSpec(iv));
+        if (Array.isArray(iv)) extras.push(iv);
+        else extras = extras.concat(parseIntervalSpec(iv));
       });
-      var merged = mergeIntervals(intervals);
+      extras = validateIntervals(extras, 'extra font intervals', MAX_EXTRA_INTERVALS);
+      var merged = boundedMergedIntervals(intervals.concat(extras));
 
       // validation pass: existence only, no raster (the tool's speedup #1)
       var validated = [];
@@ -213,6 +298,15 @@
 
       var total = 0;
       validated.forEach(function (iv) { total += iv[1] - iv[0] + 1; });
+      if (total > MAX_REQUESTED_CODEPOINTS) throw new Error('validated font exceeds glyph limit');
+
+      // Metadata size is known before the first bitmap is copied or retained.
+      // This prevents a request that cannot fit the output ceiling from first
+      // constructing a large blobs[] graph and only failing at final assembly.
+      var fixedBytes = 32 + validated.length * 12 + total * 16;
+      if (!Number.isSafeInteger(fixedBytes) || fixedBytes > MAX_EPDFONT_BYTES) {
+        throw new Error('EPDFont metadata exceeds the supported 64 MiB limit');
+      }
 
       var props = [];      // {width, height, advanceX, left, top, length, offset, cp}
       var blobs = [];
@@ -228,29 +322,51 @@
             var g = ft._ftw_char_index(handles[h], cp);
             if (g > 0) { face = h; gi = g; break; }
           }
-          if (face < 0) continue;
+          if (face < 0) throw new Error('validated glyph disappeared at U+' + cp.toString(16).toUpperCase());
           if (appliedEmbolden > 0) {
-            if (!ft._ftw_load_outline(face, gi)) continue;
-            if (!ft._ftw_embolden(face, appliedEmbolden)) continue;
+            if (!ft._ftw_load_outline(face, gi)) {
+              throw new Error('FreeType outline load failed at U+' + cp.toString(16).toUpperCase());
+            }
+            if (!ft._ftw_embolden(face, appliedEmbolden)) {
+              throw new Error('FreeType embolden failed at U+' + cp.toString(16).toUpperCase());
+            }
           } else {
-            if (!ft._ftw_load_render(face, gi)) continue;
+            if (!ft._ftw_load_render(face, gi)) {
+              throw new Error('FreeType raster failed at U+' + cp.toString(16).toUpperCase());
+            }
           }
           var w = ft._ftw_bm_width(face), rows = ft._ftw_bm_rows(face);
+          requireRange(w, 0, 255, 'glyph width at U+' + cp.toString(16).toUpperCase());
+          requireRange(rows, 0, 255, 'glyph height at U+' + cp.toString(16).toUpperCase());
+          var bitmapBytes = w * rows;
+          if (!Number.isSafeInteger(bitmapBytes) || bitmapBytes > MAX_GLYPH_BITMAP_BYTES) {
+            throw new Error('glyph bitmap exceeds the 4 MiB limit at U+' + cp.toString(16).toUpperCase());
+          }
           var packed = null;
           if (w > 0 && rows > 0) {
             if (!ft._ftw_bitmap_is_gray(face)) {
               throw new Error('unexpected non-grayscale bitmap (pixel mode ' + ft._ftw_bitmap_is_gray(face) + ')');
             }
             var bptr = ft._ftw_bitmap(face);
-            packed = pack(ft.HEAPU8.subarray(bptr, bptr + w * rows));
+            if (!bptr) throw new Error('FreeType bitmap copy failed at U+' + cp.toString(16).toUpperCase());
+            packed = pack(ft.HEAPU8.subarray(bptr, bptr + bitmapBytes));
           } else {
             packed = new Uint8Array(0);
           }
           var advX = ft._ftw_advance_x(face);
           if (appliedEmbolden > 0) advX += appliedEmbolden;  // FreeType does not update it
+          var advanceX = requireRange(normFloor(advX), 0, 255,
+                                      'glyph advance at U+' + cp.toString(16).toUpperCase());
+          var left = requireRange(ft._ftw_bm_left(face), -32768, 32767,
+                                  'glyph left bearing at U+' + cp.toString(16).toUpperCase());
+          var top = requireRange(ft._ftw_bm_top(face), -32768, 32767,
+                                 'glyph top bearing at U+' + cp.toString(16).toUpperCase());
+          if (packedTotal > MAX_EPDFONT_BYTES - fixedBytes - packed.length) {
+            throw new Error('converted epdfont exceeds the supported 64 MiB limit');
+          }
           props.push({
-            width: w, height: rows, advanceX: normFloor(advX),
-            left: ft._ftw_bm_left(face), top: ft._ftw_bm_top(face),
+            width: w, height: rows, advanceX: advanceX,
+            left: left, top: top,
             length: packed.length, offset: packedTotal, codePoint: cp,
           });
           blobs.push(packed);
@@ -267,11 +383,17 @@
       var advanceY = normCeil(ft._ftw_size_height(metricFace));
       var ascender = normCeil(ft._ftw_size_ascender(metricFace));
       var descender = normFloor(ft._ftw_size_descender(metricFace));
+      requireRange(advanceY, 1, 255, 'font line height');
+      requireRange(ascender, -128, 127, 'font ascender');
+      requireRange(descender, -128, 127, 'font descender');
 
       var headerSize = 32;
       var intervalsSize = validated.length * 12;
       var glyphsSize = props.length * 16;
       var bitmapOffset = headerSize + intervalsSize + glyphsSize;
+      if (bitmapOffset !== fixedBytes || bitmapOffset + packedTotal > MAX_EPDFONT_BYTES) {
+        throw new Error('converted epdfont exceeds the supported 64 MiB limit');
+      }
       var outBytes = new Uint8Array(bitmapOffset + packedTotal);
       var dv = new DataView(outBytes.buffer);
 
@@ -279,9 +401,9 @@
       dv.setUint16(4, EPDFONT_VERSION, true);
       outBytes[6] = twoBit ? 1 : 0;
       outBytes[7] = 0;
-      outBytes[8] = advanceY & 0xFF;
-      outBytes[9] = ascender & 0xFF;      // int8 semantics: the reader reinterprets
-      outBytes[10] = descender & 0xFF;
+      dv.setUint8(8, advanceY);
+      dv.setInt8(9, ascender);
+      dv.setInt8(10, descender);
       outBytes[11] = 0;
       dv.setUint32(12, validated.length, true);
       dv.setUint32(16, props.length, true);
@@ -299,9 +421,9 @@
         off += 12;
       });
       props.forEach(function (p) {
-        outBytes[off] = p.width & 0xFF;
-        outBytes[off + 1] = p.height & 0xFF;
-        outBytes[off + 2] = p.advanceX & 0xFF;
+        outBytes[off] = p.width;
+        outBytes[off + 1] = p.height;
+        outBytes[off + 2] = p.advanceX;
         outBytes[off + 3] = 0;
         dv.setInt16(off + 4, p.left, true);
         dv.setInt16(off + 6, p.top, true);
@@ -319,7 +441,7 @@
           if (a <= 0x20 && 0x20 <= z) {
             var gidx = dv.getUint32(32 + i * 12 + 8, true);
             var rec = 32 + intervalsSize + (gidx + (0x20 - a)) * 16;
-            if (rec + 16 <= outBytes.length) outBytes[rec + 2] = spacePx & 0xFF;
+            if (rec + 16 <= outBytes.length) outBytes[rec + 2] = spacePx;
             break;
           }
         }
@@ -334,6 +456,9 @@
         weightMode: weightMode, effectiveWeight: effectiveWeight,
         nativeWeight: native, emboldenPx64: appliedEmbolden,
       };
+      } finally {
+        ft._ftw_reset();
+      }
     }
 
     return { convert: convert };
@@ -366,6 +491,13 @@
       parseIntervalSpec: parseIntervalSpec, nativeWeight: nativeWeight,
       weightToEmboldenPx64: weightToEmboldenPx64, DEFAULT_INTERVALS: DEFAULT_INTERVALS,
       KOREAN_INTERVALS: KOREAN_INTERVALS,
+      validateIntervals: validateIntervals, boundedMergedIntervals: boundedMergedIntervals,
+      requireRange: requireRange,
+      MAX_EXTRA_INTERVALS: MAX_EXTRA_INTERVALS,
+      MAX_REQUESTED_CODEPOINTS: MAX_REQUESTED_CODEPOINTS,
+      MAX_FONT_SOURCE_BYTES: MAX_FONT_SOURCE_BYTES,
+      MAX_EPDFONT_BYTES: MAX_EPDFONT_BYTES,
+      MAX_GLYPH_BITMAP_BYTES: MAX_GLYPH_BITMAP_BYTES,
     },
   };
 }));

@@ -13,6 +13,7 @@
 #include <new>
 
 #include "../../../../src/fontIds.h"
+#include "../../../../src/utf8_utils.h"
 #include "Epub.h"
 #include "Epub/Page.h"
 #include "Epub/VisibleTextUtils.h"
@@ -24,6 +25,10 @@
 // Minimum file size (in bytes) to show indexing popup - smaller chapters don't benefit from it
 constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
 constexpr size_t PARSE_BUFFER_SIZE = 1024;
+constexpr size_t MAX_CHAPTER_HEADINGS = 256;
+constexpr size_t MAX_CHAPTER_HEADING_TITLE_BYTES = 1024;
+constexpr size_t MAX_CHAPTER_HEADING_ANCHOR_BYTES = 4096;
+constexpr size_t MAX_CHAPTER_HEADING_METADATA_BYTES = 128 * 1024;
 
 // This number comes from PR #73
 // If we have > 750 words buffered up, perform the layout and consume out all but the last line
@@ -1398,9 +1403,21 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
   if (self->headingDepth >= 0 && self->depth - 1 == self->headingDepth &&
       matches(name, HEADER_TAGS, std::size(HEADER_TAGS))) {
     std::string title = trimAndNormalize(self->headingText);
-    if (!title.empty()) {
+    if (title.size() > MAX_CHAPTER_HEADING_TITLE_BYTES) {
+      title.resize(ko::utf8SafePrefixLength(title.data(), title.size(), MAX_CHAPTER_HEADING_TITLE_BYTES));
+    }
+    if (self->headingAnchor.size() > MAX_CHAPTER_HEADING_ANCHOR_BYTES) {
+      self->headingAnchor.resize(ko::utf8SafePrefixLength(
+          self->headingAnchor.data(), self->headingAnchor.size(), MAX_CHAPTER_HEADING_ANCHOR_BYTES));
+    }
+    const size_t metadataBytes = sizeof(ParsedChapterHeading) + title.size() + self->headingAnchor.size();
+    if (!title.empty() && self->chapterHeadings.size() < MAX_CHAPTER_HEADINGS &&
+        metadataBytes <= MAX_CHAPTER_HEADING_METADATA_BYTES -
+                             std::min(self->chapterHeadingMetadataBytes,
+                                      MAX_CHAPTER_HEADING_METADATA_BYTES)) {
       self->chapterHeadings.push_back(
           {std::move(title), std::move(self->headingAnchor), self->headingVisibleOffset, self->headingLevel});
+      self->chapterHeadingMetadataBytes += metadataBytes;
     }
     self->headingDepth = -1;
     self->headingLevel = 0;

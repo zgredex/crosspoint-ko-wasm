@@ -146,6 +146,16 @@ function check(ok, label, detail) {
         'refused margins leave the viewport unchanged');
   check(api._ko_set_orientation(0) === 0, 'orientation restored to portrait');
 
+  // A successful pooled-spine transfer is explicitly released once copied;
+  // no accessor may retain stale bytes or metadata afterwards.
+  const encodedPages = api._ko_encode_spine(0);
+  check(encodedPages > 0 && api._ko_spine_data_size() > 0,
+        'standalone spine encode publishes a complete transfer');
+  api._ko_spine_release();
+  check(api._ko_spine_page_count() === 0 && api._ko_spine_data_size() === 0 &&
+        api._ko_spine_toc_count() === 0,
+        'spine release clears every transfer accessor');
+
   // ---- 7. invalid spine indices are refused everywhere (they used to clamp to spine 0) ------------
   loadBytes(good);
   const count = api._ko_load_epub ? loadBytes(good) : 0;
@@ -153,6 +163,9 @@ function check(ok, label, detail) {
     check(api._ko_build_spine(bad) < 0, `build_spine(${bad}) refused`);
     check(api._ko_start_spine(bad, 1) < 0, `start_spine(${bad}) refused`);
     check(api._ko_encode_spine(bad) < 0, `encode_spine(${bad}) refused`);
+    check(api._ko_spine_page_count() === 0 && api._ko_spine_data_size() === 0 &&
+          api._ko_spine_toc_count() === 0,
+          `encode_spine(${bad}) left no readable transfer state`);
     check(api._ko_export_begin() > 0, 'export_begin for the invalid-spine case');
     check(api._ko_export_spine(bad) < 0, `export_spine(${bad}) refused`);
     check(api._ko_export_finish() < 0, `export_finish refused after export_spine(${bad})`);
@@ -314,7 +327,7 @@ function check(ok, label, detail) {
   const onePtr = api._malloc(4); u32(onePtr)[0] = expectedGrayRecord;
   check(api._ko_plan_begin(1) === 0 && api._ko_plan_add_spine(onePtr, 1) === 1,
         'one-page plan starts for metadata range checks');
-  check(api._ko_plan_add_toc(2147483647, 0, 2147483647) < 0,
+  check(api._ko_plan_add_toc(2147483647, 0, 2147483647, 0) < 0,
         'overflowing TOC page arithmetic is rejected');
   check(api._ko_plan_begin(1) === 0,
         'metadata rejection also rolls the plan back');

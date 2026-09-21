@@ -2070,8 +2070,13 @@ case 'openPreview': {
         // On demand: the engine probes visible XHTML headings and uses an
         // exact-spine navigation label only as fallback. The href is retained
         // solely for a book with neither source.
-        const start = Math.max(0, ev.data.start | 0);
-        const count = Math.max(1, ev.data.count | 0);
+        const start = Number(ev.data.start);
+        const requestedCount = Number(ev.data.count);
+        if (!Number.isSafeInteger(start) || start < 0 || start > spineCount ||
+            !Number.isSafeInteger(requestedCount) || requestedCount < 1) {
+          throw new Error('invalid spine label range');
+        }
+        const count = Math.min(100, requestedCount);
         const end = Math.min(spineCount, start + count);
         const hrefs = [];
         const titles = [];
@@ -2128,6 +2133,9 @@ case 'openPreview': {
             fallbackName: api.UTF8ToString(api._ko_spine_fallback_name()),
           }, [bytes.buffer]);
         } finally {
+          // Safe after success and every partial failure. JS-owned copies above
+          // remain valid; all C accessors become empty immediately.
+          if (api && api._ko_spine_release) api._ko_spine_release();
           foregroundExportRunning = false;
         }
         break;
@@ -2162,7 +2170,8 @@ case 'openPreview': {
               api._free(lptr);
             }
             for (const t of (sp.toc || [])) {
-              if (withCString(t.title, (tp) => api._ko_plan_add_toc(base, tp, t.localPage | 0)) < 0) {
+              if (withCString(t.title, (tp) => api._ko_plan_add_toc(
+                    base, tp, t.localPage | 0, t.tocIndex < 0 ? 1 : 0)) < 0) {
                 throw new Error('plan TOC entry rejected');
               }
             }
@@ -2266,7 +2275,8 @@ case 'openPreview': {
             byteStart += chunkSize;
           }
           for (const t of (sp.toc || [])) {
-            if (withCString(t.title, (tp) => api._ko_assemble_add_toc(base, tp, t.localPage | 0)) < 0) {
+            if (withCString(t.title, (tp) => api._ko_assemble_add_toc(
+                  base, tp, t.localPage | 0, t.tocIndex < 0 ? 1 : 0)) < 0) {
               throw new Error('assembly TOC entry rejected');
             }
           }

@@ -10,7 +10,7 @@ Form fields (multipart):
   name      — font name (default "custom")
   size      — point size (default 14, the KO reader size)
   twoBit    — "1" → 2-bit grayscale (KO default), "0"/absent → 1-bit
-  extraIntervals — optional comma-separated "MIN,MAX" hex ranges (repeatable)
+  extraIntervals — optional "MIN,MAX" hex ranges separated by semicolons
 
 Requires freetype-py + fonttools for the python3 that runs this server.
 """
@@ -55,6 +55,51 @@ _RAW_FONT_CACHE_MAX = 6
 MAX_FONT_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_EPDFONT_BYTES = 64 * 1024 * 1024
 MAX_FONT_MULTIPART_BYTES = MAX_FONT_SOURCE_BYTES + 1024 * 1024
+MAX_EXTRA_INTERVALS = 64
+MAX_REQUESTED_CODEPOINTS = 131072
+MAX_UNICODE = 0x10FFFF
+_FONT_BASE_INTERVALS = [
+    (0x0000, 0x007F), (0x0080, 0x00FF), (0x0100, 0x017F),
+    (0x2000, 0x206F), (0x2010, 0x203A), (0x2040, 0x205F),
+    (0x20A0, 0x20CF), (0x0300, 0x036F), (0x0400, 0x04FF),
+    (0x2200, 0x22FF), (0x2190, 0x21FF),
+]
+
+
+def parse_font_intervals(spec, include_hangul):
+    """Return canonical bounded converter ranges, rejecting malformed input."""
+    extra = []
+    for chunk in str(spec or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        match = re.fullmatch(r"(0[xX][0-9a-fA-F]+)\s*[-:,]\s*(0[xX][0-9a-fA-F]+)", chunk)
+        if not match:
+            raise ValueError("invalid Unicode interval: %s" % chunk)
+        a, b = int(match.group(1), 16), int(match.group(2), 16)
+        if a < 0 or b < a or b > MAX_UNICODE:
+            raise ValueError("invalid Unicode interval: %s" % chunk)
+        extra.append((a, b))
+        if len(extra) > MAX_EXTRA_INTERVALS:
+            raise ValueError("too many extra Unicode intervals")
+
+    requested = list(_FONT_BASE_INTERVALS)
+    if include_hangul:
+        requested.append((0xAC00, 0xD7A3))
+    requested.extend(extra)
+    merged = []
+    for a, b in sorted(requested):
+        if merged and a <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    if sum(b - a + 1 for a, b in merged) > MAX_REQUESTED_CODEPOINTS:
+        raise ValueError("font intervals exceed the 131072-codepoint limit")
+    result = []
+    if include_hangul:
+        result.append("0xAC00,0xD7A3")
+    result.extend("0x%X,0x%X" % (a, b) for a, b in extra)
+    return result
 
 
 def _read_body(handler):
@@ -314,18 +359,14 @@ class Handler(SimpleHTTPRequestHandler):
         two_bit = (fields.get("twoBit") or "1") == "1"
         # The converter only includes Hangul when the font NAME says korean or
         # an explicit interval is given. KO reader faces need full modern
-        # Hangul (U+AC00..U+D7AF) — pass it by default, like the doc command.
+        # Hangul (U+AC00..U+D7A3) — pass it by default, like the doc command.
         extra = fields.get("extraIntervals") or ""
-        extra_intervals = []
-        if (fields.get("noHangul") or "0") != "1":
-            extra_intervals.append("0xAC00,0xD7AF")
-        for chunk in extra.split(","):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            m = re.match(r"^(0[xX][0-9a-fA-F]+)\s*[-:]\s*(0[xX][0-9a-fA-F]+)$", chunk)
-            if m:
-                extra_intervals.append("0x%X,0x%X" % (int(m.group(1), 16), int(m.group(2), 16)))
+        try:
+            extra_intervals = parse_font_intervals(
+                extra, (fields.get("noHangul") or "0") != "1")
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+            return
         # spacePx patch value (default: no patch)
         sp_raw = fields.get("spacePx")
         space_px = None
@@ -394,7 +435,11 @@ class Handler(SimpleHTTPRequestHandler):
                         "stdout": (proc.stdout or b"").decode("utf-8", "replace")[-2000:],
                     })
                     return
-                data = bytearray(open(out, "rb").read())
+                with open(out, "rb") as converted:
+                    data = bytearray(converted.read(MAX_EPDFONT_BYTES + 1))
+                if not data or len(data) > MAX_EPDFONT_BYTES:
+                    self.send_json(400, {"error": "converted epdfont exceeds the supported 64 MiB limit"})
+                    return
                 if len(_CONVERT_CACHE) >= _CONVERT_CACHE_MAX:
                     _CONVERT_CACHE.pop(next(iter(_CONVERT_CACHE)))
                 _CONVERT_CACHE[ck] = (bytes(data), weight_mode, applied_embolden, native_weight,

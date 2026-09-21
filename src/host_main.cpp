@@ -507,7 +507,7 @@ int main(int argc, char** argv) {
   struct PoolSpine {
     std::vector<uint8_t> flat;
     std::vector<uint32_t> off, len;
-    struct Anchor { std::string title; int localPage; };
+    struct Anchor { std::string title; int localPage; bool inferred = false; };
     std::vector<Anchor> toc;
     std::string fallback;
     int pages = 0;
@@ -599,18 +599,28 @@ int main(int argc, char** argv) {
         int local_ = anchor.empty() ? -1 : driver.anchorLocalPage(anchor);
         if (local_ < 0 || local_ >= renderedThisSpine) local_ = 0;
         const std::string chapterTitle = driver.currentChapterTitle(anchor, local_, driver.tocTitle(t));
-        tocCandidates.push_back({chapterTitle, static_cast<uint32_t>(chapterStart + local_)});
-        resolvedChapterAnchors.push_back({chapterTitle, local_});
-        namedLocalPages.push_back(local_);
+        if (ko::retainChapterCandidate(
+                tocCandidates,
+                {chapterTitle, static_cast<uint32_t>(chapterStart + local_), false})) {
+          if (resolvedChapterAnchors.size() < 2 * ko::MAX_EXPORTED_CHAPTERS) {
+            resolvedChapterAnchors.push_back({chapterTitle, local_, false});
+          }
+          namedLocalPages.push_back(local_);
+        }
       }
       for (const auto& heading : driver.currentSectionChapterHeadings()) {
         const int local_ = static_cast<int>(heading.localPage);
         if (local_ < 0 || local_ >= renderedThisSpine ||
             std::find(namedLocalPages.begin(), namedLocalPages.end(), local_) != namedLocalPages.end()) continue;
         const std::string chapterTitle = ko::normalizeChapterTitle(heading.title);
-        tocCandidates.push_back({chapterTitle, static_cast<uint32_t>(chapterStart + local_)});
-        resolvedChapterAnchors.push_back({chapterTitle, local_});
-        namedLocalPages.push_back(local_);
+        if (ko::retainChapterCandidate(
+                tocCandidates,
+                {chapterTitle, static_cast<uint32_t>(chapterStart + local_), true})) {
+          if (resolvedChapterAnchors.size() < 2 * ko::MAX_EXPORTED_CHAPTERS) {
+            resolvedChapterAnchors.push_back({chapterTitle, local_, true});
+          }
+          namedLocalPages.push_back(local_);
+        }
       }
       std::string href = driver.spineHref(spine);
       const size_t slash = href.find_last_of('/');
@@ -711,7 +721,10 @@ int main(int argc, char** argv) {
           return 1;
         }
       }
-      for (const PoolSpine::Anchor& a : ps.toc) cands.push_back({a.title, static_cast<uint32_t>(base + a.localPage)});
+      for (const PoolSpine::Anchor& a : ps.toc) {
+        ko::retainChapterCandidate(
+            cands, {a.title, static_cast<uint32_t>(base + a.localPage), a.inferred});
+      }
       ko::XtchChapter ch;
       ch.name = ps.fallback;
       ch.startPage = static_cast<uint16_t>(base);

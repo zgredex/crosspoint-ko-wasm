@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -5,7 +6,9 @@
 #include <vector>
 
 #include "xtch_writer.h"
+#include "xtch_chapters.h"
 #include "chapter_title_probe.h"
+#include "Epub/Section.h"
 
 namespace {
 
@@ -34,6 +37,26 @@ int main() {
     probe.write(reinterpret_cast<const uint8_t*>(xhtml.data()), xhtml.size());
     if (probe.headingTitle() != "제1장 진짜 이름 & 시작") {
       std::cerr << "streaming XHTML heading probe did not recover the visible title\n";
+      return 1;
+    }
+  }
+  {
+    const std::string xhtml(512, 'x');
+    ko::ChapterTitleProbe probe(64);
+    probe.write(reinterpret_cast<const uint8_t*>(xhtml.data()), xhtml.size());
+    if (probe.consumedBytes() != 64) {
+      std::cerr << "streaming title probe did not enforce its injected byte limit\n";
+      return 1;
+    }
+  }
+  {
+    const std::string malformed = "<html><body></html>";
+    ko::ChapterTitleProbe probe(64);
+    probe.write(reinterpret_cast<const uint8_t*>(malformed.data()), malformed.size());
+    const size_t charged = probe.consumedBytes();
+    probe.write(reinterpret_cast<const uint8_t*>(malformed.data()), malformed.size());
+    if (charged != malformed.size() || probe.consumedBytes() != charged) {
+      std::cerr << "streaming title probe did not charge the malformed terminal chunk exactly once\n";
       return 1;
     }
   }
@@ -81,6 +104,43 @@ int main() {
 
   if (!writer.buildPrefix({}, {}).empty()) {
     std::cerr << "zero-page prefix was accepted\n";
+    return 1;
+  }
+
+  {
+    std::vector<ko::ChapterCandidate> candidates;
+    candidates.push_back({"First real", 0, false});
+    for (uint32_t page = 1; page <= 99; ++page) {
+      candidates.push_back({"Inferred " + std::to_string(page), page, true});
+    }
+    candidates.push_back({"Late real", 150, false});
+    const auto chapters = ko::buildChapters(candidates, {}, 200);
+    const bool keptLateReal = std::any_of(chapters.begin(), chapters.end(), [](const auto& chapter) {
+      return chapter.name == "Late real" && chapter.startPage == 150;
+    });
+    if (chapters.size() != 100 || !keptLateReal) {
+      std::cerr << "inferred headings displaced an authoritative navigation entry\n";
+      return 1;
+    }
+  }
+  {
+    std::vector<ko::ChapterCandidate> retained;
+    for (uint32_t page = 0; page < 150; ++page) {
+      ko::retainChapterCandidate(retained, {"Inferred " + std::to_string(page), page, true});
+    }
+    ko::retainChapterCandidate(retained, {"Late real", 150, false});
+    const auto chapters = ko::buildChapters(retained, {}, 200);
+    const bool keptLateReal = std::any_of(chapters.begin(), chapters.end(), [](const auto& chapter) {
+      return chapter.name == "Late real" && chapter.startPage == 150;
+    });
+    if (retained.size() != 101 || chapters.size() != 100 || !keptLateReal) {
+      std::cerr << "bounded candidate collector displaced a late authoritative entry\n";
+      return 1;
+    }
+  }
+  if (Section::canAppendSectionPage(Section::MAX_SECTION_PAGES) ||
+      !Section::canAppendSectionPage(Section::MAX_SECTION_PAGES - 1)) {
+    std::cerr << "section page-count serialization boundary is not enforced\n";
     return 1;
   }
 

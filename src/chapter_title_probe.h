@@ -116,7 +116,8 @@ class ChapterTitleProbe final : public Print {
  public:
   static constexpr size_t kMaxProbeBytes = 256u * 1024u;
 
-  ChapterTitleProbe() {
+  explicit ChapterTitleProbe(size_t maxBytes = kMaxProbeBytes)
+      : maxBytes_(std::min(maxBytes, kMaxProbeBytes)) {
     parser_ = XML_ParserCreate(nullptr);
     if (parser_) {
       XML_SetUserData(parser_, this);
@@ -129,18 +130,27 @@ class ChapterTitleProbe final : public Print {
 
   size_t write(uint8_t byte) override { return write(&byte, 1); }
   size_t write(const uint8_t* data, size_t size) override {
-    if (!parser_ || done_ || consumed_ >= kMaxProbeBytes) return 0;
-    const size_t take = std::min(size, kMaxProbeBytes - consumed_);
+    if (done_ || consumed_ >= maxBytes_) return 0;
+    const size_t take = std::min(size, maxBytes_ - consumed_);
+    // Charge every byte delivered by the inflater, including the chunk that
+    // exposes malformed XML (or arrives after parser allocation failed). The
+    // per-book budget is a decompression-work ceiling, not merely a count of
+    // bytes Expat accepted successfully.
+    consumed_ += take;
+    if (!parser_) {
+      done_ = true;
+      return 0;
+    }
     if (XML_Parse(parser_, reinterpret_cast<const char*>(data), static_cast<int>(take), false) ==
         XML_STATUS_ERROR) {
       destroyXmlParser(parser_);
       parser_ = nullptr;
+      done_ = true;
       return 0;
     }
-    consumed_ += take;
     // A short write asks ZipFile's explicitly-enabled early-stop path to stop
     // inflating without pretending the unconsumed member was CRC-verified.
-    return done_ || take != size || consumed_ == kMaxProbeBytes ? 0 : size;
+    return done_ || take != size || consumed_ == maxBytes_ ? 0 : size;
   }
 
   std::string bestTitle() const {
@@ -149,6 +159,7 @@ class ChapterTitleProbe final : public Print {
   }
   std::string headingTitle() const { return normalizeChapterTitle(heading_); }
   std::string documentTitle() const { return normalizeChapterTitle(documentTitle_); }
+  size_t consumedBytes() const { return consumed_; }
 
  private:
   static bool headingTag(const char* name) {
@@ -230,6 +241,7 @@ class ChapterTitleProbe final : public Print {
   }
 
   XML_Parser parser_ = nullptr;
+  size_t maxBytes_ = kMaxProbeBytes;
   size_t consumed_ = 0;
   int depth_ = 0;
   int titleDepth_ = -1;

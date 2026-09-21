@@ -22,6 +22,7 @@
  * build: scripts/build_ft_wasm.sh  (needs emcc; FreeType comes from -sUSE_FREETYPE=1)
  */
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 #include <ft2build.h>
@@ -32,6 +33,7 @@
 #include <emscripten.h>
 
 #define FTW_MAX_FACES 4
+#define FTW_MAX_BITMAP_BYTES (4u * 1024u * 1024u)
 
 static FT_Library g_lib = NULL;
 static FT_Face g_faces[FTW_MAX_FACES];
@@ -39,6 +41,16 @@ static unsigned char* g_face_data[FTW_MAX_FACES]; /* owned copies */
 static int g_face_count = 0;
 static unsigned char* g_rows = NULL; /* contiguous bitmap rows, grown as needed */
 static size_t g_rows_cap = 0;
+
+static int bitmap_within_limit(const FT_Bitmap* bm) {
+  if (!bm) return 0;
+  if (bm->width == 0 || bm->rows == 0) return 1;
+  if ((size_t)bm->width > FTW_MAX_BITMAP_BYTES / (size_t)bm->rows) return 0;
+  const size_t tight = (size_t)bm->width * (size_t)bm->rows;
+  const size_t pitch = bm->pitch < 0 ? (size_t)(-(int64_t)bm->pitch) : (size_t)bm->pitch;
+  if (pitch < bm->width || pitch > FTW_MAX_BITMAP_BYTES / (size_t)bm->rows) return 0;
+  return tight <= FTW_MAX_BITMAP_BYTES && pitch * (size_t)bm->rows <= FTW_MAX_BITMAP_BYTES;
+}
 
 EMSCRIPTEN_KEEPALIVE int ftw_init(void) {
   if (g_lib) return 1;
@@ -71,6 +83,9 @@ EMSCRIPTEN_KEEPALIVE void ftw_reset(void) {
     g_face_data[i] = NULL;
   }
   g_face_count = 0;
+  free(g_rows);
+  g_rows = NULL;
+  g_rows_cap = 0;
 }
 
 EMSCRIPTEN_KEEPALIVE int ftw_set_char_size(int idx, int size26_6, int dpi) {
@@ -144,7 +159,8 @@ EMSCRIPTEN_KEEPALIVE int ftw_set_wght(int idx, int wght) {
 
 EMSCRIPTEN_KEEPALIVE int ftw_load_render(int idx, unsigned int gi) {
   if (idx < 0 || idx >= g_face_count) return 0;
-  return FT_Load_Glyph(g_faces[idx], (FT_UInt)gi, FT_LOAD_RENDER) == 0 ? 1 : 0;
+  if (FT_Load_Glyph(g_faces[idx], (FT_UInt)gi, FT_LOAD_RENDER) != 0) return 0;
+  return bitmap_within_limit(&g_faces[idx]->glyph->bitmap);
 }
 
 EMSCRIPTEN_KEEPALIVE int ftw_load_outline(int idx, unsigned int gi) {
@@ -175,10 +191,12 @@ EMSCRIPTEN_KEEPALIVE int ftw_embolden(int idx, int strength26_6) {
                   * no contour. The Python tool used to raise here and abort the whole
                   * conversion; both sides now render plainly instead (same rule in
                   * tools/ttf_to_epdfont_fast.py). */
-    return FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) == 0 ? 2 : 0;
+    if (FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) != 0) return 0;
+    return bitmap_within_limit(&slot->bitmap) ? 2 : 0;
   }
   if (rc != 0) return 0;
-  return FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) == 0 ? 1 : 0;
+  if (FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) != 0) return 0;
+  return bitmap_within_limit(&slot->bitmap);
 }
 
 EMSCRIPTEN_KEEPALIVE unsigned int ftw_bm_width(int idx) {
@@ -212,6 +230,7 @@ EMSCRIPTEN_KEEPALIVE const unsigned char* ftw_bitmap(int idx) {
   if (idx < 0 || idx >= g_face_count) return NULL;
   FT_Bitmap* bm = &g_faces[idx]->glyph->bitmap;
   if (!bm->buffer || !bm->width || !bm->rows) return NULL;
+  if (!bitmap_within_limit(bm)) return NULL;
   const size_t need = (size_t)bm->width * bm->rows;
   if (need > g_rows_cap) {
     unsigned char* grown = (unsigned char*)realloc(g_rows, need);

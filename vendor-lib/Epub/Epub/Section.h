@@ -65,6 +65,7 @@ class Section {
   // Pages laid out by the active build (== build_->lut.size()). Distinct from pageCount,
   // which is the pages *available to read* and also counts a loaded partial file's pages.
   uint16_t builtPageCount_ = 0;
+  bool pageLimitExceeded_ = false;
   // A partial section file (suspended build from a previous session) is loaded at filePath.
   // Its pages 0..partialPageCount_-1 are readable while a rebuild extends past them.
   bool partial_ = false;
@@ -86,6 +87,8 @@ class Section {
   std::unique_ptr<Page> loadPageDuringBuild(int page);
 
  public:
+  static constexpr uint32_t MAX_SECTION_PAGES = UINT16_MAX;
+  static constexpr bool canAppendSectionPage(uint32_t count) { return count < MAX_SECTION_PAGES; }
   uint16_t pageCount = 0;
   int currentPage = 0;
 

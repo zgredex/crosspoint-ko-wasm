@@ -1291,8 +1291,10 @@ KO_EXPORT int ko_export_spine(int spine) {
       if (local < 0 || local >= added) local = 0;
       const std::string title = g_driver->currentChapterTitle(anchor, local, g_driver->tocTitle(t));
       int page = spineStart + local;
-      g_chapterCandidates.push_back({title, static_cast<uint32_t>(page)});
-      namedLocalPages.push_back(local);
+      if (ko::retainChapterCandidate(
+              g_chapterCandidates, {title, static_cast<uint32_t>(page), false})) {
+        namedLocalPages.push_back(local);
+      }
     }
     // A valid EPUB may omit navigation entries entirely, or omit chapters
     // inside a single large XHTML spine. Visible heading parsing supplies those
@@ -1302,9 +1304,12 @@ KO_EXPORT int ko_export_spine(int spine) {
       const int local = static_cast<int>(heading.localPage);
       if (local < 0 || local >= added ||
           std::find(namedLocalPages.begin(), namedLocalPages.end(), local) != namedLocalPages.end()) continue;
-      g_chapterCandidates.push_back({ko::normalizeChapterTitle(heading.title),
-                                     static_cast<uint32_t>(spineStart + local)});
-      namedLocalPages.push_back(local);
+      if (ko::retainChapterCandidate(
+              g_chapterCandidates,
+              {ko::normalizeChapterTitle(heading.title),
+               static_cast<uint32_t>(spineStart + local), true})) {
+        namedLocalPages.push_back(local);
+      }
     }
     g_spinePageStart += added;
   }
@@ -1402,6 +1407,12 @@ static int failAssembly(const std::string& why) {
   return -1;
 }
 
+static int failEncodedSpine(const std::string& why) {
+  g_enc.reset();
+  setError(why);
+  return -1;
+}
+
 // Layout+render+encode one spine into g_enc. Returns the page count, or -1.
 KO_EXPORT int ko_encode_spine(int spine) {
   // Clear the previous encoded spine FIRST: a refused request must not leave the previous spine's bytes
@@ -1412,18 +1423,16 @@ KO_EXPORT int ko_encode_spine(int spine) {
   ko::XtchWriter w(g_xtch->mode(), g_spec.deviceProfile);
   w.setTextAa(textAaEnabled());
   const int n = g_driver->buildSection(spine, g_spec);
-  if (n < 0) return -1;
+  if (n < 0) return failEncodedSpine("failed to build spine " + std::to_string(spine));
   const uint64_t recordBytes = recordBytesForMode(g_xtch->mode(), g_spec.deviceProfile);
   if (static_cast<uint64_t>(n) > ko::MAX_XTC_PAGES ||
       static_cast<uint64_t>(n) > MAX_SAFE_SPINE_TRANSFER / recordBytes) {
-    setError("encoded spine exceeds the 384 MiB safe transfer limit");
-    return -1;
+    return failEncodedSpine("encoded spine exceeds the 384 MiB safe transfer limit");
   }
   const uint64_t encodedBytes = static_cast<uint64_t>(n) * recordBytes;
   if (encodedBytes > std::numeric_limits<uint32_t>::max() ||
       !safeWasmWorkingSetAllows(encodedBytes + recordBytes)) {
-    setError("encoded spine exceeds the safe wasm working-set budget");
-    return -1;
+    return failEncodedSpine("encoded spine exceeds the safe wasm working-set budget");
   }
   g_enc.flat.reserve(static_cast<size_t>(encodedBytes));
   g_enc.offsets.reserve(static_cast<size_t>(n));
@@ -1435,23 +1444,19 @@ KO_EXPORT int ko_encode_spine(int spine) {
     // rendered. See the note in ko_export_spine(). And the same failure policy: a page that will not
     // render fails the spine rather than shortening it.
     if (!g_driver->renderPage(p, g_spec, rp, nullptr, 0)) {
-      setError("render failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
-      return -1;
+      return failEncodedSpine("render failed at spine " + std::to_string(spine) + ", page " +
+                              std::to_string(p));
     }
     if (!w.addPageFromPlanes(rp.bw, rp.lsb, rp.msb)) {
-      g_enc.reset();
-      g_exportFailed = true;
-      setError("page encode failed at spine " + std::to_string(spine) + ", page " + std::to_string(p));
-      return -1;
+      return failEncodedSpine("page encode failed at spine " + std::to_string(spine) + ", page " +
+                              std::to_string(p));
     }
     // The final flat transfer buffer was reserved before rendering.  Append
     // this one record and release it immediately, so a giant spine never has
     // both a complete page-vector set and a complete flat copy resident.
     const std::vector<uint8_t>& rec = w.page(0);
     if (rec.size() != recordBytes || g_enc.flat.size() > std::numeric_limits<uint32_t>::max() - rec.size()) {
-      g_enc.reset();
-      setError("encoded spine record size is inconsistent");
-      return -1;
+      return failEncodedSpine("encoded spine record size is inconsistent");
     }
     g_enc.offsets.push_back(static_cast<uint32_t>(g_enc.flat.size()));
     g_enc.lengths.push_back(static_cast<uint32_t>(rec.size()));
@@ -1464,7 +1469,7 @@ KO_EXPORT int ko_encode_spine(int spine) {
     // The serial path counts a page for every successful render and trusts the writer to have made
     // the same number of records. If those disagree the container would already be malformed, so
     // fail loudly here rather than assemble a file whose index disagrees with its records.
-    return -1;
+    return failEncodedSpine("encoded spine page count is inconsistent");
   }
   // TOC anchors, resolved while this spine's section is still the built one.
   const int tocN = g_driver->tocCount();
@@ -1478,8 +1483,12 @@ KO_EXPORT int ko_encode_spine(int spine) {
     e.tocIndex = t;
     e.localPage = local;
     e.title = g_driver->currentChapterTitle(anchor, local, g_driver->tocTitle(t));
-    g_enc.toc.push_back(e);
-    namedLocalPages.push_back(local);
+    const size_t officialCount = static_cast<size_t>(std::count_if(
+        g_enc.toc.begin(), g_enc.toc.end(), [](const SpineTocEntry& entry) { return entry.tocIndex >= 0; }));
+    if (officialCount < ko::MAX_EXPORTED_CHAPTERS) {
+      g_enc.toc.push_back(e);
+      namedLocalPages.push_back(local);
+    }
   }
   for (const auto& heading : g_driver->currentSectionChapterHeadings()) {
     const int local = static_cast<int>(heading.localPage);
@@ -1489,8 +1498,12 @@ KO_EXPORT int ko_encode_spine(int spine) {
     e.tocIndex = -1;
     e.localPage = local;
     e.title = ko::normalizeChapterTitle(heading.title);
-    g_enc.toc.push_back(std::move(e));
-    namedLocalPages.push_back(local);
+    const size_t inferredCount = static_cast<size_t>(std::count_if(
+        g_enc.toc.begin(), g_enc.toc.end(), [](const SpineTocEntry& entry) { return entry.tocIndex < 0; }));
+    if (inferredCount < ko::MAX_EXPORTED_CHAPTERS) {
+      g_enc.toc.push_back(std::move(e));
+      namedLocalPages.push_back(local);
+    }
   }
   // Fallback chapter name, only used when the book has no usable TOC.
   {
@@ -1523,6 +1536,10 @@ KO_EXPORT const char* ko_spine_toc_title(int i) {
   return (i >= 0 && i < static_cast<int>(g_enc.toc.size())) ? g_enc.toc[i].title.c_str() : "";
 }
 KO_EXPORT const char* ko_spine_fallback_name() { return g_enc.fallbackName.c_str(); }
+// The transfer is caller-owned only after it has copied every accessor. Make
+// release explicit so a successful export does not retain the last spine's
+// potentially very large record buffer indefinitely.
+KO_EXPORT void ko_spine_release() { g_enc.reset(); }
 
 // ---- spine pool: centralised assembly ---------------------------------------
 // Workers hand back page records; ONE assembler appends them in spine order and writes the container.
@@ -1599,20 +1616,23 @@ KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCo
 }
 
 // One TOC anchor for a spine. spineBase is the spine's first global page.
-KO_EXPORT int ko_assemble_add_toc(int spineBase, const char* title, int localPage) {
+KO_EXPORT int ko_assemble_add_toc(int spineBase, const char* title, int localPage, int inferred) {
   if (!g_asmActive || g_asmFailed || !g_asm) {
     return failAssembly("assemble_add_toc: no healthy assembly");
   }
+  if (inferred != 0 && inferred != 1) {
+    return failAssembly("assemble_add_toc: invalid source class");
+  }
   const int64_t local = localPage < 0 ? 0 : static_cast<int64_t>(localPage);
   const int64_t page = static_cast<int64_t>(spineBase) + local;
-  if (spineBase < 0 || page < 0 || page >= static_cast<int64_t>(g_asm->pageCount()) ||
-      g_asmCandidates.size() >= ko::MAX_XTC_CHAPTERS) {
-    return failAssembly("assemble_add_toc: page or chapter count out of range");
+  if (spineBase < 0 || page < 0 || page >= static_cast<int64_t>(g_asm->pageCount())) {
+    return failAssembly("assemble_add_toc: page out of range");
   }
   ko::ChapterCandidate c;
   c.title = boundedChapterName(title);
   c.page = static_cast<uint32_t>(page);
-  g_asmCandidates.push_back(c);
+  c.inferred = inferred != 0;
+  ko::retainChapterCandidate(g_asmCandidates, std::move(c));
   return 0;
 }
 
@@ -1757,18 +1777,19 @@ KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
   return static_cast<int>(g_planSizes.size());
 }
 
-KO_EXPORT int ko_plan_add_toc(int spineBase, const char* title, int localPage) {
+KO_EXPORT int ko_plan_add_toc(int spineBase, const char* title, int localPage, int inferred) {
   if (!g_planActive || g_planFailed) return failPlan("plan_add_toc: no healthy plan");
+  if (inferred != 0 && inferred != 1) return failPlan("plan_add_toc: invalid source class");
   const int64_t local = localPage < 0 ? 0 : static_cast<int64_t>(localPage);
   const int64_t page = static_cast<int64_t>(spineBase) + local;
-  if (spineBase < 0 || page < 0 || page >= static_cast<int64_t>(g_planSizes.size()) ||
-      g_planCandidates.size() >= ko::MAX_XTC_CHAPTERS) {
-    return failPlan("plan_add_toc: page or chapter count out of range");
+  if (spineBase < 0 || page < 0 || page >= static_cast<int64_t>(g_planSizes.size())) {
+    return failPlan("plan_add_toc: page out of range");
   }
   ko::ChapterCandidate c;
   c.title = boundedChapterName(title);
   c.page = static_cast<uint32_t>(page);
-  g_planCandidates.push_back(c);
+  c.inferred = inferred != 0;
+  ko::retainChapterCandidate(g_planCandidates, std::move(c));
   return 0;
 }
 

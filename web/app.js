@@ -852,7 +852,7 @@
       twoBit: true,             // reader fonts are always 2-bit; the XTC/XTCH output depth
                                 // is the export mode, applied at pack time
       noHangul: !els.fontHangul.checked,
-      extraIntervals: iv ? iv.split(/[\s,]+/).filter(Boolean) : [],
+      extraIntervals: iv ? [iv] : [],
       spacePx: isNaN(sp) ? undefined : sp,
     }, [raw], 120000);
     r._bytes = r.epdfont;

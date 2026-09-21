@@ -1,4 +1,5 @@
 #include <HalStorage.h>
+#include <HalDisplay.h>
 
 #include <cstdint>
 #include <cstring>
@@ -7,6 +8,11 @@
 #include <vector>
 
 #include "Epub/BookMetadataCache.h"
+#include "Epub.h"
+#include "Epub/Section.h"
+#include "GfxRenderer.h"
+
+HalDisplay display;  // engine image helpers use the firmware's global display symbol
 
 namespace {
 
@@ -106,6 +112,85 @@ int main() {
     return 1;
   }
 
-  std::cout << "cache-integrity: valid cache round-trips; every truncation and bad LUT is rejected\n";
+  // Section cache accessors are callable independently of loadSectionFile()
+  // (anchor/progress lookups do exactly that). Every header truncation must
+  // therefore fail locally instead of consuming zero-initialized read output.
+  constexpr size_t sectionHeaderSize =
+      sizeof(uint8_t) + sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(bool) + sizeof(uint8_t) +
+      sizeof(bool) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
+      sizeof(uint8_t) + sizeof(bool) + 5 * sizeof(uint32_t);
+  GfxRenderer renderer(display);
+  auto epub = std::make_shared<Epub>("/book.epub", "/cache");
+  const std::string sectionPath = epub->getCachePath() + "/sections/0.bin";
+  ReaderRenderSpec spec{};
+  for (size_t size = 0; size < sectionHeaderSize; ++size) {
+    Storage.clearAll();
+    Storage.mountBlob(sectionPath, std::vector<uint8_t>(size, 0));
+    {
+      Section section(epub, 0, renderer);
+      if (section.loadSectionFile(spec)) {
+        std::cerr << "truncated section cache loaded at " << size << "/"
+                  << sectionHeaderSize << " bytes\n";
+        return 1;
+      }
+    }
+    Storage.mountBlob(sectionPath, std::vector<uint8_t>(size, 0));
+    Section section(epub, 0, renderer);
+    if (section.getCachedPageCount() ||
+        section.getPageForAnchor("x") || section.getPageForParagraphIndex(0) ||
+        section.getPageForListItemIndex(0) || section.getParagraphIndexForPage(0) ||
+        section.getVisibleTextOffsetForPage(0) || section.getPageForVisibleTextOffset(0)) {
+      std::cerr << "truncated section cache accessor succeeded at " << size << "/"
+                << sectionHeaderSize << " bytes\n";
+      return 1;
+    }
+  }
+
+  std::vector<uint8_t> badSectionHeader(sectionHeaderSize, 0);
+  size_t headerPos = 0;
+  const auto putHeader = [&badSectionHeader, &headerPos](const auto& value) {
+    std::memcpy(badSectionHeader.data() + headerPos, &value, sizeof(value));
+    headerPos += sizeof(value);
+  };
+  putHeader(uint8_t{42});
+  putHeader(spec.fontId);
+  putHeader(spec.lineCompression);
+  putHeader(spec.extraParagraphSpacing);
+  putHeader(spec.paragraphIndent);
+  putHeader(spec.paragraphAlignment);
+  putHeader(spec.characterWrap);
+  putHeader(spec.viewportWidth);
+  putHeader(spec.viewportHeight);
+  putHeader(spec.hyphenationEnabled);
+  putHeader(spec.embeddedStyle);
+  putHeader(spec.imageRendering);
+  putHeader(spec.focusReadingEnabled);
+  putHeader(uint16_t{1});
+  for (int i = 0; i < 5; ++i) putHeader(uint32_t{UINT32_MAX});
+  if (headerPos != sectionHeaderSize) {
+    std::cerr << "section header test fixture size drifted\n";
+    return 1;
+  }
+  Storage.clearAll();
+  Storage.mountBlob(sectionPath, badSectionHeader);
+  {
+    Section section(epub, 0, renderer);
+    if (section.loadSectionFile(spec)) {
+      std::cerr << "section cache with out-of-range LUT offsets loaded\n";
+      return 1;
+    }
+  }
+  Storage.mountBlob(sectionPath, badSectionHeader);
+  {
+    Section section(epub, 0, renderer);
+    if (section.getPageForAnchor("x") || section.getPageForParagraphIndex(0) ||
+        section.getPageForListItemIndex(0) || section.getParagraphIndexForPage(0) ||
+        section.getVisibleTextOffsetForPage(0) || section.getPageForVisibleTextOffset(0)) {
+      std::cerr << "section cache accessor accepted an out-of-range LUT offset\n";
+      return 1;
+    }
+  }
+
+  std::cout << "cache-integrity: metadata and section truncations plus bad LUTs are rejected\n";
   return 0;
 }
