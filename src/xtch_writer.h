@@ -142,10 +142,6 @@ struct XtchChapter {
 struct ChapterCandidate {
   std::string title;
   uint32_t page = 0;       // global (container) page the entry starts at
-  // False for EPUB navigation entries, true for headings inferred from the
-  // rendered XHTML. Navigation is authoritative when the device's 100-entry
-  // chapter table is full; inferred headings may only consume spare slots.
-  bool inferred = false;
 };
 
 class XtchWriter {

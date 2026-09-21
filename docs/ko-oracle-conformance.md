@@ -214,10 +214,9 @@ so the chain was checked too — `dist/` was rebuilt from the new engine, served
 | page payloads | **byte-identical** to the host CLI (page 0/1/2 hashes compared directly) |
 | metadata | identical (title, author, publisher, language, chapterCount, coverPage) |
 
-Two differences, both outside the layout contract and both expected: `createTime` is a wall
-clock, and the web app writes the book's **real TOC chapter names** where the host CLI writes
-`Chapter N`. Neither changes a pixel; both are visible if you `cmp` the two files, which is
-why they are written down instead of being left for someone to rediscover.
+The remaining difference outside the layout contract is `createTime`, which is a wall clock.
+The web and host paths now share the same TOC-only chapter builder, so both write the EPUB's
+navigation titles and neither invents `Chapter N`, filename, or XHTML-heading labels.
 
 ## 5. Image pages — where pixels legitimately differ
 

@@ -54,9 +54,10 @@ oracle gate is the one that compares against the reference.
 The load reply built one string per spine and the page made one `<option>` per spine before showing
 anything. Now `spineLabels` serves them in batches of 100 after the first frame (rAF-yielded, token
 cancelled on a new book). Each label is the first EPUB TOC title assigned to that spine—the same parsed
-navigation metadata used by the Korean reader and the XTC chapter table—and only falls back to the spine
-basename when the book has no TOC item for that spine. Verified 60/60 labels and working navigation; the
-cost removed grows with spine count, which is the omnibus case.
+navigation metadata used by the Korean reader and the XTC chapter table. A spine with no exact TOC item
+is shown explicitly as having no TOC entry; XHTML and basenames are never promoted to chapter names.
+Verified 60/60 labels and working navigation; the cost removed grows with spine count, which is the
+omnibus case.
 
 ## Adopting the EPUB instead of copying it
 

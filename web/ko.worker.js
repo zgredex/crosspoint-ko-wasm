@@ -591,9 +591,9 @@ async function init() {
   Module = await factory({ locateFile: (path) => asset(path) });
   api = Module;
   BOOT.wasmReady = performance.now();
-  // A worker/engine cache mismatch must fail visibly. Falling back to hrefs
-  // here would make the app look healthy while silently restoring the exact
-  // wrong chapter labels this API exists to prevent.
+  // A worker/engine cache mismatch must fail visibly. The API is the one path
+  // from parsed EPUB navigation metadata to the chapter picker; no filename or
+  // XHTML-derived fallback is allowed.
   if (typeof api._ko_get_spine_title !== 'function') {
     throw new Error('engine missing required ko_get_spine_title export');
   }
@@ -953,12 +953,9 @@ let loadTiming = {};
 // What the engine did with images during the render it just performed. `decodes` is the number that
 // matters: the page is rendered three times (BW, then LSB, then MSB), so unless the grey passes stop
 // decoding, an image page decodes its image three times to produce one preview frame.
-// The spine-label snapshot that used to live here is GONE. It contained a symptom: Driver::spineHref()
-// returned `const std::string&` bound to `epub_->getSpineItem(i).href`, but getSpineItem() returns
-// BookMetadataCache::SpineEntry BY VALUE, so the reference dangled and short hrefs were read out of a
-// dead stack frame (the "䏆" / U+070F U+0006 garbage). spineHref() now returns std::string by value and
-// ko_get_spine_href() copies into its own buffer, so labels are read on demand again, after the first
-// frame, where an omnibus with thousands of spines should pay for them.
+// Chapter-picker labels are read on demand after the first frame. Each value
+// comes only from the EPUB navigation cache; a spine without its own TOC entry
+// is returned as an empty string so the page can mark it honestly.
 
 function readImagePerf() {
   if (!api || !api._ko_image_decodes) return null;
@@ -2067,9 +2064,8 @@ case 'openPreview': {
 // that would produce a container with missing chapter names and no error.
       case 'spineLabels': {
         if (!requireWorkerBook(id, 'spineLabels')) break;
-        // On demand: the engine probes visible XHTML headings and uses an
-        // exact-spine navigation label only as fallback. The href is retained
-        // solely for a book with neither source.
+        // On demand: exact-spine EPUB navigation labels only. An empty string
+        // means the TOC supplied no label for this document.
         const start = Number(ev.data.start);
         const requestedCount = Number(ev.data.count);
         if (!Number.isSafeInteger(start) || start < 0 || start > spineCount ||
@@ -2078,13 +2074,11 @@ case 'openPreview': {
         }
         const count = Math.min(100, requestedCount);
         const end = Math.min(spineCount, start + count);
-        const hrefs = [];
         const titles = [];
         for (let s = start; s < end; s++) {
-          hrefs.push(api.UTF8ToString(api._ko_get_spine_href(s)));
           titles.push(api.UTF8ToString(api._ko_get_spine_title(s)));
         }
-        post(id, true, { start, hrefs, titles });
+        post(id, true, { start, titles });
         break;
       }
 
@@ -2130,7 +2124,6 @@ case 'openPreview': {
           }
           post(id, true, {
             spine, pageCount: n, bytes: bytes.buffer, lengths, toc,
-            fallbackName: api.UTF8ToString(api._ko_spine_fallback_name()),
           }, [bytes.buffer]);
         } finally {
           // Safe after success and every partial failure. JS-owned copies above
@@ -2171,13 +2164,9 @@ case 'openPreview': {
             }
             for (const t of (sp.toc || [])) {
               if (withCString(t.title, (tp) => api._ko_plan_add_toc(
-                    base, tp, t.localPage | 0, t.tocIndex < 0 ? 1 : 0)) < 0) {
+                    base, tp, t.localPage | 0)) < 0) {
                 throw new Error('plan TOC entry rejected');
               }
-            }
-            if (withCString(sp.fallbackName,
-                            (fp) => api._ko_plan_add_fallback(base, fp, pages)) < 0) {
-              throw new Error('plan fallback chapter rejected');
             }
             for (let i = 0; i < pages; i++) recordBytes += lengths[i];
             base += pages;
@@ -2276,13 +2265,9 @@ case 'openPreview': {
           }
           for (const t of (sp.toc || [])) {
             if (withCString(t.title, (tp) => api._ko_assemble_add_toc(
-                  base, tp, t.localPage | 0, t.tocIndex < 0 ? 1 : 0)) < 0) {
+                  base, tp, t.localPage | 0)) < 0) {
               throw new Error('assembly TOC entry rejected');
             }
-          }
-          if (withCString(sp.fallbackName,
-                          (fp) => api._ko_assemble_add_fallback(base, fp, pages)) < 0) {
-            throw new Error('assembly fallback chapter rejected');
           }
           base += pages;
           raw += bytes.length;

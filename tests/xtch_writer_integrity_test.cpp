@@ -7,7 +7,7 @@
 
 #include "xtch_writer.h"
 #include "xtch_chapters.h"
-#include "chapter_title_probe.h"
+#include "chapter_title.h"
 #include "Epub/Section.h"
 
 namespace {
@@ -28,54 +28,6 @@ std::string repeat(const char* utf8, int count) {
 }  // namespace
 
 int main() {
-  {
-    const std::string xhtml =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><html><head><title>Generic Section</title></head>"
-        "<body><h1 style=\"display: none\">Hidden title</h1><h1>Section 1</h1>"
-        "<h2 id=\"real\"><span>제1장</span> 진짜 이름 &amp; 시작</h2><p>text</p></body></html>";
-    ko::ChapterTitleProbe probe;
-    probe.write(reinterpret_cast<const uint8_t*>(xhtml.data()), xhtml.size());
-    if (probe.headingTitle() != "제1장 진짜 이름 & 시작") {
-      std::cerr << "streaming XHTML heading probe did not recover the visible title\n";
-      return 1;
-    }
-  }
-  {
-    const std::string xhtml(512, 'x');
-    ko::ChapterTitleProbe probe(64);
-    probe.write(reinterpret_cast<const uint8_t*>(xhtml.data()), xhtml.size());
-    if (probe.consumedBytes() != 64) {
-      std::cerr << "streaming title probe did not enforce its injected byte limit\n";
-      return 1;
-    }
-  }
-  {
-    const std::string malformed = "<html><body></html>";
-    ko::ChapterTitleProbe probe(64);
-    probe.write(reinterpret_cast<const uint8_t*>(malformed.data()), malformed.size());
-    const size_t charged = probe.consumedBytes();
-    probe.write(reinterpret_cast<const uint8_t*>(malformed.data()), malformed.size());
-    if (charged != malformed.size() || probe.consumedBytes() != charged) {
-      std::cerr << "streaming title probe did not charge the malformed terminal chunk exactly once\n";
-      return 1;
-    }
-  }
-  if (!ko::isGenericChapterTitle("Chapter IV") || !ko::isGenericChapterTitle("Section 12") ||
-      !ko::isGenericChapterTitle("제12장") || !ko::isGenericChapterTitle("섹션 3") ||
-      ko::isGenericChapterTitle("제12장 실제 이름") || ko::isGenericChapterTitle("Chapter Four Winds") ||
-      ko::isGenericChapterTitle("XTCKO chapter parsing")) {
-    std::cerr << "generic chapter-title classification is not conservative\n";
-    return 1;
-  }
-  {
-    const std::string xhtml = "<html><body><h1>First real heading</h1><h2>Later heading</h2></body></html>";
-    ko::ChapterTitleProbe probe;
-    probe.write(reinterpret_cast<const uint8_t*>(xhtml.data()), xhtml.size());
-    if (probe.headingTitle() != "First real heading") {
-      std::cerr << "streaming title probe did not stop at the first meaningful heading\n";
-      return 1;
-    }
-  }
   const std::string normalizedLong = ko::normalizeChapterTitle(repeat("가", 400));
   if (normalizedLong.size() > 1024 ||
       ko::utf8SafePrefixLength(normalizedLong, normalizedLong.size()) != normalizedLong.size()) {
@@ -109,32 +61,31 @@ int main() {
 
   {
     std::vector<ko::ChapterCandidate> candidates;
-    candidates.push_back({"First real", 0, false});
-    for (uint32_t page = 1; page <= 99; ++page) {
-      candidates.push_back({"Inferred " + std::to_string(page), page, true});
-    }
-    candidates.push_back({"Late real", 150, false});
-    const auto chapters = ko::buildChapters(candidates, {}, 200);
-    const bool keptLateReal = std::any_of(chapters.begin(), chapters.end(), [](const auto& chapter) {
-      return chapter.name == "Late real" && chapter.startPage == 150;
-    });
-    if (chapters.size() != 100 || !keptLateReal) {
-      std::cerr << "inferred headings displaced an authoritative navigation entry\n";
+    candidates.push_back({"Navigation 1", 0});
+    candidates.push_back({"", 1});
+    candidates.push_back({"Navigation 2", 50});
+    const auto chapters = ko::buildChapters(candidates, 200);
+    if (chapters.size() != 2 || chapters[0].name != "Navigation 1" ||
+        chapters[1].name != "Navigation 2") {
+      std::cerr << "empty TOC titles were replaced or retained\n";
       return 1;
     }
   }
   {
     std::vector<ko::ChapterCandidate> retained;
     for (uint32_t page = 0; page < 150; ++page) {
-      ko::retainChapterCandidate(retained, {"Inferred " + std::to_string(page), page, true});
+      ko::retainChapterCandidate(retained, {"Navigation " + std::to_string(page), page});
     }
-    ko::retainChapterCandidate(retained, {"Late real", 150, false});
-    const auto chapters = ko::buildChapters(retained, {}, 200);
-    const bool keptLateReal = std::any_of(chapters.begin(), chapters.end(), [](const auto& chapter) {
-      return chapter.name == "Late real" && chapter.startPage == 150;
-    });
-    if (retained.size() != 101 || chapters.size() != 100 || !keptLateReal) {
-      std::cerr << "bounded candidate collector displaced a late authoritative entry\n";
+    const auto chapters = ko::buildChapters(retained, 200);
+    if (retained.size() != 100 || chapters.size() != 100) {
+      std::cerr << "TOC candidate collector did not enforce the 100-entry limit\n";
+      return 1;
+    }
+  }
+  {
+    const auto chapters = ko::buildChapters({}, 200);
+    if (!chapters.empty()) {
+      std::cerr << "a book without a usable TOC received invented chapters\n";
       return 1;
     }
   }

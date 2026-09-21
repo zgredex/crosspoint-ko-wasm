@@ -20,9 +20,9 @@ What each fixture exercises, and why it is in the set:
   ko-mixed.epub  CJK run adjacent to Latin run adjacent to a punctuation-only run: this is
                  what `attachToPrevious` / `noSpaceBefore` in ParsedText.cpp actually act on,
                  and the reason Hangul can break mid-word without acquiring a fake space.
-  ko-chapters.epub deliberately false generic navigation labels versus visible Korean headings,
-                 including one heading omitted from navigation. It proves chapter names come from
-                 rendered XHTML structure rather than filenames or "Section N" placeholders.
+  ko-chapters.epub deliberately generic navigation labels versus visible Korean headings,
+                 including one heading omitted from navigation. It proves chapter names come only
+                 from EPUB navigation, never from rendered XHTML or filenames.
 
 Output is deterministic: fixed timestamps, fixed UUIDs, no zlib timestamps. Two runs produce
 byte-identical files, which is what makes the fixture itself non-variable in the gate.
@@ -213,7 +213,7 @@ def write_epub(path, title, chapters, indent_paragraph=False):
 
 
 def write_chapter_fixture(path):
-    """Two-spine adversarial chapter fixture: nav labels are intentionally not the book's labels."""
+    """Two-spine fixture whose XHTML headings intentionally disagree with its authoritative TOC."""
     title = 'XTCKO chapter parsing'
     filler = ''.join(
         '<p>Pagination filler sentence number %d. This paragraph exists so the next visible heading '

@@ -117,9 +117,10 @@
           state.sectionComplete = !!m.complete;
           state.total = m.complete ? state.pages : Math.max(m.estimated || 0, state.pages);
           updatePager();
-          const chapter = els.spineSel.value ? (Number(els.spineSel.value) + 1) + '장 ' : '';
+          const chapter = els.spineSel.selectedOptions && els.spineSel.selectedOptions[0]
+            ? els.spineSel.selectedOptions[0].textContent + ' · ' : '';
           els.pageStatus.textContent = chapter + (state.page + 1) + '/' + state.total +
-                                       (state.mono ? ' · 1-bit' : '');
+                                       (state.mono ? ' · 1비트' : '');
         }
         return;
       }
@@ -199,7 +200,7 @@
       const timer = setTimeout(() => {
         pending.delete(id);
         setStatus('⚠ 엔진 호출 "' + cmd + '" 시간 초과 ' +
-                  Math.round((timeoutMs || CALL_TIMEOUT_MS) / 1000) + 's — 엔진 재시작…', true);
+                  Math.round((timeoutMs || CALL_TIMEOUT_MS) / 1000) + '초 — 엔진 재시작…', true);
         respawn();
         reject(new Error('timeout: ' + cmd));
       }, timeoutMs || CALL_TIMEOUT_MS);
@@ -486,6 +487,8 @@
     els.textAa.checked = true;                // device default: on
     els.deviceProfile.value = 'x4';           // CrossPoint-KO fallback/default profile
     els.orientation.value = '0';              // device default: portrait
+    state.mode = 1;                           // product default: 2-bit XTCH
+    els.lz4Wrap.checked = true;                // product default: XTZ4/LZ4 wrapper
     els.exportName.value = '[X4]';
     els.screenMargin.value = '5';
     els.screenMarginOut.textContent = '5 px';
@@ -507,8 +510,11 @@
     els.fontSpacePxOut.textContent = '9 px';
     els.fontHangul.checked = true;
     els.fontIntervals.value = '';
-    els.fontName.value = 'custom';
+    els.fontName.value = '사용자글꼴';
     syncFontSeg();
+    syncExportSeg();
+    syncAaToMode();
+    updateExportSummary();
     toggleFontPanel();
     // These assignments do not fire change events, so the dependent-visibility rule has
     // to be re-applied by hand: resetting to the defaults puts character wrap back ON,
@@ -557,7 +563,7 @@
     clearInterval(busyTicker);
     const tick = () => {
       const sec = Math.round((Date.now() - t0) / 1000);
-      els.loading.textContent = msg + '… ' + sec + 's';
+      els.loading.textContent = msg + '… ' + sec + '초';
     };
     tick();
     busyTicker = setInterval(tick, 1000);
@@ -647,10 +653,10 @@
     if (!els.viewportOut || !r || !r.viewport || !r.margins) return;
     const m = r.margins;
     els.viewportOut.textContent =
-      (r.screen ? '논리 화면: ' + r.screen.width + '×' + r.screen.height + ' px · ' : '') +
+      (r.screen ? '논리 화면: ' + r.screen.width + '×' + r.screen.height + '픽셀 · ' : '') +
       '본문 영역: ' + r.viewport.width + '×' + r.viewport.height +
-      ' px · 여백 T/R/B/L ' + m.top + '/' + m.right + '/' + m.bottom + '/' + m.left +
-      ' · 파일에 UI 없음';
+      '픽셀 · 여백 위/오른쪽/아래/왼쪽 ' + m.top + '/' + m.right + '/' + m.bottom + '/' + m.left +
+      ' · 기기 화면 요소는 파일에 포함되지 않음';
   }
 
   // §2: the spec only has to be pushed when it actually changed. Every spec push used to run
@@ -717,9 +723,10 @@
       updatePager();
       // Routine navigation must not flood a live region: the page counter is plain text
       // (readable on demand), while #status keeps only meaningful events.
-      const chapter = els.spineSel.value ? (Number(els.spineSel.value) + 1) + '장 ' : '';
+      const chapter = els.spineSel.selectedOptions && els.spineSel.selectedOptions[0]
+        ? els.spineSel.selectedOptions[0].textContent + ' · ' : '';
       els.pageStatus.textContent = chapter + (r.page + 1) + '/' + (state.total || r.pages) +
-                                   (r.mono ? ' · 1-bit' : '');
+                                   (r.mono ? ' · 1비트' : '');
       // §15: a screen reader cannot read rasterized text, but it can say what this object is
       els.page.setAttribute('aria-label', '도서 미리보기, ' + chapter + (r.page + 1) + '쪽');
     } catch (e) {
@@ -971,16 +978,12 @@
     await refresh(true, true);
     return r;
   }
-  function spineLabel(title, href, i) {
-    // The engine prefers a visible XHTML heading, with EPUB navigation as its
-    // fallback. Filenames are implementation details and appear only when the
-    // book supplied neither kind of human-readable label.
+  function spineLabel(title, i) {
+    // Chapter names come only from EPUB 3 nav / EPUB 2 NCX. A missing TOC
+    // entry stays visibly unnamed instead of borrowing XHTML text or a filename.
     const bookTitle = normalizeDisplayText(title).trim();
     if (bookTitle) return bookTitle;
-    const fallback = normalizeDisplayText(String(href || '')
-      .replace(/\.(xhtml|html|htm)$/i, '')
-      .replace(/[_]+/g, ' ')).trim();
-    return fallback || ('장 ' + (i + 1));
+    return '목차 항목 없음 · 문서 ' + (i + 1);
   }
 
   // Labels arrive in batches AFTER the first page is on screen. Building one <option> per spine in
@@ -1001,10 +1004,10 @@
       }
       if (token !== spinePopulateToken) return;
       const frag = document.createDocumentFragment();
-      r.hrefs.forEach((h, i) => {
+      (r.titles || []).forEach((title, i) => {
         const opt = document.createElement('option');
         opt.value = r.start + i;
-        opt.textContent = spineLabel(r.titles && r.titles[i], h, r.start + i);
+        opt.textContent = spineLabel(title, r.start + i);
         frag.appendChild(opt);
       });
       els.spineSel.appendChild(frag);
@@ -1013,18 +1016,6 @@
       if (els.spineSel.querySelector('option[value="' + cur + '"]')) els.spineSel.value = cur;
       await new Promise((res) => requestAnimationFrame(res));   // never block the frame
     }
-  }
-
-  function populateSpines(hrefs, titles) {
-    els.spineSel.innerHTML = '';
-    hrefs.forEach((h, i) => {
-      const opt = document.createElement('option');
-      opt.value = i;
-      opt.textContent = spineLabel(titles && titles[i], h, i);
-      els.spineSel.appendChild(opt);
-    });
-    els.spineSel.disabled = false;
-    els.spineSel.selectedIndex = 0;
   }
 
   async function loadBook(blob, name) {
@@ -1529,12 +1520,12 @@
       const wm = meta.weightMode === 'wght-instance' ? 'wght 인스턴스 @' + meta.weight :
                   meta.weightMode === 'embolden' ? '합성 볼드 +' + (meta.emboldenPx64 / 64).toFixed(2) + 'px' :
                   meta.weightMode === 'native' ? '원본 굵기 이하 (' + meta.weight + ' 무시)' : '굵기 해당 없음';
-      fontStatus('✓ ' + (meta.name || 'custom') + ' ' + meta.size + 'pt · w' + meta.weight +
+      fontStatus('✓ ' + (meta.name || '사용자 글꼴') + ' ' + meta.size + 'pt · w' + meta.weight +
                  ' [' + wm + '] · ' + meta.glyphs + '글리프 — 적용 중…', false);
       await applyCustomFont(meta);
       customFontLoaded = true;      // only now: the preview engine is holding this face
       lastFontSig = want;
-      fontStatus('✓ ' + (meta.name || 'custom') + ' ' + meta.size + 'pt 활성 (' +
+      fontStatus('✓ ' + (meta.name || '사용자 글꼴') + ' ' + meta.size + 'pt 활성 (' +
                  meta.glyphs + '글리프, ' + Math.round(meta.bytes / 1024) + ' KB' +
                  (meta.inBrowser ? ', 브라우저에서 ' + meta.ms + ' ms 만에 변환 — ' +
                    (meta.ftVersion || 'FreeType') : '') + ')', false);
@@ -2041,7 +2032,6 @@
       pageCount: r ? r.pageCount : 0,
       lengths: r ? r.lengths : [],
       toc: r ? r.toc : [],
-      fallbackName: r ? r.fallbackName : '',
     }));
     let asm;
     let file;
@@ -2117,7 +2107,7 @@
     setExportLocked(true);
     els.downloadBtn.disabled = true;
     busy((mode === 0 ? 'XTC' : 'XTCH') + ' 생성 중 (책 전체)');
-    const depthLabel = mode === 0 ? 'XTC 1-bit' : 'XTCH 2-bit';
+    const depthLabel = mode === 0 ? 'XTC 1비트' : 'XTCH 2비트';
     setStatus('책 전체를 ' + depthLabel + (xtcz ? ' + LZ4 (.xtcz)' : '') + '로 생성 중' +
               ' — 현재 설정으로 모든 페이지를 다시 렌더링합니다');
     els.exportStatus.textContent = '생성 중…';

@@ -291,7 +291,8 @@ function check(ok, label, detail) {
   check(api._ko_plan_finish() < 0, 'invalid-record plan cannot finish');
   api._ko_export_abort();
 
-  // The add fits without chapters; finish must include the actual chapter table and reject before allocation.
+  // TOC collection is capped at the official 100-entry limit, and the removed
+  // per-spine fallback API cannot be used to manufacture chapter names.
   const chapterEdgePages = 11180;
   const chapterEdgePtr = api._malloc(chapterEdgePages * 4);
   { const view = u32(chapterEdgePtr, chapterEdgePages);
@@ -299,16 +300,21 @@ function check(ok, label, detail) {
   check(api._ko_plan_begin(1) === 0, 'plan_begin for chapter-budget edge');
   check(api._ko_plan_add_spine(chapterEdgePtr, chapterEdgePages) === chapterEdgePages,
         'record plus fixed/index bytes fit just below the budget');
+  const tocTitlePtr = api._malloc(16);
+  api.stringToUTF8('목차', tocTitlePtr, 16);
   let chapterRangesOk = true;
-  for (let i = 0; i < 383; i++) {
-    if (api._ko_plan_add_fallback(i, 0, 1) !== 0) chapterRangesOk = false;
+  for (let i = 0; i < 150; i++) {
+    if (api._ko_plan_add_toc(i, tocTitlePtr, 0) !== 0) chapterRangesOk = false;
   }
-  check(chapterRangesOk, 'chapter metadata ranges are accepted before the aggregate finish check');
-  check(api._ko_plan_finish() < 0,
-        'plan_finish includes actual chapter-table bytes in the budget');
-  check(api._ko_plan_prefix_size() === 0, 'chapter-over-budget plan allocates no prefix');
+  check(chapterRangesOk, 'valid EPUB TOC ranges are accepted');
+  check(api._ko_plan_finish() === chapterEdgePages, 'TOC-only plan finishes');
+  const planned = new DataView(api.HEAPU8.buffer, api._ko_plan_prefix_ptr(), api._ko_plan_prefix_size());
+  check(planned.getUint16(56 + 0xf6, true) === 100,
+        'chapter table is capped at 100 EPUB TOC entries');
+  check(typeof api._ko_plan_add_fallback === 'undefined',
+        'no API exists for inventing per-spine fallback chapter names');
   api._ko_export_abort();
-  api._free(prefixEdgePtr); api._free(chapterEdgePtr);
+  api._free(prefixEdgePtr); api._free(chapterEdgePtr); api._free(tocTitlePtr);
 
   const recPtr2 = api._malloc(64);
   const offPtr2 = api._malloc(budgetPages * 4);
@@ -327,7 +333,7 @@ function check(ok, label, detail) {
   const onePtr = api._malloc(4); u32(onePtr)[0] = expectedGrayRecord;
   check(api._ko_plan_begin(1) === 0 && api._ko_plan_add_spine(onePtr, 1) === 1,
         'one-page plan starts for metadata range checks');
-  check(api._ko_plan_add_toc(2147483647, 0, 2147483647, 0) < 0,
+  check(api._ko_plan_add_toc(2147483647, 0, 2147483647) < 0,
         'overflowing TOC page arithmetic is rejected');
   check(api._ko_plan_begin(1) === 0,
         'metadata rejection also rolls the plan back');

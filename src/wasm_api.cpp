@@ -132,7 +132,6 @@ static std::vector<uint8_t> g_error;
 // XTCH accumulation (used by ko_render_xtch one-shot)
 static ko::XtchWriter* g_xtch = nullptr;
 static std::vector<ko::XtchChapter> g_chapters;
-static std::vector<ko::XtchChapter> g_spineFallback;   // per-spine names when no TOC
 static std::vector<ko::ChapterCandidate> g_chapterCandidates;  // TOC entries during export
 static int g_currentSpine = -1;
 static int g_spinePageStart = 0;
@@ -716,7 +715,6 @@ static void beginBookReplacement() {
   g_planFailed = false;
   g_rgbaReady = false;
   g_chapters.clear();
-  g_spineFallback.clear();
   g_chapterCandidates.clear();
   g_currentSpine = -1;
   g_spinePageStart = 0;
@@ -909,12 +907,12 @@ KO_EXPORT const char* ko_get_spine_href(int spineIndex) {
   return last.c_str();
 }
 
-// First meaningful visible XHTML heading for a spine, with its own navigation
-// title as fallback; pointer valid until the next call.
+// First non-empty EPUB TOC title owned by this exact spine. There is
+// deliberately no XHTML/filename fallback; pointer valid until the next call.
 KO_EXPORT const char* ko_get_spine_title(int spineIndex) {
   if (!g_driver || spineIndex < 0 || spineIndex >= g_driver->spineCount()) return "";
   static std::string last;
-  last = g_driver->spineDisplayTitle(spineIndex);
+  last = g_driver->spineTocTitle(spineIndex);
   return last.c_str();
 }
 
@@ -1195,7 +1193,6 @@ KO_EXPORT int ko_export_begin() {
   g_xtch->setDeviceProfile(g_exportSpec.deviceProfile);
   g_xtch->setMetadata(g_driver->title(), "unknown", "", "ko");
   g_chapters.clear();
-  g_spineFallback.clear();
   g_chapterCandidates.clear();
   g_totalPages = 0;
   g_spinePageStart = 0;
@@ -1264,52 +1261,18 @@ KO_EXPORT int ko_export_spine(int spine) {
   const int added = g_totalPages - before;
   if (added > 0) {
     const int spineStart = g_spinePageStart;
-    // fallback chapter name (used only when the book has no usable TOC)
-    {
-      std::string href = g_driver->spineHref(spine);
-      size_t slash = href.find_last_of('/');
-      if (slash != std::string::npos) href = href.substr(slash + 1);
-      size_t dot = href.find_last_of('.');
-      if (dot != std::string::npos) href = href.substr(0, dot);
-      ko::XtchChapter ch;
-      std::string visibleTitle = g_driver->spineDisplayTitle(spine);
-      ch.name = !visibleTitle.empty() ? visibleTitle
-                                     : (href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href);
-      ch.startPage = static_cast<uint16_t>(spineStart);
-      ch.endPage = static_cast<uint16_t>(spineStart + added - 1);
-      g_spineFallback.push_back(ch);
-    }
     // TOC candidates for this spine: each nav entry resolving into this spine
     // becomes a chapter whose start page = spine start + anchor local page
     // (anchors are recorded during the layout we just ran).
     const int tocN = g_driver->tocCount();
-    std::vector<int> namedLocalPages;
     for (int t = 0; t < tocN; t++) {
       if (g_driver->tocSpine(t) != spine) continue;
       const std::string anchor = g_driver->tocAnchor(t);
       int local = anchor.empty() ? -1 : g_driver->anchorLocalPage(anchor);
       if (local < 0 || local >= added) local = 0;
-      const std::string title = g_driver->currentChapterTitle(anchor, local, g_driver->tocTitle(t));
+      const std::string title = ko::normalizeChapterTitle(g_driver->tocTitle(t));
       int page = spineStart + local;
-      if (ko::retainChapterCandidate(
-              g_chapterCandidates, {title, static_cast<uint32_t>(page), false})) {
-        namedLocalPages.push_back(local);
-      }
-    }
-    // A valid EPUB may omit navigation entries entirely, or omit chapters
-    // inside a single large XHTML spine. Visible heading parsing supplies those
-    // real names and pages. Existing TOC pages stay first, preserving book order
-    // and avoiding duplicate entries at the same rendered page.
-    for (const auto& heading : g_driver->currentSectionChapterHeadings()) {
-      const int local = static_cast<int>(heading.localPage);
-      if (local < 0 || local >= added ||
-          std::find(namedLocalPages.begin(), namedLocalPages.end(), local) != namedLocalPages.end()) continue;
-      if (ko::retainChapterCandidate(
-              g_chapterCandidates,
-              {ko::normalizeChapterTitle(heading.title),
-               static_cast<uint32_t>(spineStart + local), true})) {
-        namedLocalPages.push_back(local);
-      }
+      ko::retainChapterCandidate(g_chapterCandidates, {title, static_cast<uint32_t>(page)});
     }
     g_spinePageStart += added;
   }
@@ -1317,9 +1280,9 @@ KO_EXPORT int ko_export_spine(int spine) {
 }
 
 // Finalize the container into g_xtchOut. Returns total pages or -1.
-// Chapters are assembled from the EPUB TOC (device-true chapter list, official
-// converter caps at 100 entries, end page = next chapter start − 1). Books
-// without a usable TOC fall back to per-spine chapters.
+// Chapters are assembled only from the EPUB TOC (device-true chapter list,
+// official converter caps at 100 entries, end page = next chapter start − 1).
+// A book without a usable TOC gets no invented chapter table.
 
 KO_EXPORT int ko_export_finish() {
   // A failed export must never be finalized, even if the caller ignored a -1 from ko_export_spine and
@@ -1332,8 +1295,7 @@ KO_EXPORT int ko_export_finish() {
   if (!g_xtch) return -1;
   if (!requireBook("export_finish")) return failExport("book disappeared during export");
   if (g_totalPages <= 0) return failExport("cannot export an empty book");
-  g_chapters = buildChapters(g_chapterCandidates, g_spineFallback,
-                             static_cast<uint32_t>(g_totalPages));
+  g_chapters = buildChapters(g_chapterCandidates, static_cast<uint32_t>(g_totalPages));
   const uint64_t finalBytes = 56u + 256u + static_cast<uint64_t>(g_chapters.size()) * 96u +
                               static_cast<uint64_t>(g_totalPages) * 16u + g_xtch->residentPageBytes();
   if (finalBytes > MAX_SERIAL_CONTAINER_BYTES || finalBytes > UINT64_MAX / 2u ||
@@ -1368,14 +1330,12 @@ struct EncodedSpine {
   std::vector<uint8_t> flat;
   std::vector<uint32_t> offsets, lengths;
   std::vector<SpineTocEntry> toc;            // anchors resolved while the section was still built
-  std::string fallbackName;
   int count() const { return static_cast<int>(lengths.size()); }
   void reset() {
     std::vector<uint8_t>().swap(flat);
     std::vector<uint32_t>().swap(offsets);
     std::vector<uint32_t>().swap(lengths);
     std::vector<SpineTocEntry>().swap(toc);
-    std::string().swap(fallbackName);
   }
 };
 }  // namespace
@@ -1383,7 +1343,6 @@ struct EncodedSpine {
 static EncodedSpine g_enc;
 static std::unique_ptr<ko::XtchWriter> g_asm;          // the assembler's writer
 static std::vector<ko::ChapterCandidate> g_asmCandidates;
-static std::vector<ko::XtchChapter> g_asmFallback;
 
 static std::string boundedChapterName(const char* value) {
   if (!value) return {};
@@ -1400,7 +1359,6 @@ static int failAssembly(const std::string& why) {
   g_asmFailed = true;
   g_asm.reset();
   g_asmCandidates.clear();
-  g_asmFallback.clear();
   g_xtchFullReady = 0;
   g_xtchOut.clear();
   setError(why);
@@ -1473,7 +1431,6 @@ KO_EXPORT int ko_encode_spine(int spine) {
   }
   // TOC anchors, resolved while this spine's section is still the built one.
   const int tocN = g_driver->tocCount();
-  std::vector<int> namedLocalPages;
   for (int t = 0; t < tocN; t++) {
     if (g_driver->tocSpine(t) != spine) continue;
     const std::string anchor = g_driver->tocAnchor(t);
@@ -1482,40 +1439,10 @@ KO_EXPORT int ko_encode_spine(int spine) {
     SpineTocEntry e;
     e.tocIndex = t;
     e.localPage = local;
-    e.title = g_driver->currentChapterTitle(anchor, local, g_driver->tocTitle(t));
-    const size_t officialCount = static_cast<size_t>(std::count_if(
-        g_enc.toc.begin(), g_enc.toc.end(), [](const SpineTocEntry& entry) { return entry.tocIndex >= 0; }));
-    if (officialCount < ko::MAX_EXPORTED_CHAPTERS) {
-      g_enc.toc.push_back(e);
-      namedLocalPages.push_back(local);
-    }
-  }
-  for (const auto& heading : g_driver->currentSectionChapterHeadings()) {
-    const int local = static_cast<int>(heading.localPage);
-    if (local < 0 || local >= pages ||
-        std::find(namedLocalPages.begin(), namedLocalPages.end(), local) != namedLocalPages.end()) continue;
-    SpineTocEntry e;
-    e.tocIndex = -1;
-    e.localPage = local;
-    e.title = ko::normalizeChapterTitle(heading.title);
-    const size_t inferredCount = static_cast<size_t>(std::count_if(
-        g_enc.toc.begin(), g_enc.toc.end(), [](const SpineTocEntry& entry) { return entry.tocIndex < 0; }));
-    if (inferredCount < ko::MAX_EXPORTED_CHAPTERS) {
+    e.title = ko::normalizeChapterTitle(g_driver->tocTitle(t));
+    if (!e.title.empty() && g_enc.toc.size() < ko::MAX_EXPORTED_CHAPTERS) {
       g_enc.toc.push_back(std::move(e));
-      namedLocalPages.push_back(local);
     }
-  }
-  // Fallback chapter name, only used when the book has no usable TOC.
-  {
-    std::string href = g_driver->spineHref(spine);
-    const size_t slash = href.find_last_of('/');
-    if (slash != std::string::npos) href = href.substr(slash + 1);
-    const size_t dot = href.find_last_of('.');
-    if (dot != std::string::npos) href = href.substr(0, dot);
-    const std::string visibleTitle = g_driver->spineDisplayTitle(spine);
-    g_enc.fallbackName = !visibleTitle.empty()
-                             ? visibleTitle
-                             : (href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href);
   }
   return pages;
 }
@@ -1535,7 +1462,6 @@ KO_EXPORT int ko_spine_toc_local_page(int i) {
 KO_EXPORT const char* ko_spine_toc_title(int i) {
   return (i >= 0 && i < static_cast<int>(g_enc.toc.size())) ? g_enc.toc[i].title.c_str() : "";
 }
-KO_EXPORT const char* ko_spine_fallback_name() { return g_enc.fallbackName.c_str(); }
 // The transfer is caller-owned only after it has copied every accessor. Make
 // release explicit so a successful export does not retain the last spine's
 // potentially very large record buffer indefinitely.
@@ -1563,7 +1489,6 @@ KO_EXPORT int ko_assemble_begin(int mode) {
   g_asm->setTextAa(textAaEnabled());
   g_asm->adoptMetadataFrom(*g_xtch);      // the header carries the book's title/author
   g_asmCandidates.clear();
-  g_asmFallback.clear();
   g_asmActive = true;
   g_asmFailed = false;
   g_xtchFullReady = 0;
@@ -1615,13 +1540,10 @@ KO_EXPORT int ko_assemble_add_spine(const uint8_t* data, size_t size, int pageCo
   return static_cast<int>(g_asm->pageCount());
 }
 
-// One TOC anchor for a spine. spineBase is the spine's first global page.
-KO_EXPORT int ko_assemble_add_toc(int spineBase, const char* title, int localPage, int inferred) {
+// One EPUB TOC anchor for a spine. spineBase is the spine's first global page.
+KO_EXPORT int ko_assemble_add_toc(int spineBase, const char* title, int localPage) {
   if (!g_asmActive || g_asmFailed || !g_asm) {
     return failAssembly("assemble_add_toc: no healthy assembly");
-  }
-  if (inferred != 0 && inferred != 1) {
-    return failAssembly("assemble_add_toc: invalid source class");
   }
   const int64_t local = localPage < 0 ? 0 : static_cast<int64_t>(localPage);
   const int64_t page = static_cast<int64_t>(spineBase) + local;
@@ -1631,27 +1553,7 @@ KO_EXPORT int ko_assemble_add_toc(int spineBase, const char* title, int localPag
   ko::ChapterCandidate c;
   c.title = boundedChapterName(title);
   c.page = static_cast<uint32_t>(page);
-  c.inferred = inferred != 0;
   ko::retainChapterCandidate(g_asmCandidates, std::move(c));
-  return 0;
-}
-
-// The per-spine fallback chapter, used only when the book has no usable TOC.
-KO_EXPORT int ko_assemble_add_fallback(int spineBase, const char* name, int pages) {
-  if (!g_asmActive || g_asmFailed || !g_asm) {
-    return failAssembly("assemble_add_fallback: no healthy assembly");
-  }
-  const int64_t end = static_cast<int64_t>(spineBase) + static_cast<int64_t>(pages) - 1;
-  if (spineBase < 0 || pages <= 0 || end < spineBase ||
-      end >= static_cast<int64_t>(g_asm->pageCount()) ||
-      g_asmFallback.size() >= ko::MAX_XTC_CHAPTERS) {
-    return failAssembly("assemble_add_fallback: page or chapter count out of range");
-  }
-  ko::XtchChapter ch;
-  ch.name = boundedChapterName(name);
-  ch.startPage = static_cast<uint16_t>(spineBase);
-  ch.endPage = static_cast<uint16_t>(end);
-  g_asmFallback.push_back(ch);
   return 0;
 }
 
@@ -1664,7 +1566,7 @@ KO_EXPORT int ko_assemble_finish() {
   if (!g_asm || !requireBook("assemble_finish")) return failAssembly("assemble_finish: book or writer unavailable");
   const uint32_t total = static_cast<uint32_t>(g_asm->pageCount());
   if (total == 0) return failAssembly("assemble_finish: cannot build an empty container");
-  g_chapters = buildChapters(g_asmCandidates, g_asmFallback, total);
+  g_chapters = buildChapters(g_asmCandidates, total);
   const uint64_t finalBytes = 56u + 256u + static_cast<uint64_t>(g_chapters.size()) * 96u +
                               static_cast<uint64_t>(total) * 16u + g_asm->residentPageBytes();
   if (finalBytes > MAX_SERIAL_CONTAINER_BYTES || finalBytes > UINT64_MAX / 2u ||
@@ -1696,7 +1598,6 @@ KO_EXPORT int ko_assemble_finish() {
 // needs the bytes. Streaming XTZ4 over Blob parts is a later step, not this one.
 static std::vector<uint32_t> g_planSizes;
 static std::vector<ko::ChapterCandidate> g_planCandidates;
-static std::vector<ko::XtchChapter> g_planFallback;
 static std::vector<uint8_t> g_planPrefix;
 static int g_planMode = 1;
 static ko::DeviceProfile g_planDeviceProfile = ko::DeviceProfile::X4;
@@ -1706,7 +1607,6 @@ static int failPlan(const std::string& why) {
   g_planFailed = true;
   g_planSizes.clear();
   g_planCandidates.clear();
-  g_planFallback.clear();
   g_planPrefix.clear();
   setError(why);
   return -1;
@@ -1726,7 +1626,6 @@ KO_EXPORT int ko_plan_begin(int mode) {
   g_planFailed = false;
   g_planSizes.clear();
   g_planCandidates.clear();
-  g_planFallback.clear();
   g_planPrefix.clear();
   g_planMode = mode;
   g_planDeviceProfile = g_spec.deviceProfile;
@@ -1777,9 +1676,8 @@ KO_EXPORT int ko_plan_add_spine(const uint32_t* lengths, int count) {
   return static_cast<int>(g_planSizes.size());
 }
 
-KO_EXPORT int ko_plan_add_toc(int spineBase, const char* title, int localPage, int inferred) {
+KO_EXPORT int ko_plan_add_toc(int spineBase, const char* title, int localPage) {
   if (!g_planActive || g_planFailed) return failPlan("plan_add_toc: no healthy plan");
-  if (inferred != 0 && inferred != 1) return failPlan("plan_add_toc: invalid source class");
   const int64_t local = localPage < 0 ? 0 : static_cast<int64_t>(localPage);
   const int64_t page = static_cast<int64_t>(spineBase) + local;
   if (spineBase < 0 || page < 0 || page >= static_cast<int64_t>(g_planSizes.size())) {
@@ -1788,24 +1686,7 @@ KO_EXPORT int ko_plan_add_toc(int spineBase, const char* title, int localPage, i
   ko::ChapterCandidate c;
   c.title = boundedChapterName(title);
   c.page = static_cast<uint32_t>(page);
-  c.inferred = inferred != 0;
   ko::retainChapterCandidate(g_planCandidates, std::move(c));
-  return 0;
-}
-
-KO_EXPORT int ko_plan_add_fallback(int spineBase, const char* name, int pages) {
-  if (!g_planActive || g_planFailed) return failPlan("plan_add_fallback: no healthy plan");
-  const int64_t end = static_cast<int64_t>(spineBase) + static_cast<int64_t>(pages) - 1;
-  if (spineBase < 0 || pages <= 0 || end < spineBase ||
-      end >= static_cast<int64_t>(g_planSizes.size()) ||
-      g_planFallback.size() >= ko::MAX_XTC_CHAPTERS) {
-    return failPlan("plan_add_fallback: page or chapter count out of range");
-  }
-  ko::XtchChapter ch;
-  ch.name = boundedChapterName(name);
-  ch.startPage = static_cast<uint16_t>(spineBase);
-  ch.endPage = static_cast<uint16_t>(end);
-  g_planFallback.push_back(ch);
   return 0;
 }
 
@@ -1821,7 +1702,7 @@ KO_EXPORT int ko_plan_finish() {
   w.adoptMetadataFrom(*g_xtch);          // the header carries the book's title/author
   const uint32_t total = static_cast<uint32_t>(g_planSizes.size());
   if (total == 0) return failPlan("plan_finish: cannot build an empty container");
-  g_chapters = ko::buildChapters(g_planCandidates, g_planFallback, total);
+  g_chapters = ko::buildChapters(g_planCandidates, total);
   uint64_t recordBytes = 0;
   for (uint32_t size : g_planSizes) recordBytes += size;
   const uint64_t projected = 56u + 256u + static_cast<uint64_t>(g_chapters.size()) * 96u +
@@ -1981,13 +1862,10 @@ KO_EXPORT void ko_export_abort() {
   g_enc.reset();
   g_asm.reset();
   g_asmCandidates.clear();
-  g_asmFallback.clear();
   g_planSizes.clear();
   g_planCandidates.clear();
-  g_planFallback.clear();
   g_planPrefix.clear();
   g_chapters.clear();
-  g_spineFallback.clear();
   g_chapterCandidates.clear();
   g_totalPages = 0;
   g_spinePageStart = 0;
@@ -2024,10 +1902,8 @@ static void clearBookOutputs() {
   g_enc.reset();
   g_asm.reset();
   g_asmCandidates.clear();
-  g_asmFallback.clear();
   g_planSizes.clear();
   g_planCandidates.clear();
-  g_planFallback.clear();
   g_planPrefix.clear();
   g_rgbaOut.clear();
 }

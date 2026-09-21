@@ -139,9 +139,10 @@ All functions exported on the module instance (`createKoEngine()` → `Module`).
 | `ko_export_spine(s)` → added | Build + render one spine into the container (per-spine progress) |
 | `ko_export_finish()` → pages | Finalize container (chapters assembled from the EPUB **TOC**) |
 
-Chapters come from the EPUB table of contents (title + anchor→page resolution via the
-engine's `Section::findAnchor`), capped at 100 entries like the official converter,
-deduped by start page; books without a usable TOC fall back to per-spine names.
+Chapters come only from the EPUB table of contents (EPUB 3 nav or EPUB 2 NCX title +
+anchor→page resolution via the engine's `Section::findAnchor`), capped at 100 entries
+like the official converter and deduped by start page. XHTML headings and filenames
+are never used as chapter names; a book without a usable TOC has no invented chapter table.
 
 ---
 
@@ -200,8 +201,8 @@ not apply the EPUB reader's orientation setting. See
    XTCKO extra; runtime `.epdfont` via
    SdFont resident preload (whole font in RAM). Embedded TTF in EPUBs is not used by the
    device engine (no @font-face support) — all text renders in the spec fontId.
-3. Output is uncompressed by design for XTC/XTCH; the XTCZ (LZ4) wrapper (`ko_xtcz_wrap`)
-   provides compression for device firmware ≥ 5.1.6.
+3. Raw XTC/XTCH containers are uncompressed by format design. The web app defaults to a
+   2-bit XTCH payload wrapped as XTCZ/LZ4 (`.xtcz`) for device firmware ≥ 5.1.6.
 4. Whole-book export holds the finished container in the wasm heap (1,981-page book ≈ 190 MB
    XTCH / 86 MB XTCZ); MAXIMUM_MEMORY is set to 2 GB to fit giant books + EPUB + caches.
 5. XTCZ file-view decoding in the worker unwraps the whole container once (190 MB ≈ 1.3 s).
@@ -255,7 +256,8 @@ not apply the EPUB reader's orientation setting. See
 
 ## 알려진 제한 (v0)
 1. 이미지 디코딩 비활성(스텁) — 텍스트 우선. PNGdec/JPEGDEC(휴대용 C) 추후 교체 가능.
-2. 챕터명은 "Chapter N"(스파인 기준) — EPUB TOC 제목 매핑은 이후 개선.
+2. 챕터명은 EPUB 3 nav 또는 EPUB 2 NCX 목차에서만 가져온다. XHTML 제목과 파일명으로
+   이름을 추측하지 않으며, 유효한 목차가 없으면 가짜 챕터 표를 만들지 않는다.
 3. 폰트: 내장 KoPub Batang 14 + Pretendard 10. EPUB 내장 TTF는 기기 엔진이 미지원(@font-face 없음).
-4. XTZ4/LZ4 래퍼 미적용(현재는 순수 XTCH 컨테이너 출력) — 간단한 추가 작업.
-5. 12MB EPUB → 161MB 출력은 무압축 특성상 정상(XTC/XTCH는 자체 압축 없음).
+4. 웹 기본 출력은 X4 세로 · 2비트 XTCH · 블루 노이즈 디더링 · XTZ4/LZ4 압축이다.
+5. 순수 XTC/XTCH는 자체 압축이 없으며, 웹 기본값은 이를 XTZ4/LZ4로 감싸 크기를 줄인다.

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Chapter labels must come from the visible book, not internal filenames or
-// generic EPUB navigation placeholders. The adversarial fixture says
-// "Section N" in nav.xhtml while its rendered XHTML has Korean names; one real
-// heading is absent from navigation entirely.
+// Chapter labels must come only from the EPUB table of contents. The
+// adversarial fixture deliberately disagrees: nav.xhtml says "Section N"
+// while rendered XHTML contains attractive Korean headings, including one
+// heading omitted from navigation. None of the XHTML text may become a name.
 
 const fs = require('fs');
 const path = require('path');
@@ -30,9 +30,9 @@ function check(ok, message) {
   check(typeof api._ko_get_spine_title === 'function', 'spine title API is exported');
 
   const title = (i) => api.UTF8ToString(api._ko_get_spine_title(i));
-  check(title(0) === 'PNG Image Tests', 'spine 1 uses its visible XHTML heading');
-  check(title(1) === 'PNG Format Test', 'spine 2 uses its visible XHTML heading');
-  check(title(9) === 'Image Centering Bleed Test', 'last spine uses its visible XHTML heading');
+  check(title(0) === 'Introduction', 'spine 1 uses its EPUB nav title');
+  check(title(1) === '1. PNG Format', 'spine 2 uses its EPUB nav title');
+  check(title(9) === '9. Alignment Bleed', 'last spine uses its EPUB nav title');
   check(title(-1) === '', 'negative spine index is rejected');
   check(title(spines) === '', 'past-end spine index is rejected');
 
@@ -42,8 +42,8 @@ function check(ok, message) {
   const chapterSpines = api._ko_load_epub(chapterPtr, chapterBytes.length, '/chapters.epub');
   api._free(chapterPtr);
   check(chapterSpines === 2, 'adversarial chapter fixture loads two spines');
-  check(title(0) === '제1부 실제 첫 장', 'picker skips hidden/generic headings for the real Korean title');
-  check(title(1) === 'XTCKO chapter parsing', 'picker uses the visible outer title on the omnibus spine');
+  check(title(0) === 'Section 1', 'picker preserves the exact TOC title for spine 1');
+  check(title(1) === 'Section 2', 'picker uses the first exact-spine TOC title for spine 2');
 
   // Production registers this same externalized face in the worker. Load it
   // here so pagination—and therefore the omitted-heading page boundary—is a
@@ -72,10 +72,11 @@ function check(ok, message) {
     const nul = field.indexOf(0);
     names.push(decode.decode(nul >= 0 ? field.subarray(0, nul) : field));
   }
-  const expected = ['제1부 실제 첫 장', '제2장 깊은 제목', '제3장 목차에 없는 이름', '제4장 마지막 실제 이름'];
+  const expected = ['Section 1', 'Section 2', 'Section 4'];
   check(JSON.stringify(names) === JSON.stringify(expected),
-        `exported chapters are parsed from visible XHTML (${names.join(' / ')})`);
-  check(!names.some((name) => /^Section\s+\d+$/i.test(name)), 'no generic navigation label reaches the XTC');
+        `exported chapter names match the EPUB TOC exactly (${names.join(' / ')})`);
+  check(!names.includes('제3장 목차에 없는 이름'),
+        'an XHTML heading omitted from the TOC is not invented as a chapter');
 
   api._ko_close();
   console.log('chapter-title gate OK');

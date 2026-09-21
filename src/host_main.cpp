@@ -501,15 +501,13 @@ int main(int argc, char** argv) {
 
   std::vector<uint8_t> out_override;   // pooled assembly, when --pool
   std::vector<ko::ChapterCandidate> tocCandidates;
-  std::vector<ko::XtchChapter> spineFallback;
   std::vector<double> spineMs;
   std::vector<int> spinePages;
   struct PoolSpine {
     std::vector<uint8_t> flat;
     std::vector<uint32_t> off, len;
-    struct Anchor { std::string title; int localPage; bool inferred = false; };
+    struct Anchor { std::string title; int localPage; };
     std::vector<Anchor> toc;
-    std::string fallback;
     int pages = 0;
   };
   std::vector<PoolSpine> pool;
@@ -592,48 +590,20 @@ int main(int argc, char** argv) {
     if (renderedThisSpine > 0) {
       // Candidates in SPINE order, then TOC order within the spine — the order the product's export
       // accumulates them in, and the order the pooled assembler must reproduce.
-      std::vector<int> namedLocalPages;
       for (int t = 0; t < driver.tocCount(); t++) {
         if (driver.tocSpine(t) != spine) continue;
         const std::string anchor = driver.tocAnchor(t);
         int local_ = anchor.empty() ? -1 : driver.anchorLocalPage(anchor);
         if (local_ < 0 || local_ >= renderedThisSpine) local_ = 0;
-        const std::string chapterTitle = driver.currentChapterTitle(anchor, local_, driver.tocTitle(t));
+        const std::string chapterTitle = ko::normalizeChapterTitle(driver.tocTitle(t));
         if (ko::retainChapterCandidate(
                 tocCandidates,
-                {chapterTitle, static_cast<uint32_t>(chapterStart + local_), false})) {
-          if (resolvedChapterAnchors.size() < 2 * ko::MAX_EXPORTED_CHAPTERS) {
-            resolvedChapterAnchors.push_back({chapterTitle, local_, false});
+                {chapterTitle, static_cast<uint32_t>(chapterStart + local_)})) {
+          if (resolvedChapterAnchors.size() < ko::MAX_EXPORTED_CHAPTERS) {
+            resolvedChapterAnchors.push_back({chapterTitle, local_});
           }
-          namedLocalPages.push_back(local_);
         }
       }
-      for (const auto& heading : driver.currentSectionChapterHeadings()) {
-        const int local_ = static_cast<int>(heading.localPage);
-        if (local_ < 0 || local_ >= renderedThisSpine ||
-            std::find(namedLocalPages.begin(), namedLocalPages.end(), local_) != namedLocalPages.end()) continue;
-        const std::string chapterTitle = ko::normalizeChapterTitle(heading.title);
-        if (ko::retainChapterCandidate(
-                tocCandidates,
-                {chapterTitle, static_cast<uint32_t>(chapterStart + local_), true})) {
-          if (resolvedChapterAnchors.size() < 2 * ko::MAX_EXPORTED_CHAPTERS) {
-            resolvedChapterAnchors.push_back({chapterTitle, local_, true});
-          }
-          namedLocalPages.push_back(local_);
-        }
-      }
-      std::string href = driver.spineHref(spine);
-      const size_t slash = href.find_last_of('/');
-      if (slash != std::string::npos) href = href.substr(slash + 1);
-      const size_t dot = href.find_last_of('.');
-      if (dot != std::string::npos) href = href.substr(0, dot);
-      ko::XtchChapter ch;
-      const std::string visibleTitle = driver.spineDisplayTitle(spine);
-      ch.name = !visibleTitle.empty() ? visibleTitle
-                                     : (href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href);
-      ch.startPage = static_cast<uint16_t>(chapterStart);
-      ch.endPage = static_cast<uint16_t>(chapterStart + renderedThisSpine - 1);
-      spineFallback.push_back(ch);
       chapterStart += renderedThisSpine;
     }
     if (pooled) {
@@ -648,19 +618,9 @@ int main(int argc, char** argv) {
         ps.len.push_back(static_cast<uint32_t>(rec.size()));
         ps.flat.insert(ps.flat.end(), rec.begin(), rec.end());
       }
-      // Already resolved against the full XHTML parse above; this includes
-      // visible headings omitted from EPUB navigation.
+      // Resolved only from the EPUB navigation document while this spine's
+      // anchor map is live.
       ps.toc = resolvedChapterAnchors;
-      {   // fallback name, exactly as the serial path derives it
-        std::string href = driver.spineHref(spine);
-        const size_t slash = href.find_last_of('/');
-        if (slash != std::string::npos) href = href.substr(slash + 1);
-        const size_t dot = href.find_last_of('.');
-        if (dot != std::string::npos) href = href.substr(0, dot);
-        const std::string visibleTitle = driver.spineDisplayTitle(spine);
-        ps.fallback = !visibleTitle.empty() ? visibleTitle
-                                           : (href.empty() ? ("Chapter " + std::to_string(spine + 1)) : href);
-      }
       pool.push_back(std::move(ps));
     }
     spineMs.push_back(msSince(tSpine0));
@@ -711,7 +671,6 @@ int main(int argc, char** argv) {
     asmW.setTextAa(spec.textAntiAliasing != 0);
     asmW.adoptMetadataFrom(writer);
     std::vector<ko::ChapterCandidate> cands;
-    std::vector<ko::XtchChapter> fallback;
     int base = 0;
     for (const PoolSpine& ps : pool) {
       if (ps.pages <= 0) continue;
@@ -723,17 +682,12 @@ int main(int argc, char** argv) {
       }
       for (const PoolSpine::Anchor& a : ps.toc) {
         ko::retainChapterCandidate(
-            cands, {a.title, static_cast<uint32_t>(base + a.localPage), a.inferred});
+            cands, {a.title, static_cast<uint32_t>(base + a.localPage)});
       }
-      ko::XtchChapter ch;
-      ch.name = ps.fallback;
-      ch.startPage = static_cast<uint16_t>(base);
-      ch.endPage = static_cast<uint16_t>(base + ps.pages - 1);
-      fallback.push_back(ch);
       base += ps.pages;
     }
     const uint32_t total = static_cast<uint32_t>(asmW.pageCount());
-    std::vector<ko::XtchChapter> asmChapters = ko::buildChapters(cands, fallback, total);
+    std::vector<ko::XtchChapter> asmChapters = ko::buildChapters(cands, total);
     std::vector<uint8_t> pooledOut = asmW.finish(asmChapters);
     fprintf(stderr, "POOL     %d spines, %u pages assembled, %zu chapters\n",
             static_cast<int>(pool.size()), total, asmChapters.size());
@@ -741,7 +695,7 @@ int main(int argc, char** argv) {
   }
 
   // One chapter table for both paths: the shared builder, fed in spine order.
-  chapters = ko::buildChapters(tocCandidates, spineFallback, static_cast<uint32_t>(totalPages));
+  chapters = ko::buildChapters(tocCandidates, static_cast<uint32_t>(totalPages));
   std::vector<uint8_t> out = out_override.empty() ? writer.finish(chapters) : std::move(out_override);
   const double tFinish = msSince(tFin0);
   FILE* o = fopen(outPath.c_str(), "wb");

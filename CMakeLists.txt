@@ -398,6 +398,8 @@ else()
     if(NODE_EXECUTABLE)
       add_test(NAME font_limits COMMAND ${NODE_EXECUTABLE}
                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify/font_limits_gate.js)
+      add_test(NAME ui_defaults COMMAND ${NODE_EXECUTABLE}
+               ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify/ui_defaults_gate.js)
     endif()
   endif()
 endif()

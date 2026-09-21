@@ -8,12 +8,12 @@
 <meta property="og:title" content="XTCKO — EPUB → XTC 변환기">
 <meta property="og:description" content="KO 포크 조판 규칙을 따르는 EPUB → XTC 변환기. 모든 변환이 브라우저에서 실행됩니다.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f172a'/%3E%3Cpath d='M9 9l14 14M23 9L9 23' stroke='%23e8eaf0' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=107">
+<link rel="stylesheet" href="style.css?v=108">
 </head>
 <body data-app-state="empty">
 
 <header id="appbar">
-  <div class="brandLockup" aria-label="XTCKO EPUB to XTC converter">
+  <div class="brandLockup" aria-label="XTCKO EPUB-XTC 변환기">
     <span class="brandMark" aria-hidden="true">X</span>
     <span class="brand">XTCKO</span>
     <span class="brandSub">EPUB → XTC</span>
@@ -28,7 +28,7 @@
 <main id="importScreen">
   <section id="importCard">
     <div class="heroCopy">
-      <p class="eyebrow">CROSSPOINT-KO RENDERING</p>
+      <p class="eyebrow">CROSSPOINT-KO 조판</p>
       <h1>책을, 기기에 맞는<br>형태로.</h1>
       <p class="sub">한국어 조판 규칙을 그대로 적용해 EPUB을<br class="wideOnly"> Xteink용 XTC·XTCH로 변환합니다.</p>
     </div>
@@ -94,7 +94,7 @@
 
   <aside id="sidebar" aria-label="설정 및 내보내기">
     <header class="sidebarHeader">
-      <div><p class="eyebrow">BOOK SETUP</p><h2>변환 설정</h2></div>
+      <div><p class="eyebrow">도서 설정</p><h2>변환 설정</h2></div>
       <button id="drawerClose" class="drawerClose iconButton" aria-label="설정 닫기">×</button>
     </header>
 
@@ -107,14 +107,14 @@
         <label class="ctrl" title="CrossPoint-KO와 FreeInk가 런타임에 선택하는 실제 패널 프로파일입니다.">
           <span>기기</span>
           <select id="deviceProfile">
-            <option value="x4" selected>Xteink X4 · 480×800</option>
+            <option value="x4" selected>Xteink X4 · 480×800 (기본)</option>
             <option value="x3">Xteink X3 · 528×792</option>
           </select>
         </label>
         <label class="ctrl" title="KO 포크의 읽기 방향과 같은 좌표 변환·안전 여백으로 본문을 다시 조판합니다.">
           <span>읽기 방향</span>
           <select id="orientation">
-            <option value="0" selected>세로</option>
+            <option value="0" selected>세로 (기본)</option>
             <option value="1">가로 · 시계 방향</option>
             <option value="3">가로 · 반시계 방향</option>
           </select>
@@ -123,11 +123,12 @@
           <summary>가로 모드 정보</summary>
           <p class="hint">CrossPoint-KO의 두 가로 모드를 그대로 사용합니다. 본문은 X4 800×480 또는 X3 792×528 좌표에서 다시 조판되고, 비대칭 안전 여백도 방향에 맞춰 회전합니다.</p>
         </details>
-        <label class="ctrl">
-          <span>화면 여백</span>
-          <input type="range" id="screenMargin" min="5" max="40" step="5" value="5" aria-label="화면 여백">
+        <label class="ctrl" title="CrossPoint-KO 리더가 실제로 제공하는 설정입니다. 범위 5–40, 간격 5, 기본값 5입니다.">
+          <span>리더 화면 여백</span>
+          <input type="range" id="screenMargin" min="5" max="40" step="5" value="5" aria-label="리더 화면 여백">
           <output id="screenMarginOut">5 px</output>
         </label>
+        <details class="help proseHelp"><summary>리더 화면 여백 정보</summary><p class="hint">CrossPoint-KO의 실제 리더 설정입니다. 5부터 40까지 5단위로 조절하며 기본값은 5입니다.</p></details>
       </section>
 
       <section class="card" id="fontCard">
@@ -160,12 +161,12 @@
           <div id="fontTuning" class="hidden">
             <details class="adv" id="fontAdvanced">
               <summary>고급 글꼴 설정</summary>
-              <label class="ctrl"><span>글꼴 이름</span><input type="text" id="fontName" value="custom" maxlength="24"></label>
+              <label class="ctrl"><span>글꼴 이름</span><input type="text" id="fontName" value="사용자글꼴" maxlength="24"></label>
               <label class="ctrl"><span>글자 크기</span><input type="range" id="fontSize" min="8" max="48" step="1" value="14"><output id="fontSizeOut">14 pt</output></label>
               <label class="ctrl"><span>굵기</span><input type="range" id="fontWeight" min="100" max="900" step="25" value="500"><output id="fontWeightOut">500</output></label>
               <details class="help"><summary aria-label="굵기 도움말">?</summary><p class="hint">가변 폰트는 선택한 wght 값으로 인스턴스하고, 정적 폰트는 원래 굵기를 기준으로 합성 볼드를 적용합니다. 400은 원본 그대로입니다.</p></details>
               <label class="ctrl check"><input type="checkbox" id="fontHangul" checked><span>현대 한글 음절 U+AC00–D7A3</span></label>
-              <label class="ctrl stacked"><span>추가 유니코드 범위</span><input type="text" id="fontIntervals" placeholder="e.g. 0x3130,0x318F" title="MIN,MAX 범위. 여러 범위는 세미콜론으로 구분"></label>
+              <label class="ctrl stacked"><span>추가 유니코드 범위</span><input type="text" id="fontIntervals" placeholder="예: 0x3130,0x318F" title="최솟값,최댓값 범위. 여러 범위는 세미콜론으로 구분"></label>
               <label class="ctrl"><span>공백 너비</span><input type="range" id="fontSpacePx" min="0" max="30" step="1" value="9"><output id="fontSpacePxOut">9 px</output></label>
             </details>
           </div>
@@ -257,10 +258,10 @@
         <p class="hint" id="exportSub">EPUB 한 권을 기기 파일 하나로 만듭니다.</p>
         <div class="seg exportSeg" role="radiogroup" aria-label="출력 모드" title="출력 톤 깊이 — 미리보기가 정확히 이 모드로 다시 렌더링합니다">
           <label class="segOpt"><input type="radio" name="exportModeRadio" value="0" title="XTC · 1비트"><span><b>XTC</b><small>1비트 · 작은 파일</small></span></label>
-          <label class="segOpt"><input type="radio" name="exportModeRadio" value="1" checked title="XTCH · 2비트 계조"><span><b>XTCH</b><small>2비트 · 이미지 품질</small></span></label>
+          <label class="segOpt"><input type="radio" name="exportModeRadio" value="1" checked title="XTCH · 2비트 계조"><span><b>XTCH</b><small>2비트 · 이미지 품질 · 기본</small></span></label>
         </div>
-        <p class="hint" id="modeHint">사진·삽화가 많은 책은 XTCH, 텍스트 위주로 가볍게 읽으려면 XTC를 권합니다.</p>
-        <label class="ctrl check" title="기기 펌웨어 5.1.6 이상에서 읽을 수 있습니다."><input type="checkbox" id="lz4Wrap"><span>LZ4로 압축 (.xtcz)</span></label>
+        <p class="hint" id="modeHint">기본 출력은 2비트 XTCH입니다. 사진·삽화가 많은 책은 XTCH, 텍스트 위주로 가볍게 읽으려면 XTC를 권합니다.</p>
+        <label class="ctrl check" title="기기 펌웨어 5.1.6 이상에서 읽을 수 있습니다."><input type="checkbox" id="lz4Wrap" checked><span>LZ4 압축 (.xtcz) · 기본</span></label>
         <details class="help"><summary aria-label="LZ4 압축 도움말">?</summary><p class="hint">LZ4 블록으로 감싸 .xtcz로 저장합니다. 펌웨어 5.1.6 이상에서 읽을 수 있으며 압축률은 책 내용에 따라 달라집니다.</p></details>
         <label class="ctrl"><span>파일 이름</span><input type="text" id="exportName" value="[X4]" maxlength="40" aria-label="파일 이름 접두사" title="책 제목 앞에 붙는 접두사"></label>
         <p class="hint" id="viewportOut" title="선택한 논리 화면에서 안전 여백·화면 여백·상태 표시줄 예약 영역을 뺀 본문 영역입니다."></p>
@@ -277,6 +278,6 @@
   </aside>
 </main>
 
-<script src="app.js?v=107"></script>
+<script src="app.js?v=108"></script>
 </body>
 </html>
